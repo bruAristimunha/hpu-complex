@@ -459,7 +459,6 @@ at::Tensor float_addsub(
     const at::Tensor& a,
     const at::Tensor& b,
     bool subtract) {
-  auto stacked = at::stack({a, b}, -2).contiguous(); // [..., 2, n]
   // Rows cached: building ones per call costs a CPU->HPU fill (~50ms).
   static std::unordered_map<int64_t, std::pair<at::Tensor, at::Tensor>>
       row_cache;
@@ -468,19 +467,19 @@ at::Tensor float_addsub(
   auto it = row_cache.find(dev);
   if (it == row_cache.end()) {
     auto one = at::ones({1}, a.options());
-    auto plus = at::cat({one, one});   // [1, 1]
-    auto minus = at::cat({one, -one}); // [1, -1]
+    auto plus = at::cat({one, one}).reshape({1, 2});   // [1, 1]
+    auto minus = at::cat({one, -one}).reshape({1, 2}); // [1, -1]
     it = row_cache.emplace(dev, std::make_pair(plus, minus)).first;
   }
   const auto& row = subtract ? it->second.second : it->second.first;
-  // bmm, not matmul: this fork's matmul mishandles 1-D x 2-D operands.
-  // Flatten only batch dims (contiguous => batch-major), never across them.
-  const int64_t n = a.size(-1);
-  const int64_t batch = stacked.numel() / (2 * n);
-  auto flat = at::bmm(
-      row.reshape({1, 1, 2}).expand({batch, 1, 2}),
-      stacked.reshape({batch, 2, n}));
-  return flat.reshape(a.sizes());
+  // One skinny GEMM for the whole (flattened) tensor: [1,2] @ [2, N].
+  // The old per-row batched bmm cost ~20 ms at 96000x200, and its
+  // stack({a,b}, -2) is out of range on 0-d operands -- that crashed
+  // clip_grad_norm_ (its total_norm is 0-d). stack dim 0 and 2-D x 2-D
+  // matmul (this fork's matmul mishandles 1-D x 2-D) are valid at any
+  // rank, 0-d included.
+  auto stacked = at::stack({a, b}, 0).reshape({2, -1});
+  return at::matmul(row, stacked).reshape(a.sizes());
 }
 
 void float_addsub_out(
@@ -564,10 +563,16 @@ at::Tensor& add_out_hpu(
     at::Tensor& out) {
   auto [self, other] = normalize_operands(self_in, other_in);
   if (self.is_complex() || other.is_complex()) {
-    copy_pair_into(pair_of(self) + pair_of(other) * alpha, out);
+    // Skip the pair * alpha GEMM when alpha == 1 (the common case):
+    // it costs a full-tensor bmm mul on every plain add.
+    auto b_pair = alpha.toDouble() == 1.0
+        ? pair_of(other)
+        : pair_of(other) * alpha;
+    copy_pair_into(pair_of(self) + b_pair, out);
     return out;
   }
-  float_addsub_out(out, self, other * alpha, false);
+  float_addsub_out(
+      out, self, alpha.toDouble() == 1.0 ? other : other * alpha, false);
   return out;
 }
 
@@ -578,10 +583,14 @@ at::Tensor& sub_out_hpu(
     at::Tensor& out) {
   auto [self, other] = normalize_operands(self_in, other_in);
   if (self.is_complex() || other.is_complex()) {
-    copy_pair_into(pair_of(self) - pair_of(other) * alpha, out);
+    auto b_pair = alpha.toDouble() == 1.0
+        ? pair_of(other)
+        : pair_of(other) * alpha;
+    copy_pair_into(pair_of(self) - b_pair, out);
     return out;
   }
-  float_addsub_out(out, self, other * alpha, true);
+  float_addsub_out(
+      out, self, alpha.toDouble() == 1.0 ? other : other * alpha, true);
   return out;
 }
 

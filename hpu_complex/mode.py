@@ -6,6 +6,13 @@ recurse into themselves (measured: segfault in randn). A dispatch mode
 sits above the dispatcher, intercepts only when a complex HPU tensor is
 involved, and computes with plain float ops -- float code paths are
 never touched.
+
+Opt-in: enable() does not enter this mode anymore (forward complex ops
+route through the C++ .out kernels instead). Enter it scoped via
+hpu_complex.complex_mode(), or globally via enable(enter_mode=True).
+Its remaining job is hosting hooks such as the fused TPC FFT
+(FFT_R2C_HOOK). Non-complex ops are re-called untouched under
+_disable_current_modes: a faithful no-op pass-through.
 """
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -22,6 +29,19 @@ def _pair(t):
             t = t.conj_physical()
         return torch.view_as_real(t)
     return torch.stack([t, torch.zeros_like(t)], dim=-1)
+
+
+def _operand(x, ref):
+    """Wrap a Python scalar operand as a 0-d tensor on ref's device.
+
+    Scalars arrive unwrapped at this level (z * 1j); the stock wrap
+    casts complex128 -> complex64 through _to_copy, which the
+    extension only supports as complex64 -> complex64.
+    """
+    if isinstance(x, torch.Tensor):
+        return x
+    dtype = torch.complex64 if isinstance(x, complex) else torch.float32
+    return torch.full((), x, dtype=dtype, device=ref.device)
 
 
 def _mul(a, b):
@@ -71,17 +91,29 @@ class ComplexMode(TorchDispatchMode):
                 if "synNodeCreateWithId" in str(e):
                     return func(*args, **kwargs)
                 raise
-        if func is aten.mul.Tensor:
-            return _mul(args[0], args[1])
-        if func is aten.div.Tensor:
-            return _div(args[0], args[1])
-        if func is aten.add.Tensor:
-            alpha = args[2] if len(args) > 2 else kwargs.get("alpha", 1)
-            pair = _pair(args[0]) + _pair(args[1]) * alpha
+        # Scalar operands (z * 1j, z - 1.0) arrive unwrapped at this
+        # level: wrap them against the tensor operand (see _operand)
+        # and compute the tensor/tensor form.
+        if func in (aten.mul.Tensor, aten.mul.Scalar):
+            ref = args[0] if isinstance(args[0], torch.Tensor) else args[1]
+            return _mul(_operand(args[0], ref), _operand(args[1], ref))
+        if func in (aten.div.Tensor, aten.div.Scalar) and \
+                kwargs.get("rounding_mode") is None:
+            ref = args[0] if isinstance(args[0], torch.Tensor) else args[1]
+            return _div(_operand(args[0], ref), _operand(args[1], ref))
+        if func in (aten.add.Tensor, aten.add.Scalar):
+            ref = args[0] if isinstance(args[0], torch.Tensor) else args[1]
+            a, b = _operand(args[0], ref), _operand(args[1], ref)
+            alpha = args[2] if len(args) > 2 and func is aten.add.Tensor \
+                else kwargs.get("alpha", 1)
+            pair = _pair(a) + _pair(b) * alpha
             return torch.view_as_complex(pair.contiguous())
-        if func is aten.sub.Tensor:
-            alpha = args[2] if len(args) > 2 else kwargs.get("alpha", 1)
-            pair = _pair(args[0]) - _pair(args[1]) * alpha
+        if func in (aten.sub.Tensor, aten.sub.Scalar):
+            ref = args[0] if isinstance(args[0], torch.Tensor) else args[1]
+            a, b = _operand(args[0], ref), _operand(args[1], ref)
+            alpha = args[2] if len(args) > 2 and func is aten.sub.Tensor \
+                else kwargs.get("alpha", 1)
+            pair = _pair(a) - _pair(b) * alpha
             return torch.view_as_complex(pair.contiguous())
         if func is aten.neg.default:
             pair = torch.view_as_real(args[0])

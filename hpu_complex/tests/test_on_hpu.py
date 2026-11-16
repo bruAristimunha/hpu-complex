@@ -29,6 +29,37 @@ def test_stft_and_grad_on_hpu():
     print(f"stft_magnitude {tuple(mag.shape)} grad ok")
 
 
+def test_complex_without_mode_and_clip_grad():
+    # Default enable(): no dispatch mode entered, yet complex forward
+    # (via the C++ .out kernels) and clip_grad_norm_ (0-d total_norm:
+    # regression for the stack({a,b}, -2) crash in float_addsub) work.
+    H.enable()
+    a = torch.complex(torch.randn(4, 8, device="hpu"),
+                      torch.randn(4, 8, device="hpu"))
+    b = torch.complex(torch.randn(4, 8, device="hpu"),
+                      torch.randn(4, 8, device="hpu"))
+    ac, bc = a.cpu(), b.cpu()
+    for got, ref in [(a * b, ac * bc), (a / b, ac / bc), (a + b, ac + bc)]:
+        err = (got.cpu() - ref).abs().max() / ref.abs().max()
+        assert err < 1e-4, err
+    assert torch.isfinite(a.abs()).all()
+    m = torch.nn.Sequential(
+        torch.nn.Conv1d(22, 32, 5), torch.nn.Flatten(),
+        torch.nn.Linear(32 * 10, 4)).to("hpu")
+    loss = m(torch.randn(8, 22, 14, device="hpu")).sum()
+    loss.backward()
+    n = torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
+    torch.hpu.synchronize()
+    assert torch.isfinite(n)
+    with H.complex_mode():  # same clip inside the scoped mode
+        loss = m(torch.randn(8, 22, 14, device="hpu")).sum()
+        loss.backward()
+        n = torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
+        torch.hpu.synchronize()
+        assert torch.isfinite(n)
+    print("complex without mode + clip_grad_norm_ (both mode states): OK")
+
+
 def test_compile_attempt():
     H.enable()
     f = torch.compile(lambda t: H.magnitude(H.rfft(t)), backend="hpu_backend")

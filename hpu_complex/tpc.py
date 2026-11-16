@@ -3,8 +3,9 @@
 Requires the kernel library built by tpc_kernel/build.sh and
 GC_KERNEL_PATH pointing at it (plus the stock libtpc_kernels.so).
 enable_tpc_fft() loads the plugin and routes aten::_fft_r2c through
-the fused kernel via the dispatch mode. Everything else (and any
-failure) falls back to the GEMM extension path.
+the fused kernel via the dispatch mode, so calls must run inside
+hpu_complex.complex_mode() (or enable(enter_mode=True)). Everything
+else (and any failure) falls back to the GEMM extension path.
 """
 import pathlib
 

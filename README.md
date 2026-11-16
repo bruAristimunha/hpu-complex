@@ -37,9 +37,10 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
 - Complex tensors are interleaved-float tensor views — the same
   representation CUDA and Apple MPS use internally — so the closed
   graph compiler never sees a dtype it doesn't know.
-- Complex mul/add/div run through `.out` kernels (autograd engine) and
-  a dispatch mode (forward). `torch.compile(backend="hpu_backend")`
-  graphs run on-device.
+- Complex mul/add/div run through `.out` kernels (autograd engine);
+  forward ops reach them via the fork's composite aliases, no dispatch
+  mode needed. `torch.compile(backend="hpu_backend")` graphs run
+  on-device.
 - Optional: a fused TPC kernel (`hpu_complex.tpc.enable_tpc_fft()`,
   needs the kernel lib from `hpu_complex/tpc_kernel/build.sh` on
   `GC_KERNEL_PATH`). Correct, currently slower than the GEMM path.
@@ -61,6 +62,9 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
 
 ## Limits
 
+- The dispatch mode is opt-in and scoped
+  (`with hpu_complex.complex_mode():`), not global: `enable()` never
+  enters it. It is only needed for the fused TPC FFT hook.
 - FFT is a dense GEMM (O(n²)) in the fast path; large-n accuracy is
   fp32-bound without the four-step flag.
 - Lazy mode untouched. bf16/half arithmetic runs in fp32 while loaded
