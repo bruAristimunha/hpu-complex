@@ -1,6 +1,5 @@
 """FFT on HPU without complex dtype: real tensors in, [..., freq, 2] out.
 
-Vendored copy of ../hpu_fft.py (single-file standalone) - keep in sync.
 
 Why: gaudi-pytorch-bridge rejects complex64 (tensor_utils.cpp is_supported_type)
 and has no FFT kernel, so torch.fft.* crashes on HPU. This module never creates
