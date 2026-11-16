@@ -65,6 +65,10 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   fp32-bound without the four-step flag.
 - Lazy mode untouched. bf16/half arithmetic runs in fp32 while loaded
   (`HPU_COMPLEX_NO_ARITH=1` opts out).
+- Gradients through `.real`/`.imag` do not flow (fork autograd view
+  tracking); `.abs()` backward is verified. See
+  `hpu_complex/braindecode.py` for Braindecode helpers
+  (patch_braindecode, FTSurrogate, Hilbert, trial aggregation).
 - First `enable()` compiles the extension (~1 min, then cached).
 
 ## Tests

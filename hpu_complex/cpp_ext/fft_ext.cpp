@@ -800,6 +800,15 @@ at::Tensor& zero_hpu(at::Tensor& self) {
 
 } // namespace
 
+TORCH_LIBRARY_IMPL(aten, CompositeImplicitAutograd, m) {
+  // Composite-implicit (not a backend kernel), matching stock.
+  // Known limit: gradients through .real/.imag do not flow - the
+  // fork's autograd view tracking does not cover hand-made TensorImpl
+  // views. Use .abs() (backward verified) or pair math instead.
+  m.impl("real", &real_hpu);
+  m.impl("imag", &imag_hpu);
+}
+
 TORCH_LIBRARY_IMPL(aten, HPU, m) {
   m.impl("_fft_r2c", &fft_r2c_hpu);
   m.impl("_fft_c2r", &fft_c2r_hpu);
@@ -833,8 +842,6 @@ TORCH_LIBRARY_IMPL(aten, HPU, m) {
   }
   m.impl("sgn", &sgn_hpu);
   m.impl("conj_physical", &conj_physical_hpu);
-  m.impl("real", &real_hpu);
-  m.impl("imag", &imag_hpu);
   m.impl("new_zeros", &new_zeros_hpu);
   m.impl("copy_", &copy_hpu);
   m.impl("slice.Tensor", &slice_hpu);
