@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hpu-complex"
+version = "0.1.0"
+description = "Plugin that brings complex64 + torch.fft/torch.stft to Intel Gaudi HPU (unmodified model code, verified on Gaudi2)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Bruno Aristimunha" }]
+requires-python = ">=3.9"
+# torch is intentionally not a dependency: on Gaudi it must come from
+# Intel's Habana installer (a PyPI torch would shadow the fork).
+
+[tool.setuptools]
+packages = ["hpu_complex"]
+
+[tool.setuptools.package-data]
+hpu_complex = [
+    "cpp_ext/*.cpp",
+    "cpp_ext/*.py",
+    "tpc_kernel/*.md",
+    "tpc_kernel/CMakeLists.txt",
+    "tpc_kernel/build.sh",
+    "tpc_kernel/kernels/gaudi2/*.c",
+    "tpc_kernel/src/*.cpp",
+    "tpc_kernel/src/*.hpp",
+]
