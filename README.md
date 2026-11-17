@@ -70,9 +70,11 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
 - Lazy mode untouched. bf16/half arithmetic runs in fp32 while loaded
   (`HPU_COMPLEX_NO_ARITH=1` opts out).
 - Gradients through `.real`/`.imag` do not flow (fork autograd view
-  tracking); `.abs()` backward is verified. See
-  `hpu_complex/braindecode.py` for Braindecode helpers
-  (patch_braindecode, FTSurrogate, Hilbert, trial aggregation).
+  tracking); `.abs()` backward is verified. Braindecode integration
+  was removed in 0.2.0 (breaking: `hpu_complex.braindecode` is gone);
+  it lives in the separate
+  [braindecode-kernels](https://github.com/bruAristimunha/braindecode-kernels)
+  package, not here.
 - First `enable()` compiles the extension (~1 min, then cached).
 
 ## Tests
