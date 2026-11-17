@@ -19,18 +19,61 @@ _REGISTERED = False
 _MODE_ENTERED = False
 
 
+def _touches_complex(node):
+    """An FX node with a complex output or a complex input."""
+    import torch
+
+    def complex_dtypes(n):
+        dtypes = list(n.meta.get("output_dtypes") or ())
+        val = n.meta.get("val")
+        for v in val if isinstance(val, (list, tuple)) else (val,):
+            if isinstance(v, torch.Tensor):
+                dtypes.append(v.dtype)
+        return any(isinstance(d, torch.dtype) and d.is_complex for d in dtypes)
+
+    return complex_dtypes(node) or any(complex_dtypes(n) for n in node.all_input_nodes)
+
+
+def _complex_nodes_run_eagerly():
+    """torch.compile(backend="hpu_backend"): complex nodes run eagerly, on the C++ kernels.
+
+    Synapse has no complex dtype, yet the partitioner fuses complex nodes into its
+    graphs and then fails allocating their outputs. Eager fallback keeps the float
+    nodes around them in the fused graphs. The as_strided batching pass must skip
+    them too: its hpu::batch_as_strided op has no complex kernel (CodeBrain).
+    """
+    try:
+        from habana_frameworks.torch.dynamo.compile_backend import passes
+        from habana_frameworks.torch.dynamo.compile_backend._passes import batch_as_strided
+    except ImportError:
+        return
+    original = passes.is_eager_fallback_required
+    if getattr(original, "hpu_complex", False):
+        return
+
+    def is_eager_fallback_required(node, is_dynamic=False):
+        return _touches_complex(node) or original(node, is_dynamic=is_dynamic)
+
+    is_eager_fallback_required.hpu_complex = True
+    passes.is_eager_fallback_required = is_eager_fallback_required
+
+    support = batch_as_strided.BatchAsStridedOperatorSupport
+    batchable = support.is_node_supported
+    support.is_node_supported = lambda self, submodules, node: (
+        not _touches_complex(node) and batchable(self, submodules, node))
+
+
 def enable(enter_mode: bool = False):
-    """Activate: C++ kernels (Gaudi stack) + decompositions.
+    """Activate: C++ kernels (Gaudi stack); complex nodes of compiled graphs run eagerly on them.
 
-    After this, unmodified torch.fft/torch.stft/torch.complex work on HPU.
-    Idempotent. On non-Gaudi machines only the decompositions register.
+    After this, unmodified torch.fft/torch.stft/torch.complex work on HPU,
+    eager and under torch.compile(backend="hpu_backend"). Idempotent. The
+    kernels see only complex tensors (PrivateUse1 key), so float code is
+    untouched. On non-Gaudi machines only the CPU decompositions register.
 
-    The complex-arithmetic TorchDispatchMode is NOT entered by default:
-    forward complex mul/add/div already route through the C++ .out
-    kernels (the fork's composite aliases land there), so a process-wide
-    mode would tax every unrelated op for no benefit. Enter it only for
-    features that hook the mode itself -- the fused TPC FFT
-    (hpu_complex.tpc.enable_tpc_fft) -- via enter_mode=True here, or
+    The complex-arithmetic TorchDispatchMode is NOT entered by default; it
+    is only needed for features that hook the mode itself -- the fused TPC
+    FFT (hpu_complex.tpc.enable_tpc_fft) -- via enter_mode=True here, or
     preferably scoped with complex_mode().
     """
     global _REGISTERED, _MODE_ENTERED
@@ -40,6 +83,7 @@ def enable(enter_mode: bool = False):
         from .extension import load_extension
 
         load_extension()
+        _complex_nodes_run_eagerly()
     if not _REGISTERED:
         from .decompositions import register_all
 

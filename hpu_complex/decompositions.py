@@ -71,15 +71,10 @@ def _fft_c2c(self, dim, normalization, forward):
 
 
 def register_all():
+    # ponytail: no longer registered with the habana compile backend: compiled
+    # graphs keep _fft_* nodes, which run eagerly on the C++ kernels (one cached
+    # GEMM each). The table stays for CPU tests and the opt-in dispatch mode.
     for op, fn in [(aten._fft_r2c, _fft_r2c), (aten._fft_c2r, _fft_c2r),
                    (aten._fft_c2c, _fft_c2c)]:
         DECOMP_TABLE[op] = fn
-        try:  # habana compile path, present only on Gaudi stacks
-            from habana_frameworks.torch.dynamo.compile_backend import \
-                decomposition as _hdecomp
-
-            _hdecomp.register_custom_decomposition(
-                op, _hdecomp.hpu_backend_decompositions_common)(fn)
-        except Exception as e:  # never silent: this hid a bug for a full cycle
-            print(f"hpu_complex: habana decomp registration skipped: {e}")
     return DECOMP_TABLE
