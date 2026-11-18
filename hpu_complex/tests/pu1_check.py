@@ -279,6 +279,28 @@ def compiled_stft_case():
 
 
 check("compiled stft(200, 100).abs() fwd+grad", compiled_stft_case, 2e-3)
+
+# A permuted 5-D complex tensor: its float pair is a non-contiguous rank-6 view, which Habana misreads as a bare
+# TensorImpl or an as_strided view (MetaNeuromotorHand's cross-spectral density: 98% off); sliced too, which is not a
+# permutation of a contiguous block.
+z5 = torch.complex(torch.randn(2, 5, 3, 4, 6), torch.randn(2, 5, 3, 4, 6))
+for layout, view in (("permuted", lambda t: t.permute(0, 1, 3, 4, 2)),
+                     ("sliced permuted", lambda t: t.permute(0, 2, 1, 3, 4)[:, :, 1:])):
+    for label, op in (("* 2", lambda t: t * 2), ("+ itself", lambda t: t + t), ("abs", lambda t: t.abs()),
+                      ("sum(-1)", lambda t: t.sum(-1)), ("contiguous", lambda t: t.contiguous()),
+                      ("reshape(-1, 6, 3)", lambda t: t.reshape(-1, 6, 3)),
+                      ("view_as_real.contiguous", lambda t: torch.view_as_real(t).contiguous())):
+        check(f"{layout} 5-D complex: {label}", lambda op=op, view=view: err(op(view(z5.to(hpu))), op(view(z5))), 1e-5)
+
+
+def cross_spectra(t):  # X X^H per window, then |.|^2, as MetaNeuromotorHand does it after a rearrange
+    w = t.reshape(-1, t.shape[-2], t.shape[-1])
+    return ((w @ w.conj().transpose(1, 2)) / t.shape[-1]).abs().pow(2)
+
+
+spectra = torch.complex(torch.randn(2, 7, 3, 16, 16), torch.randn(2, 7, 3, 16, 16))
+check("cross-spectra of a permuted 5-D complex (relative)",
+      lambda: grad_err(lambda t: cross_spectra(t.permute(0, 2, 1, 3, 4)), spectra, relative=True), 1e-5)
 passed = sum(results)
 print(f"PU1_CHECK {passed}/{len(results)} passed", flush=True)
 sys.exit(0 if passed == len(results) else 1)
