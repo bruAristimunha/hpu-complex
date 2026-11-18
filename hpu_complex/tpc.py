@@ -7,8 +7,6 @@ the fused kernel via the dispatch mode, so calls must run inside
 hpu_complex.complex_mode() (or enable(enter_mode=True)). Everything
 else (and any failure) falls back to the GEMM extension path.
 """
-import pathlib
-
 import torch
 
 _TWIDDLES = {}
@@ -95,20 +93,15 @@ def enable_tpc_fft():
     global _ENABLED
     if _ENABLED:
         return True
-    from torch.utils.cpp_extension import load
+    from torch.utils.cpp_extension import load_inline
 
     from habana_frameworks.torch.utils.lib_utils import \
         get_include_dir, get_lib_dir
 
-    build = pathlib.Path("/tmp/hpu_complex_tpc_plugin_build")
-    build.mkdir(exist_ok=True)
-    src = build / "fft_plugin.cpp"
-    if not src.exists():
-        src.write_text(_CPP)
-    load(name="hpu_complex_tpc_plugin", sources=[str(src)],
-         build_directory=str(build), verbose=False, is_python_module=False,
-         extra_include_paths=[get_include_dir(), "/usr/include/habanalabs"],
-         extra_ldflags=[f"-L{get_lib_dir()}", "-lhabana_pytorch2_plugin"])
+    # Built in torch's default extension directory (TORCH_EXTENSIONS_DIR, else ~/.cache/torch_extensions).
+    load_inline(name="hpu_complex_tpc_plugin", cpp_sources=[_CPP], verbose=False, is_python_module=False,
+                extra_include_paths=[get_include_dir(), "/usr/include/habanalabs"],
+                extra_ldflags=[f"-L{get_lib_dir()}", "-lhabana_pytorch2_plugin"])
     from . import mode as _mode
 
     _mode.FFT_R2C_HOOK = _r2c_via_tpc

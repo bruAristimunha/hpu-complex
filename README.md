@@ -34,18 +34,26 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
 - Complex tensors are interleaved-float tensor views — the same
   representation CUDA and Apple MPS use internally — tagged with the
   `PrivateUse1` backend key. Only ops that touch a complex tensor reach
-  the extension; float HPU tensors keep the bridge's own kernels, so
-  float code pays nothing (no eager tax, no float-op crashes).
+  the extension's kernels; float HPU tensors keep the bridge's own. Float
+  code meets the extension only when it allocates: `empty` and
+  `empty_strided` check the dtype at `BackendSelect` and redispatch (no
+  eager tax, no float-op crashes).
 - Entry points from real HPU tensors use the `HPU` key: `_fft_r2c`,
-  `view_as_complex`, `torch.complex`. Complex factories
-  (`torch.zeros(..., dtype=torch.complex64, device="hpu")`) are caught at
-  `BackendSelect`. Everything else on a complex tensor is a
+  `view_as_complex`, `torch.complex` (and `_neg_view`, which only complex
+  code calls, for the imaginary part of a conjugate view). Every complex64
+  factory on the HPU allocates through `empty`/`empty_strided`, so all are
+  caught at `BackendSelect`: `zeros`, `ones`, `full`, `randn`, `rand`,
+  `scalar_tensor`, `*_like`, `new_*`, `.to(torch.complex64)`,
+  `torch.tensor` (Habana registers no HPU kernel for these composite
+  factories; checked on Gaudi2). Everything else on a complex tensor is a
   `PrivateUse1` kernel computing on float views: views, arithmetic,
-  `abs`/`sgn`/`where`, copies and fills, `_fft_c2c/_fft_c2r`. An
-  unregistered op falls back to the CPU and warns once with its name.
+  `abs`/`sgn`/`where`, `sum`, copies and fills, `set_` (`torch.load`),
+  `_fft_c2c/_fft_c2r`. An unregistered op falls back to the CPU and warns
+  once with its name.
 - FFTs are one GEMM each with a cached real basis; phase indices are
   reduced mod n in integers, so float32 bases stay accurate at any n.
-  The GEMMs run in float32 under autocast.
+  Under autocast, the GEMMs and the complex arithmetic stay float32, as
+  complex64 does on other backends.
 - `torch.compile(backend="hpu_backend")`: complex nodes run eagerly on
   these kernels, the float nodes around them stay in Synapse graphs.
 - Optional: a fused TPC kernel (`hpu_complex.tpc.enable_tpc_fft()`,
@@ -54,32 +62,34 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
 
 ## Verified on Gaudi2 (habana 1.21.4 / torch 2.6.0)
 
-`hpu_complex/tests/pu1_check.py` passes 21/21 checks against torch on the CPU. Errors are max abs:
+`hpu_complex/tests/pu1_check.py` passes 35/35 checks against torch on the CPU. Errors are max abs unless noted:
 
 | case | error |
 |---|---|
-| rfft (3 norms), irfft (even/odd n), fft/ifft, `torch.complex`, `view_as_complex`, complex zeros, complex arithmetic | ≤ 1.5e-05 |
-| `rfft().abs()` with gradients | 9e-08 |
-| `stft().abs()` with gradients | 2.3e-05 |
-| `.real`/`.imag` with gradients | 3.1e-05 |
-| FFT convolution with gradients (conjugate views), incl. a broadcast kernel | ≤ 8.4e-05 |
-| bf16 autocast (spectra stay float32) | 9e-08 |
-| compiled `rfft().abs()` with gradients | 9e-08 |
+| rfft (3 norms), irfft (even/odd n), fft/ifft, `torch.complex`, `view_as_complex`, complex zeros, complex arithmetic, incl. Python complex scalars (`z * 1j`) | ≤ 1.5e-05 |
+| with gradients: `rfft().abs()`, `stft().abs()`, `.real`/`.imag`, `ihfft` (a conjugate view), `torch.angle` | ≤ 4.9e-05 |
+| FFT convolution and cross-correlation (`rfft(k).conj()`) with gradients, incl. a broadcast kernel | ≤ 8.4e-05 |
+| rfft backward from a strided gradient (`torch.cat` of spectra) | 1.2e-07 |
+| after a first complex op under `torch.inference_mode`: `.real` gradients / double backward (relative) | 1.3e-05 / 4.2e-07 |
+| bf16 autocast: spectra stay float32, complex `*` `/` `+` stay complex64 | ≤ 1.8e-07 |
+| complex64 factories (`.to`, `*_like`, `new_zeros`, `full`, `zeros`, `randn`, `scalar_tensor`) give tagged tensors; `torch.load(map_location="hpu")`; `sgn` of NaN/inf/0 as `torch._refs.sgn` | exact |
+| compiled `rfft().abs()` with gradients, static and `dynamic=True` (3 batch shapes, one graph); compiled `stft().abs()` | ≤ 2.2e-05 |
+| compiled `rfft(dim=0)` raises the eager kernel's error | raises |
 
-Plain float ops are unchanged, and a float-only eager loop runs at the same speed with the extension loaded (2.75 vs 2.80 ms).
+Plain float ops are unchanged. A float-only eager loop (`tests/float_tax.py`) takes 1.9–2.8 ms per iteration with or without the extension loaded (medians 2.70 and 2.58 ms over five runs each): the run-to-run spread is larger than any difference.
 
-The onesided `_fft_r2c` backward is one GEMM: `view_as_real(grad) @ Wᵀ`. It is registered at `AutogradHPU` and traceable under compile. Its gradients match CPU float64 to 6e-07, relative, for n = 8, 9, 16 and 200, all three norms, eager and compiled (`tests/r2c_grad_check.py`). Compiled `stft().abs()`, forward and backward, at (3000, 6000): 280 ms here, 219 ms with real-DFT matmuls inside the graph.
+The onesided `_fft_r2c` backward is one GEMM: `view_as_real(grad) @ Wᵀ`. It is registered at `AutogradHPU` and traceable under compile. Its gradients match CPU float64 to 6.1e-07, relative, for n = 8, 9, 16 and 200, all three norms, eager and compiled with static and dynamic shapes (`tests/r2c_grad_check.py`). Compiled `stft().abs()`, forward and backward, at (3000, 6000): 280 ms here, 219 ms with real-DFT matmuls inside the graph.
 
-braindecode models with `braindecode_kernels.patch_braindecode()` (v0.2.2), one card, compiled, seconds per step. The baseline computes the same spectra with real-DFT matmuls inside the graph:
+braindecode models with `braindecode_kernels.patch_braindecode()` (v0.2.2), one card, compiled, seconds per step. The baseline computes the same spectra with real-DFT matmuls inside the graph (`--hpu-spectral`); each pair ran back to back on the same card:
 
-| model | hpu-complex | real-DFT baseline |
-|---|---|---|
-| CBraMod | 1.010 (0.972 with v0.2.0 gates) | 0.964 |
-| EEGDINO | 1.296 | 1.289 |
-| CodeBrain | 5.015 | 4.975 |
-| BIOT (`torch.stft`) | 0.412 | 0.378 |
+| model | hpu-complex | real-DFT baseline | difference |
+|---|---|---|---|
+| CBraMod | 1.015 | 0.959 | +5.8% |
+| EEGDINO | 1.322 | 1.280 | +3.2% |
+| CodeBrain | 5.023 | 4.980 | +0.9% |
+| BIOT (`torch.stft`) | 0.411 | 0.381 | +7.8% |
 
-CBraMod and BIOT were each measured against their baseline on the same card; EEGDINO and CodeBrain against earlier baseline runs.
+No op falls back to the CPU in these runs. The gap is in forward plus backward, where the complex nodes run eagerly outside the Synapse graphs.
 
 Details: [BENCHMARKS.md](BENCHMARKS.md) ·
 why native support is blocked: [ECOSYSTEM.md](ECOSYSTEM.md) ·
@@ -91,22 +101,40 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   (`with hpu_complex.complex_mode():`), not global: `enable()` never
   enters it. It is only needed for the fused TPC FFT hook.
 - FFT is a dense GEMM (O(n²)), last dimension only, complex64 only.
-- Lazy mode untouched. Conjugate views (`.conj()` bit) are not
-  supported; ops outside the registered set run on the CPU (warned).
-- Gradients through `.abs()`, `.real` and `.imag` are verified. Braindecode integration
+- Lazy mode untouched. Ops outside the registered set run on the CPU
+  (warned), among them the fills of complex `randn`/`rand`
+  (`normal_`/`uniform_`). `torch.func` transforms and forward-mode AD do
+  not run through `rfft`/`stft`: their backward is a C++ autograd
+  Function. Writes through the imaginary part of a conjugate view
+  (`z.conj().imag[...] = v`) do not reach `z`.
+- `torch.compile` with dynamic shapes (`dynamic=True`, or automatic
+  dynamic after a shape change): torch 2.6's fake tensors reject symbolic
+  shapes for `aten._fft_r2c`/`_fft_c2r` (their meta strides are wrong), so
+  dynamo breaks the graph at those FFTs. They run eagerly on the
+  extension, backward included; the rest stays compiled, one graph for
+  all batch sizes.
+- Gradients are verified through `.abs()`, `.real`/`.imag`,
+  `torch.angle` and complex products (above). Braindecode integration
   was removed in 0.2.0 (breaking: `hpu_complex.braindecode` is gone);
   it lives in the separate
   [braindecode-kernels](https://github.com/bruAristimunha/braindecode-kernels)
   package, not here.
-- First `enable()` compiles the extension (~1 min, then cached).
+- First `enable()` compiles the extension (~1 min, then cached in
+  `TORCH_EXTENSIONS_DIR`, by default `~/.cache/torch_extensions`). It
+  warns when `habana_frameworks` is installed but `torch.hpu` is not
+  loaded yet.
 
 ## Tests
 
 ```bash
-python -m pytest hpu_complex/tests/ -q            # CPU
+python -m pytest hpu_complex/tests/ -q            # CPU (the HPU tests skip without habana_frameworks)
 python hpu_complex/tests/pu1_check.py            # Gaudi: eager + compiled vs CPU
+python hpu_complex/tests/r2c_grad_check.py       # Gaudi: rfft gradients vs CPU float64
+python hpu_complex/tests/run_on_hpu.py           # Gaudi: test_on_hpu.py without pytest
 python hpu_complex/tests/float_tax.py [--ext]    # Gaudi: float-only loop with/without the extension
 python hpu_complex/tpc_kernel/run_fft_test.py     # Gaudi + TPC lib
 ```
+
+The Gaudi checks exit 1 if any check fails; a NaN error counts as a failure.
 
 — Bruno Aristimunha ([@bruAristimunha](https://github.com/bruAristimunha)) · Apache-2.0

@@ -9,27 +9,37 @@
 // "Schema not found for node" in the bridge's eager graph builder.
 //
 // Entry points:
-//   HPU key (real HPU inputs): _fft_r2c, view_as_complex, complex.
+//   HPU key (real HPU inputs): _fft_r2c, view_as_complex, complex, and
+//     _neg_view (reached only from complex code: the imaginary part of a
+//     conjugate view).
 //   BackendSelect (every factory passes it before a backend is chosen):
 //     empty.memory_format / empty_strided with dtype complex64 on hpu; all
-//     other factory calls are redispatched as the generated kernel does.
+//     other calls are redispatched as the generated kernel does. Habana
+//     registers no HPU kernel for the composite factories (zeros, ones, full,
+//     randn, scalar_tensor, *_like, new_*, _to_copy), so they all allocate
+//     through these two (verified on Gaudi2, SynapseAI 1.21.4).
+//   AutogradHPU: _fft_r2c, whose onesided backward is one GEMM.
 //   PrivateUse1: every op on a complex tensor. Each computes on float views
 //     of the same storage, with the plain HPU key set, so Synapse never sees
 //     a complex dtype. Unregistered ops fall back to the CPU (warned once).
 //
-// FFT: dense real DFT as matmuls (O(n^2)), bases cached per (n, norm, device).
+// FFT: dense real DFT as matmuls (O(n^2)), bases cached per (n, norm, device), at most 32 at a time.
 // Norm int: 0=none, 1=by_root_n, 2=by_n (aten per-op scaling).
 #include <torch/extension.h>
 #include <torch/library.h>
-#include <ATen/InferSize.h>
+#include <ATen/EmptyTensor.h>
 #include <ATen/Operators.h>
-#include <ATen/TensorUtils.h>
-#include <ATen/core/dispatch/DispatchKeyExtractor.h>
+#include <ATen/ops/_reshape_alias_native.h>
+#include <ATen/ops/as_strided_native.h>
+#include <ATen/ops/view_native.h>
 #include <ATen/native/CPUFallback.h>
+#include <ATen/native/Resize.h>
+#include <c10/core/InferenceMode.h>
 #include <c10/core/impl/LocalDispatchKeySet.h>
+#include <c10/util/FunctionRef.h>
 
 #include <cmath>
-#include <cstdlib>
+#include <limits>
 #include <mutex>
 #include <set>
 #include <string>
@@ -45,8 +55,14 @@ DispatchKeySet complex_keys() {
   return DispatchKeySet({DispatchKey::PrivateUse1, DispatchKey::AutogradPrivateUse1, DispatchKey::ADInplaceOrView});
 }
 
+// The key set of a plain float HPU tensor, autograd keys included: the first call may run under
+// torch.inference_mode (a validation pass before training), whose tensors lack them, and every float view of a
+// complex tensor would then be an inference tensor for the rest of the process.
 DispatchKeySet hpu_float_keys() {
-  static const DispatchKeySet keys = at::empty({0}, at::TensorOptions().dtype(at::kFloat).device(at::kHPU)).key_set();
+  static const DispatchKeySet keys = [] {
+    auto ks = at::empty({0}, at::TensorOptions().dtype(at::kFloat).device(at::kHPU)).key_set();
+    return ks | c10::getAutogradRelatedKeySetFromBackend(ks.highestBackendKey());
+  }();
   return keys;
 }
 
@@ -81,13 +97,14 @@ at::Tensor complex_view(const at::Tensor& pair) {
                  pair.storage_offset() / 2);
 }
 
-// complex64 [...] -> float [..., 2] over the same storage, ignoring a conjugate
-// bit: plain HPU keys for a tagged tensor, the stock view for a CPU one.
+// complex [...] -> float [..., 2] over the same storage, ignoring a conjugate bit: plain HPU keys for a tagged
+// (complex64) tensor, the stock view for any other one, e.g. the complex128 CPU scalar of z * 1j.
 at::Tensor raw_pair(const at::Tensor& c) {
-  TORCH_CHECK(c.scalar_type() == at::kComplexFloat, "hpu_complex: complex64 only, got ", c.scalar_type());
   if (!tagged(c)) {
+    TORCH_CHECK(c.is_complex(), "hpu_complex: expected a complex tensor, got ", c.scalar_type());
     return at::view_as_real(c.is_conj() ? c.conj() : c);  // conj() of a conjugate view: the stored values
   }
+  TORCH_CHECK(c.scalar_type() == at::kComplexFloat, "hpu_complex: complex64 only, got ", c.scalar_type());
   auto sizes = c.sizes().vec();
   auto strides = c.strides().vec();
   for (auto& s : strides) {
@@ -106,16 +123,9 @@ at::Tensor pair_view(const at::Tensor& c) {
 }
 
 at::Tensor make_complex_empty(c10::IntArrayRef size, c10::IntArrayRef stride, at::Device device) {
-  // Storage for the strided layout, in floats (two per complex element).
-  int64_t extent = 1;
-  for (size_t i = 0; i < size.size(); ++i) {
-    if (size[i] == 0) {
-      extent = 0;
-      break;
-    }
-    extent += (size[i] - 1) * stride[i];
-  }
-  auto flat = at::empty({std::max<int64_t>(extent, 0) * 2}, at::TensorOptions().dtype(at::kFloat).device(device));
+  // Storage for the strided layout, in floats (two per complex element); ATen's sizing checks rank and overflow.
+  const auto floats = at::detail::computeStorageNbytes(size, stride, sizeof(c10::complex<float>)) / sizeof(float);
+  auto flat = at::empty({static_cast<int64_t>(floats)}, at::TensorOptions().dtype(at::kFloat).device(device));
   return view_of(flat, complex_keys(), caffe2::TypeMeta::Make<c10::complex<float>>(), size, stride, 0);
 }
 
@@ -174,69 +184,83 @@ double norm_scale(int64_t normalization, int64_t n) {
   return 1.0;
 }
 
-std::mutex basis_mutex;
+enum class Basis : int64_t { R2C, C2C, C2R };
 
-// r2c, one GEMM: x [..., n] @ W [n, 2k] = interleaved [re0, im0, re1, ...].
-at::Tensor r2c_basis(int64_t n, int64_t k, int64_t normalization, const at::Device& device) {
-  static std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, at::Tensor> cache;
-  std::lock_guard<std::mutex> lock(basis_mutex);
-  auto key = std::make_tuple(n, k, normalization, static_cast<int64_t>(device.index()));
+// One cache for every basis (float32, on the device), keyed by (kind, n, m, normalization, device index); m is k,
+// or the direction for c2c. Bases are O(n^2) floats, so the cache is bounded like main's plan cache (cleared when
+// full, rebuilt lazily): many distinct FFT lengths cannot grow device memory without limit.
+at::Tensor cached_basis(Basis kind, int64_t n, int64_t m, int64_t normalization, const at::Device& device,
+                        c10::function_ref<at::Tensor()> build) {
+  static std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>, at::Tensor> cache;
+  static std::mutex mutex;
+  constexpr size_t kMaxBases = 32;
+  std::lock_guard<std::mutex> lock(mutex);
+  auto key = std::make_tuple(static_cast<int64_t>(kind), n, m, normalization, static_cast<int64_t>(device.index()));
   auto it = cache.find(key);
   if (it != cache.end()) {
     return it->second;
   }
-  auto ang = angles(n, n, k);  // [n, k]
-  auto scale = norm_scale(normalization, n);
-  auto w = at::stack({at::cos(ang) * scale, at::sin(ang) * -scale}, -1).reshape({n, 2 * k});
-  return cache.emplace(key, w.to(at::kFloat).to(device)).first->second;
+  if (cache.size() >= kMaxBases) {
+    cache.clear();
+  }
+  // A basis cached under inference mode would be an inference tensor, which the rfft backward's matmul cannot
+  // save when a double backward (create_graph=True) records it.
+  std::optional<c10::InferenceMode> normal_mode;
+  if (c10::InferenceMode::is_enabled()) {
+    normal_mode.emplace(/*enabled=*/false);
+  }
+  return cache.emplace(key, build().to(at::kFloat).to(device)).first->second;
+}
+
+// The r2c basis from angles [n, k]: x [..., n] @ W [n, 2k] = interleaved [re0, im0, re1, ...].
+at::Tensor r2c_weights(const at::Tensor& ang, int64_t n, int64_t k, int64_t normalization) {
+  const auto scale = norm_scale(normalization, n);
+  return at::stack({at::cos(ang) * scale, at::sin(ang) * -scale}, -1).reshape({n, 2 * k});
+}
+
+// r2c, one GEMM.
+at::Tensor r2c_basis(int64_t n, int64_t k, int64_t normalization, const at::Device& device) {
+  return cached_basis(Basis::R2C, n, k, normalization, device,
+                      [&] { return r2c_weights(angles(n, n, k), n, k, normalization); });
 }
 
 // c2c, one GEMM: [re, im] interleaved [..., 2n] @ W [2n, 2n] = interleaved output.
 at::Tensor c2c_basis(int64_t n, bool forward, int64_t normalization, const at::Device& device) {
-  static std::map<std::tuple<int64_t, bool, int64_t, int64_t>, at::Tensor> cache;
-  std::lock_guard<std::mutex> lock(basis_mutex);
-  auto key = std::make_tuple(n, forward, normalization, static_cast<int64_t>(device.index()));
-  auto it = cache.find(key);
-  if (it != cache.end()) {
-    return it->second;
-  }
-  auto ang = angles(n, n, n);  // [j, f]
-  auto scale = norm_scale(normalization, n);
-  auto c = at::cos(ang) * scale;
-  auto s = at::sin(ang) * (forward ? -scale : scale);  // e^{-+i}: X = sum x (c + i s)
-  // out_re = re c - im s ; out_im = re s + im c, rows interleaved (re_j, im_j).
-  auto from_re = at::stack({c, s}, -1);             // [j, f, 2]
-  auto from_im = at::stack({-s, c}, -1);            // [j, f, 2]
-  auto w = at::stack({from_re, from_im}, 1);        // [j, 2, f, 2]
-  return cache.emplace(key, w.reshape({2 * n, 2 * n}).to(at::kFloat).to(device)).first->second;
+  return cached_basis(Basis::C2C, n, forward, normalization, device, [&] {
+    auto ang = angles(n, n, n);  // [j, f]
+    auto scale = norm_scale(normalization, n);
+    auto c = at::cos(ang) * scale;
+    auto s = at::sin(ang) * (forward ? -scale : scale);  // e^{-+i}: X = sum x (c + i s)
+    // out_re = re c - im s ; out_im = re s + im c, rows interleaved (re_j, im_j).
+    auto from_re = at::stack({c, s}, -1);       // [j, f, 2]
+    auto from_im = at::stack({-s, c}, -1);      // [j, f, 2]
+    auto w = at::stack({from_re, from_im}, 1);  // [j, 2, f, 2]
+    return w.reshape({2 * n, 2 * n});
+  });
 }
 
 // c2r, one GEMM from the half spectrum (Hermitian): interleaved [..., 2k] @ W [2k, n].
 at::Tensor c2r_basis(int64_t n, int64_t k, int64_t normalization, const at::Device& device) {
-  static std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, at::Tensor> cache;
-  std::lock_guard<std::mutex> lock(basis_mutex);
-  auto key = std::make_tuple(n, k, normalization, static_cast<int64_t>(device.index()));
-  auto it = cache.find(key);
-  if (it != cache.end()) {
-    return it->second;
-  }
-  // x_j = sum_f w_f (re_f cos - im_f sin), w_f = 1 for DC/Nyquist, 2 for the bins counted twice.
-  auto ang = angles(n, k, n);  // [f, j]
-  auto weight = at::full({k, 1}, 2.0, at::TensorOptions().dtype(at::kDouble));
-  weight[0] = 1.0;
-  if (n % 2 == 0 && k == n / 2 + 1) {
-    weight[k - 1] = 1.0;
-  }
-  auto scale = norm_scale(normalization, n);
-  auto w = at::stack({at::cos(ang) * weight * scale, at::sin(ang) * weight * -scale}, 1);  // [f, 2, j]
-  return cache.emplace(key, w.reshape({2 * k, n}).to(at::kFloat).to(device)).first->second;
+  return cached_basis(Basis::C2R, n, k, normalization, device, [&] {
+    // x_j = sum_f w_f (re_f cos - im_f sin), w_f = 1 for DC/Nyquist, 2 for the bins counted twice.
+    auto ang = angles(n, k, n);  // [f, j]
+    auto weight = at::full({k, 1}, 2.0, at::TensorOptions().dtype(at::kDouble));
+    weight[0] = 1.0;
+    if (n % 2 == 0 && k == n / 2 + 1) {
+      weight[k - 1] = 1.0;
+    }
+    auto scale = norm_scale(normalization, n);
+    auto w = at::stack({at::cos(ang) * weight * scale, at::sin(ang) * weight * -scale}, 1);  // [f, 2, j]
+    return w.reshape({2 * k, n});
+  });
 }
 
 void check_last_dim(const at::Tensor& self, c10::IntArrayRef dim) {
   TORCH_CHECK(dim.size() == 1 && (dim[0] == -1 || dim[0] == self.dim() - 1), "hpu_complex: only last-dim FFT");
 }
 
-// Autocast would run the DFT GEMMs in bfloat16: the spectra stay float32.
+// Autocast would run the DFT GEMMs and the pair arithmetic in bfloat16 (Habana's default lower-precision list
+// has mul and matmul): complex math stays float32, as complex64 does under stock autocast.
 #define HPU_COMPLEX_NO_AUTOCAST c10::impl::ExcludeDispatchKeyGuard no_autocast(c10::autocast_dispatch_keyset)
 
 // ---- FFT ------------------------------------------------------------------------------
@@ -283,27 +307,37 @@ at::Tensor view_as_real_pu1(const at::Tensor& self) {
   return pair_view(self);
 }
 
+// z.view(dtype): the stock kernel copies the PrivateUse1 key onto the new dtype, and nothing here computes on a
+// tagged real tensor (its float ops would come straight back): a real view gets the plain HPU keys, as
+// view_as_real does.
+at::Tensor view_dtype_pu1(const at::Tensor& self, at::ScalarType dtype) {
+  auto v = at::native::view_dtype(self, dtype);
+  if (v.is_complex()) {
+    return v;
+  }
+  return view_of(v, hpu_float_keys(), v.dtype(), v.sizes(), v.strides(), v.storage_offset());
+}
+
+// _neg_view (the imaginary part of a conjugate view, some complex derivatives): the Habana bridge's clone and copy
+// ignore the Negative bit, so a lazily negated view would be read with the wrong sign. A physical negation instead:
+// values and gradients are right; writes through such a view no longer reach its base.
+at::Tensor neg_view_hpu(const at::Tensor& self) {
+  return self.neg();
+}
+
+at::Tensor neg_view_pu1(const at::Tensor& self) {
+  return complex_view(pair_view(self.resolve_conj()).neg().contiguous());
+}
+
+// [..., 2] pair from real and imaginary parts, broadcast. The parts are made contiguous first: Habana's stack
+// rejects strided views (BENCHMARKS.md), and a select or an expand is one.
+at::Tensor stack_pair(const at::Tensor& re, const at::Tensor& im) {
+  auto parts = at::broadcast_tensors({re, im});
+  return at::stack({parts[0].contiguous(), parts[1].contiguous()}, -1);
+}
+
 at::Tensor complex_hpu(const at::Tensor& real, const at::Tensor& imag) {
-  auto shape = at::infer_size(real.sizes(), imag.sizes());
-  return complex_view(at::stack({real.to(at::kFloat).expand(shape), imag.to(at::kFloat).expand(shape)}, -1));
-}
-
-// ---- views on complex tensors (PrivateUse1) -------------------------------------------
-
-at::Tensor as_strided_pu1(const at::Tensor& self, c10::IntArrayRef size, c10::IntArrayRef stride,
-                          std::optional<int64_t> storage_offset) {
-  return view_of(self, self.key_set(), self.dtype(), size, stride, storage_offset.value_or(self.storage_offset()));
-}
-
-at::Tensor view_pu1(const at::Tensor& self, c10::IntArrayRef size) {
-  auto inferred = at::infer_size_dv(size, self.numel());
-  auto stride = at::detail::computeStride(self.sizes(), self.strides(), inferred);
-  TORCH_CHECK(stride.has_value(), "view size is not compatible with input tensor's size and stride; use .reshape");
-  return view_of(self, self.key_set(), self.dtype(), inferred, *stride, self.storage_offset());
-}
-
-at::Tensor reshape_alias_pu1(const at::Tensor& self, c10::IntArrayRef size, c10::IntArrayRef stride) {
-  return view_of(self, self.key_set(), self.dtype(), size, stride, self.storage_offset());
+  return complex_view(stack_pair(real.to(at::kFloat), imag.to(at::kFloat)));
 }
 
 // ---- arithmetic (PrivateUse1) ------------------------------------------------------------
@@ -313,13 +347,13 @@ at::Tensor hpu_float(const at::Tensor& t, const at::Device& device) {
   return t.to(device, at::kFloat);
 }
 
-// [..., 2] pair of an operand: complex -> its pair (on the HPU), real -> nullopt.
+// [..., 2] float32 pair of an operand: complex -> its pair (on the HPU), real -> nullopt.
 std::optional<at::Tensor> pair_of(const at::Tensor& t, const at::Device& device) {
   if (!t.is_complex()) {
     return std::nullopt;
   }
   auto p = pair_view(t);
-  return p.device() == device ? p : p.to(device);
+  return p.device() == device && p.scalar_type() == at::kFloat ? p : p.to(device, at::kFloat);
 }
 
 at::Device hpu_device_of(const at::Tensor& a, const at::Tensor& b) {
@@ -330,10 +364,25 @@ at::Tensor complex_result(const at::Tensor& pair) {
   return complex_view(pair.contiguous());
 }
 
+// Neither operand complex: only the out= variants get here (out is the complex tensor), the plain op computes the
+// value and copy_into writes it into out. A tagged real operand would dispatch straight back here.
+bool both_real(const std::optional<at::Tensor>& pa, const std::optional<at::Tensor>& pb, const at::Tensor& a,
+               const at::Tensor& b) {
+  if (pa || pb) {
+    return false;
+  }
+  TORCH_CHECK(!tagged(a) && !tagged(b), "hpu_complex: a real tensor carries the complex dispatch key");
+  return true;
+}
+
 at::Tensor mul_pu1(const at::Tensor& a, const at::Tensor& b) {
+  HPU_COMPLEX_NO_AUTOCAST;
   const auto device = hpu_device_of(a, b);
   auto pa = pair_of(a, device);
   auto pb = pair_of(b, device);
+  if (both_real(pa, pb, a, b)) {
+    return at::mul(a, b);
+  }
   if (pa && pb) {
     auto ar = pa->select(-1, 0), ai = pa->select(-1, 1), br = pb->select(-1, 0), bi = pb->select(-1, 1);
     return complex_result(at::stack({ar * br - ai * bi, ar * bi + ai * br}, -1));
@@ -343,9 +392,13 @@ at::Tensor mul_pu1(const at::Tensor& a, const at::Tensor& b) {
 }
 
 at::Tensor div_pu1(const at::Tensor& a, const at::Tensor& b) {
+  HPU_COMPLEX_NO_AUTOCAST;
   const auto device = hpu_device_of(a, b);
   auto pa = pair_of(a, device);
   auto pb = pair_of(b, device);
+  if (both_real(pa, pb, a, b)) {
+    return at::div(a, b);
+  }
   if (!pb) {
     return complex_result(*pa / hpu_float(b, device).unsqueeze(-1));
   }
@@ -360,25 +413,23 @@ at::Tensor div_pu1(const at::Tensor& a, const at::Tensor& b) {
 }
 
 at::Tensor add_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha) {
+  HPU_COMPLEX_NO_AUTOCAST;
   TORCH_CHECK(!alpha.isComplex(), "hpu_complex: complex alpha is not supported");
   const auto device = hpu_device_of(a, b);
   const double s = alpha.toDouble();
   auto pa = pair_of(a, device);
   auto pb = pair_of(b, device);
+  if (both_real(pa, pb, a, b)) {
+    return at::add(a, b, alpha);
+  }
   if (pa && pb) {
     return complex_result(s == 1.0 ? *pa + *pb : *pa + *pb * s);
   }
   // complex + real: the real part moves, the imaginary part is the complex operand's (scaled when it is b).
-  at::Tensor re, im;
   if (pa) {
-    re = pa->select(-1, 0) + hpu_float(b, device) * s;
-    im = pa->select(-1, 1);
-  } else {
-    re = hpu_float(a, device) + pb->select(-1, 0) * s;
-    im = pb->select(-1, 1) * s;
+    return complex_result(stack_pair(pa->select(-1, 0) + hpu_float(b, device) * s, pa->select(-1, 1)));
   }
-  auto shape = at::infer_size(re.sizes(), im.sizes());
-  return complex_result(at::stack({re.expand(shape), im.expand(shape)}, -1));
+  return complex_result(stack_pair(hpu_float(a, device) + pb->select(-1, 0) * s, pb->select(-1, 1) * s));
 }
 
 at::Tensor sub_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha) {
@@ -392,13 +443,17 @@ at::Tensor modulus(const at::Tensor& pair, bool keepdim) {
 }
 
 at::Tensor abs_pu1(const at::Tensor& self) {
+  HPU_COMPLEX_NO_AUTOCAST;
   return modulus(pair_view(self), false);
 }
 
 at::Tensor sgn_pu1(const at::Tensor& self) {
-  auto pair = pair_view(self);
-  // sgn(0) == 0: 0/0 is NaN there.
-  return complex_result((pair / modulus(pair, true)).nan_to_num(0.0, 0.0, 0.0));
+  HPU_COMPLEX_NO_AUTOCAST;
+  auto pair = pair_view(self).contiguous();  // read twice below: one gather of a strided spectrum, not two
+  // where(|z| == 0, 0, z / |z|), as torch._refs.sgn and the CUDA kernel: only exact zeros map to 0, so NaN and inf
+  // inputs give NaN as on the other backends.
+  const auto mod = modulus(pair, true);
+  return complex_result((pair / mod).masked_fill(mod == 0, 0.0));
 }
 
 // A [..., 2] pair of any operand (a real one gets imaginary part 0), on the HPU.
@@ -407,11 +462,12 @@ at::Tensor as_pair(const at::Tensor& t, const at::Device& device) {
     return *p;
   }
   auto re = hpu_float(t, device);
-  return at::stack({re, at::zeros_like(re)}, -1);
+  return stack_pair(re, at::zeros_like(re));
 }
 
 // where(cond, a, b) with a complex a or b (compiled sgn backward: where(|z| == 0, 0, z / |z|)).
 at::Tensor where_pu1(const at::Tensor& cond, const at::Tensor& a, const at::Tensor& b) {
+  HPU_COMPLEX_NO_AUTOCAST;
   const auto device = hpu_device_of(a, b);
   return complex_result(at::where(cond.to(device).unsqueeze(-1), as_pair(a, device), as_pair(b, device)));
 }
@@ -437,11 +493,20 @@ at::Tensor& abs_out_pu1(const at::Tensor& self, at::Tensor& out) {
 at::Tensor& sgn_out_pu1(const at::Tensor& self, at::Tensor& out) {
   return copy_into(out, sgn_pu1(self));
 }
+// In-place variants: the result must keep self's shape and fit its dtype, as TensorIterator enforces; copy_into
+// would otherwise resize self (detaching a view from its base) or drop an imaginary part.
+at::Tensor& assign_inplace(at::Tensor& self, const at::Tensor& value) {
+  TORCH_CHECK(self.sizes().equals(value.sizes()), "output with shape ", self.sizes(),
+              " doesn't match the broadcast shape ", value.sizes());
+  TORCH_CHECK(self.is_complex() || !value.is_complex(),
+              "result type ComplexFloat can't be cast to the desired output type ", self.scalar_type());
+  return copy_into(self, value);
+}
 at::Tensor& mul__pu1(at::Tensor& self, const at::Tensor& other) {
-  return copy_into(self, mul_pu1(self, other));
+  return assign_inplace(self, mul_pu1(self, other));
 }
 at::Tensor& add__pu1(at::Tensor& self, const at::Tensor& other, const at::Scalar& alpha) {
-  return copy_into(self, add_pu1(self, other, alpha));
+  return assign_inplace(self, add_pu1(self, other, alpha));
 }
 
 // ---- copies and fills (PrivateUse1) ------------------------------------------------------
@@ -487,7 +552,7 @@ at::Tensor& copy_into(at::Tensor& out, const at::Tensor& value) {
   if (tagged(out)) {
     return copy_pu1(out, value, false);
   }
-  out.copy_(value.is_complex() ? pair_view(value).select(-1, 0) : value);
+  out.copy_(value);  // a tagged value dispatches to copy_pu1: complex -> complex, or its real part into a real out
   return out;
 }
 
@@ -512,6 +577,9 @@ at::Tensor sum_pu1(const at::Tensor& self, at::OptionalIntArrayRef dim, bool kee
       dims.push_back(d);
     }
   }
+  if (self.dim() == 0) {  // nothing to reduce: an empty dim list, or dim 0 of the pair, would reduce re/im
+    return complex_result(pair_view(self).clone());
+  }
   return complex_result(pair_view(self).sum(dims, keepdim));
 }
 
@@ -533,57 +601,74 @@ at::Tensor& zero_pu1(at::Tensor& self) {
   return self;
 }
 
+// torch.load rebuilds every tensor as empty(0).set_(storage, offset, size, stride): attach the device storage in
+// place, as the backends' own set_ kernels do (the CPU fallback would hand a CPU tensor the HPU storage).
+at::Tensor& set_storage_pu1(at::Tensor& self, at::Storage source, int64_t storage_offset, c10::IntArrayRef size,
+                            c10::IntArrayRef stride) {
+  const auto strides = stride.empty() ? c10::contiguous_strides(size) : at::DimVector(stride.begin(), stride.end());
+  at::native::checkSetStorage(self, std::move(source), storage_offset, size, c10::IntArrayRef(strides));
+  at::native::setStrided(self, size, c10::IntArrayRef(strides), storage_offset);
+  return self;
+}
+
 // ---- autograd of _fft_r2c on HPU: the onesided backward as one GEMM ----------------------
 
 // The r2c basis from int32 device ops, for traced graphs: no cache or host state at trace time.
-// Exact phase index: j*f < 2^31 for n up to ~65k.
 at::Tensor r2c_basis_traced(int64_t n, int64_t k, int64_t normalization, const at::Device& device) {
+  // The phase index j*f must fit int32, or compiled gradients would be silently wrong.
+  TORCH_CHECK((n - 1) * (k - 1) <= std::numeric_limits<int32_t>::max(),
+              "hpu_complex: the compiled rfft backward supports n <= 65536, got ", n);
   auto iopts = at::TensorOptions().dtype(at::kInt).device(device);
   auto idx = at::outer(at::arange(n, iopts), at::arange(k, iopts)).remainder(n);
-  auto ang = idx.to(at::kFloat) * (2.0 * M_PI / static_cast<double>(n));
-  auto scale = norm_scale(normalization, n);
-  return at::stack({at::cos(ang) * scale, at::sin(ang) * -scale}, -1).reshape({n, 2 * k});
+  return r2c_weights(idx.to(at::kFloat) * (2.0 * M_PI / static_cast<double>(n)), n, k, normalization);
 }
 
 // X = x @ W with W [n, 2k] = interleaved (C, -S): the real pairs of X are linear in x, and torch's
 // complex gradient is dL/dRe + i dL/dIm, so grad_x = view_as_real(grad) @ W^T. This replaces
 // fft_r2c_backward's zero-padded full spectrum and its [2n, 2n] c2c.
+// Under torch.compile this Function runs on fake tensors, whose sizes are symbolic with dynamic=True: shapes are
+// read as SymInts here, never with sizes().
 class FftR2C : public torch::autograd::Function<FftR2C> {
  public:
   static at::Tensor forward(torch::autograd::AutogradContext* ctx, const at::Tensor& self, std::vector<int64_t> dim,
                             int64_t normalization, bool onesided) {
-    ctx->saved_data["sizes"] = self.sizes().vec();
+    // The eager kernel's check, here too: traced graphs reach this Function but not that kernel, and the backward
+    // below is a last-dim transform (onesided: k = n / 2 + 1 bins, as the kernel computes them).
+    check_last_dim(self, dim);
+    ctx->saved_data["n"] = self.sym_size(-1);
     ctx->saved_data["dim"] = dim;
     ctx->saved_data["normalization"] = normalization;
     ctx->saved_data["onesided"] = onesided;
-    ctx->saved_data["dtype"] = static_cast<int64_t>(self.scalar_type());
     at::AutoDispatchBelowADInplaceOrView guard;
     return at::_ops::_fft_r2c::call(self, dim, normalization, onesided);
   }
 
+  // grads[0] is always defined (custom Functions materialize zeros), and the engine casts the returned
+  // gradient to the input's dtype.
   static torch::autograd::variable_list backward(torch::autograd::AutogradContext* ctx,
                                                  torch::autograd::variable_list grads) {
-    const auto& grad = grads[0];
-    if (!grad.defined()) {
-      return {at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor()};
-    }
     HPU_COMPLEX_NO_AUTOCAST;
-    auto sizes = ctx->saved_data["sizes"].toIntVector();
-    auto normalization = ctx->saved_data["normalization"].toInt();
-    auto dtype = static_cast<at::ScalarType>(ctx->saved_data["dtype"].toInt());
-    at::Tensor grad_x;
-    if (ctx->saved_data["onesided"].toBool()) {
-      const int64_t n = sizes.back();
-      const int64_t k = n / 2 + 1;
-      // Eager gradients come from the kernels here (tagged): the cached basis. Traced ones are fake.
-      auto basis = tagged(grad) ? r2c_basis(n, k, normalization, grad.device())
-                                : r2c_basis_traced(n, k, normalization, grad.device());
-      grad_x = at::matmul(at::view_as_real(grad).reshape({-1, 2 * k}), basis.t()).view(sizes);
-    } else {  // the full spectrum: fft_r2c_backward's own formula
-      auto dim = ctx->saved_data["dim"].toIntVector();
-      grad_x = at::real(at::_fft_c2c(grad, dim, normalization, /*forward=*/false));
+    const auto& grad = grads[0];
+    const auto normalization = ctx->saved_data["normalization"].toInt();
+    if (!ctx->saved_data["onesided"].toBool()) {  // the full spectrum: fft_r2c_backward's own formula
+      const auto dim = ctx->saved_data["dim"].toIntVector();
+      return {at::real(at::_fft_c2c(grad, dim, normalization, /*forward=*/false)), at::Tensor(), at::Tensor(),
+              at::Tensor()};
     }
-    return {grad_x.to(dtype), at::Tensor(), at::Tensor(), at::Tensor()};
+    // The basis is built for one length: a symbolic n is specialized (one graph per FFT length, the guard of
+    // dynamic=True), the batch dims stay symbolic.
+    const int64_t n = ctx->saved_data["n"].toSymInt().guard_int(__FILE__, __LINE__);
+    const int64_t k = n / 2 + 1;
+    // Eager gradients come from the kernels here (tagged): the cached basis. Traced ones are fake.
+    auto basis = tagged(grad) ? r2c_basis(n, k, normalization, grad.device())
+                              : r2c_basis_traced(n, k, normalization, grad.device());
+    // resolve_conj: the gradient of rfft(x).conj() (cross-spectra, correlation, ihfft) arrives as a conjugate
+    // view, which view_as_real refuses. contiguous: a gradient can be a strided view (a slice of cat's gradient,
+    // a transpose), and Habana GEMMs mis-handle strided inputs, as in the forward.
+    auto pair = at::view_as_real(grad.resolve_conj()).contiguous().view({-1, 2 * k});
+    auto sizes = grad.sym_sizes().vec();
+    sizes.back() = n;
+    return {at::matmul(pair, basis.t()).view_symint(sizes), at::Tensor(), at::Tensor(), at::Tensor()};
   }
 };
 
@@ -625,15 +710,19 @@ TORCH_LIBRARY_IMPL(aten, HPU, m) {
   m.impl("_fft_r2c", &fft_r2c_hpu);
   m.impl("view_as_complex", &view_as_complex_hpu);
   m.impl("complex", &complex_hpu);
+  m.impl("_neg_view", &neg_view_hpu);  // reached only from complex code (imag of a conjugate view)
 }
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_fft_c2c", &fft_c2c_pu1);
   m.impl("_fft_c2r", &fft_c2r_pu1);
   m.impl("view_as_real", &view_as_real_pu1);
-  m.impl("as_strided", &as_strided_pu1);
-  m.impl("view", &view_pu1);
-  m.impl("_reshape_alias", &reshape_alias_pu1);
+  m.impl("view.dtype", &view_dtype_pu1);
+  m.impl("_neg_view", &neg_view_pu1);
+  // ATen's own TensorImpl views (same key set and dtype, bounds-checked): no PrivateUse1 kernels upstream.
+  m.impl("as_strided", TORCH_FN(at::native::as_strided_tensorimpl));
+  m.impl("view", TORCH_FN(at::native::view));
+  m.impl("_reshape_alias", TORCH_FN(at::native::_reshape_alias));
   m.impl("abs", &abs_pu1);
   m.impl("abs.out", &abs_out_pu1);
   m.impl("sgn", &sgn_pu1);
@@ -655,4 +744,5 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("copy_", &copy_pu1);
   m.impl("fill_.Scalar", &fill_pu1);
   m.impl("zero_", &zero_pu1);
+  m.impl("set_.source_Storage_storage_offset", &set_storage_pu1);
 }

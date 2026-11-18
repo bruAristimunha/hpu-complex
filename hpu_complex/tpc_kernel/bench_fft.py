@@ -6,8 +6,9 @@ import time
 import torch
 from torch.utils.cpp_extension import load
 
-sys.path.insert(0, "/voyager/ceph/users/bpinto/hpu-probe")
-exec(open("/voyager/ceph/users/bpinto/hpu-probe/hpu_complex/tpc_kernel/run_fft_test.py").read().split("torch.manual_seed")[0])
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[1]))  # the repo root, for ``import hpu_complex``
+exec((HERE / "run_fft_test.py").read_text().split("torch.manual_seed")[0])  # its kernel-loading preamble
 import hpu_complex
 
 hpu_complex.enable()

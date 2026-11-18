@@ -20,7 +20,6 @@ packages = ["hpu_complex"]
 hpu_complex = [
     "cpp_ext/*.cpp",
     "cpp_ext/*.py",
-    "tpc_kernel/*.md",
     "tpc_kernel/CMakeLists.txt",
     "tpc_kernel/build.sh",
     "tpc_kernel/kernels/gaudi2/*.c",

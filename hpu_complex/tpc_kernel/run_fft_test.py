@@ -1,8 +1,6 @@
 """Fused TPC FFT kernel correctness vs torch.fft (Gaudi pod)."""
-import pathlib
-
 import torch
-from torch.utils.cpp_extension import load
+from torch.utils.cpp_extension import load_inline
 
 CPP = r"""
 #include <torch/extension.h>
@@ -45,14 +43,9 @@ TORCH_LIBRARY_IMPL(custom_op, Meta, m) {
 """
 
 from habana_frameworks.torch.utils.lib_utils import get_include_dir, get_lib_dir
-build = pathlib.Path("/tmp/tpc_fft_plugin_build")
-build.mkdir(exist_ok=True)
-src = build / "fft_plugin.cpp"
-src.write_text(CPP)
-load(name="fft_tpc_plugin", sources=[str(src)],
-     build_directory=str(build), verbose=False, is_python_module=False,
-     extra_include_paths=[get_include_dir(), "/usr/include/habanalabs"],
-     extra_ldflags=[f"-L{get_lib_dir()}", "-lhabana_pytorch2_plugin"])
+load_inline(name="fft_tpc_plugin", cpp_sources=[CPP], verbose=False, is_python_module=False,
+            extra_include_paths=[get_include_dir(), "/usr/include/habanalabs"],
+            extra_ldflags=[f"-L{get_lib_dir()}", "-lhabana_pytorch2_plugin"])
 print("PLUGIN LOADED", flush=True)
 
 

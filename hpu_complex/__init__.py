@@ -1,34 +1,33 @@
 """hpu_complex: real torch.fft/complex64 on Gaudi, without Intel's compiler.
 
-User code stays unmodified. Internally a complex spectrum is carried as a
-float tensor [..., 2] (interleaved re/im) -- the same representation CUDA
-(cuComplex/float2) and MPS (MPSGraph complex) use. The complex dtype never
-crosses into SynapseAI, whose type system has no complex entry.
+User code stays unmodified. A complex64 HPU tensor is a complex view over
+interleaved float storage (re, im) -- the layout CUDA (cuComplex/float2) and
+MPS use -- tagged with the PrivateUse1 dispatch key. The extension's kernels
+(cpp_ext/fft_ext.cpp) compute on float views of that storage, so the
+complex dtype never crosses into SynapseAI, whose type system has no
+complex entry.
 
-Two activation paths, decided by probes.py on the target cluster:
-  A) plugin  -- torch.library registrations only, no bridge rebuild
-  B) fork    -- same decompositions registered inside a bridge fork
-
-enable() is safe to call anywhere: on non-HPU machines it only registers
-the (device-agnostic) decompositions for testing.
+enable() is safe to call anywhere: without a Gaudi it does nothing.
+hpu_complex.rfft/irfft/fft/stft (the _core module) are a separate,
+device-agnostic float API on [..., 2] pairs.
 """
+import importlib.util
+import warnings
+
 from . import _core as core
 from ._core import fft, irfft, magnitude, rfft, stft, stft_magnitude
 
-_REGISTERED = False
 _MODE_ENTERED = False
 
 
 def _touches_complex(node):
     """An FX node with a complex output or a complex input."""
     import torch
+    from torch.utils._pytree import tree_leaves
 
     def complex_dtypes(n):
         dtypes = list(n.meta.get("output_dtypes") or ())
-        val = n.meta.get("val")
-        for v in val if isinstance(val, (list, tuple)) else (val,):
-            if isinstance(v, torch.Tensor):
-                dtypes.append(v.dtype)
+        dtypes += [v.dtype for v in tree_leaves(n.meta.get("val")) if isinstance(v, torch.Tensor)]
         return any(isinstance(d, torch.dtype) and d.is_complex for d in dtypes)
 
     return complex_dtypes(node) or any(complex_dtypes(n) for n in node.all_input_nodes)
@@ -44,8 +43,9 @@ def _complex_nodes_run_eagerly():
     """
     try:
         from habana_frameworks.torch.dynamo.compile_backend import passes
-        from habana_frameworks.torch.dynamo.compile_backend._passes import batch_as_strided
     except ImportError:
+        warnings.warn("hpu_complex: Habana's torch.compile passes not found; complex nodes of "
+                      "hpu_backend graphs are not forced to run eagerly")
         return
     original = passes.is_eager_fallback_required
     if getattr(original, "hpu_complex", False):
@@ -57,6 +57,27 @@ def _complex_nodes_run_eagerly():
     is_eager_fallback_required.hpu_complex = True
     passes.is_eager_fallback_required = is_eager_fallback_required
 
+    # pass_mark_placement settles HPU-to-HPU _to_copy nodes (casts to or from complex) before it asks
+    # the predicate above, so its placement of complex nodes is overruled afterwards. Their old placement
+    # is dropped first: on a second run the pass asserts that it recomputes the stored one.
+    mark_placement = getattr(passes, "pass_mark_placement", None)
+    if mark_placement is not None:
+        def pass_mark_placement(ctx):
+            complex_nodes = [n for n in ctx.graph_module.graph.nodes
+                             if n.op == "call_function" and _touches_complex(n)]
+            for node in complex_nodes:
+                node.meta.pop("placement", None)
+            changed = mark_placement(ctx)
+            for node in complex_nodes:
+                node.meta["placement"] = "eager"
+            return changed
+
+        passes.pass_mark_placement = pass_mark_placement
+
+    try:  # private, and absent before 1.20: its absence must not cost the patches above
+        from habana_frameworks.torch.dynamo.compile_backend._passes import batch_as_strided
+    except ImportError:
+        return
     support = batch_as_strided.BatchAsStridedOperatorSupport
     batchable = support.is_node_supported
     support.is_node_supported = lambda self, submodules, node: (
@@ -68,15 +89,17 @@ def enable(enter_mode: bool = False):
 
     After this, unmodified torch.fft/torch.stft/torch.complex work on HPU,
     eager and under torch.compile(backend="hpu_backend"). Idempotent. The
-    kernels see only complex tensors (PrivateUse1 key), so float code is
-    untouched. On non-Gaudi machines only the CPU decompositions register.
+    compute kernels see only complex tensors (PrivateUse1 key); float HPU
+    ops reach the extension only as a dtype check in empty/empty_strided
+    at BackendSelect. Without a Gaudi it does nothing, and warns when
+    habana_frameworks is installed but torch.hpu is not loaded yet.
 
     The complex-arithmetic TorchDispatchMode is NOT entered by default; it
     is only needed for features that hook the mode itself -- the fused TPC
     FFT (hpu_complex.tpc.enable_tpc_fft) -- via enter_mode=True here, or
     preferably scoped with complex_mode().
     """
-    global _REGISTERED, _MODE_ENTERED
+    global _MODE_ENTERED
     import torch
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
@@ -84,11 +107,10 @@ def enable(enter_mode: bool = False):
 
         load_extension()
         _complex_nodes_run_eagerly()
-    if not _REGISTERED:
-        from .decompositions import register_all
-
-        register_all()
-        _REGISTERED = True
+    elif not hasattr(torch, "hpu") and importlib.util.find_spec("habana_frameworks") is not None:
+        warnings.warn("hpu_complex: habana_frameworks is installed but torch.hpu is not loaded, so the "
+                      "extension is not enabled; import habana_frameworks.torch.core before "
+                      "hpu_complex.enable()")
     if enter_mode and not _MODE_ENTERED:
         from .mode import MODE
 
@@ -101,7 +123,7 @@ def complex_mode():
 
     Inside the block, ops involving a complex tensor are computed from
     float ops by the mode; every other op passes through untouched.
-    Outside it, complex arithmetic uses the C++ .out kernels. Needed
+    Outside it, complex ops run on the extension's PrivateUse1 kernels. Needed
     only to activate mode hooks such as the fused TPC FFT.
     """
     from .mode import ComplexMode

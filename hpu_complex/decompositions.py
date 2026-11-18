@@ -2,23 +2,21 @@
 
 These are the only three primitives PyTorch needs from a backend; torch.fft.*
 and torch.stft compose on top. Each decomposition converts complex<->pair
-at the boundary (view_as_complex/view_as_real) and runs the float core, so
-no complex tensor ever enters a Synapse graph.
+at the boundary (view_as_complex/view_as_real) and runs the float core.
+Since 0.3.0 nothing in the package registers them (the C++ kernels serve
+eager and compiled code); they stay as a reference implementation for
+callers that apply decompositions themselves, checked on the CPU by
+tests/test_decompositions_cpu.py.
 
 aten normalization int (fft_norm_mode): 0=none, 1=by_root_n, 2=by_n, already
 resolved per-direction by the torch.fft wrappers. Forward core is
-unnormalized, inverse core divides by n; _rescale fixes the difference.
+unnormalized, inverse core divides by n; _norm_factor fixes the difference.
 """
 import math
 
 import torch
 
 from . import _core as core
-
-aten = torch.ops.aten
-
-# Standalone table (tests, plugin path) + habana table (when available).
-DECOMP_TABLE = {}
 
 
 def _norm_factor(n, normalization, inverse):
@@ -68,13 +66,3 @@ def _fft_c2c(self, dim, normalization, forward):
         out = torch.stack([ore, oim], dim=-1)
     out = out * _norm_factor(n, normalization, inverse=not forward)
     return torch.view_as_complex(out.contiguous())
-
-
-def register_all():
-    # ponytail: no longer registered with the habana compile backend: compiled
-    # graphs keep _fft_* nodes, which run eagerly on the C++ kernels (one cached
-    # GEMM each). The table stays for CPU tests and the opt-in dispatch mode.
-    for op, fn in [(aten._fft_r2c, _fft_r2c), (aten._fft_c2r, _fft_c2r),
-                   (aten._fft_c2c, _fft_c2c)]:
-        DECOMP_TABLE[op] = fn
-    return DECOMP_TABLE

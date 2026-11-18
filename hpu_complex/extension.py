@@ -1,8 +1,10 @@
 """Build/load the C++ extension (first call compiles, then cached).
 
 Must run inside the Gaudi stack (habana torch fork): the extension
-registers kernels for the fork's c10::DispatchKey::HPU (entry points) and
-for PrivateUse1 (complex tensors).
+registers kernels for the fork's c10::DispatchKey::HPU (entry points),
+AutogradHPU (the rfft backward), BackendSelect (complex factories) and
+PrivateUse1 (complex tensors). The build goes to torch's default
+extension directory (TORCH_EXTENSIONS_DIR, else ~/.cache/torch_extensions).
 """
 import pathlib
 
@@ -13,13 +15,9 @@ def load_extension():
     global _LOADED
     if _LOADED:
         return
-    import torch
     from torch.utils.cpp_extension import load
 
     src = pathlib.Path(__file__).parent / "cpp_ext" / "fft_ext.cpp"
-    build_dir = pathlib.Path("/tmp/hpu_complex_pu1_build")
-    build_dir.mkdir(exist_ok=True)
-    load(name="hpu_complex_pu1_ext", sources=[str(src)],
-         build_directory=str(build_dir), verbose=False,
+    load(name="hpu_complex_pu1_ext", sources=[str(src)], verbose=False,
          is_python_module=False)
     _LOADED = True
