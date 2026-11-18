@@ -62,7 +62,7 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
 
 ## Verified on Gaudi2 (habana 1.21.4 / torch 2.6.0)
 
-`hpu_complex/tests/pu1_check.py` passes 35/35 checks against torch on the CPU. Errors are max abs unless noted:
+`hpu_complex/tests/pu1_check.py` passes 66/66 checks against torch on the CPU. Errors are max abs unless noted:
 
 | case | error |
 |---|---|
@@ -70,6 +70,7 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
 | with gradients: `rfft().abs()`, `stft().abs()`, `.real`/`.imag`, `ihfft` (a conjugate view), `torch.angle` | ≤ 4.9e-05 |
 | FFT convolution and cross-correlation (`rfft(k).conj()`) with gradients, incl. a broadcast kernel | ≤ 8.4e-05 |
 | rfft backward from a strided gradient (`torch.cat` of spectra) | 1.2e-07 |
+| permuted, sliced, stepped and offset 5-D complex tensors (rank-6 float pairs) and permuted 6-D ones: arithmetic incl. broadcasts and `where`, `abs`, `sum`, copies, writes (`copy_`, `mul_`, fills, `conj`), `reshape`, dtype views; cross-spectra `X Xᴴ` of a permuted one with gradients (relative) | ≤ 9.5e-07 / 1.9e-07 |
 | after a first complex op under `torch.inference_mode`: `.real` gradients / double backward (relative) | 1.3e-05 / 4.2e-07 |
 | bf16 autocast: spectra stay float32, complex `*` `/` `+` stay complex64 | ≤ 1.8e-07 |
 | complex64 factories (`.to`, `*_like`, `new_zeros`, `full`, `zeros`, `randn`, `scalar_tensor`) give tagged tensors; `torch.load(map_location="hpu")`; `sgn` of NaN/inf/0 as `torch._refs.sgn` | exact |
@@ -101,6 +102,12 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   (`with hpu_complex.complex_mode():`), not global: `enable()` never
   enters it. It is only needed for the fused TPC FFT hook.
 - FFT is a dense GEMM (O(n²)), last dimension only, complex64 only.
+- Habana misreads some non-contiguous layouts of rank 6 or more, its own
+  float tensors too: `as_strided` views, and copies of results that keep
+  a permuted input's strides (`(x.permute(0, 2, 1, 3, 4, 5) * 2).contiguous()`).
+  Complex tensors of rank 5 or more are covered here (their float pairs
+  and results are read as permutes of contiguous blocks, compute operands
+  are copied contiguous first); float code with such tensors is not.
 - Lazy mode untouched. Ops outside the registered set run on the CPU
   (warned), among them the fills of complex `randn`/`rand`
   (`normal_`/`uniform_`). `torch.func` transforms and forward-mode AD do

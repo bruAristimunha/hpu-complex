@@ -41,6 +41,8 @@
 #include <cmath>
 #include <limits>
 #include <mutex>
+#include <algorithm>
+#include <numeric>
 #include <set>
 #include <string>
 #include <tuple>
@@ -80,6 +82,43 @@ at::Tensor view_of(const at::Tensor& base, DispatchKeySet keys, caffe2::TypeMeta
   return result;
 }
 
+// A real view of base's storage for Habana's kernels. Habana misreads a non-contiguous view of rank 6 or more built
+// as a bare TensorImpl (view_of) or with as_strided, its own tensors' too, e.g. the float pair of a permuted 5-D complex
+// tensor; it reads the same layout right as a permute of a contiguous view. So a dense one (a permuted contiguous
+// block) is built that way. Other layouts of rank 6 or more go through Habana's as_strided on a contiguous 2-D base
+// over the whole storage, which it reads right for some of them. Lower ranks and expanded views stay bare: Habana
+// reads them right, and rejects some expanded views as strided views (synStatus 1 in strided_view / strided_insert).
+at::Tensor habana_view(const at::Tensor& base, caffe2::TypeMeta dtype, c10::IntArrayRef sizes, c10::IntArrayRef strides,
+                       int64_t storage_offset) {
+  auto view = view_of(base, hpu_float_keys(), dtype, sizes, strides, storage_offset);
+  bool expanded = false;
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    expanded |= sizes[i] > 1 && strides[i] == 0;
+  }
+  if (view.dim() < 6 || view.is_contiguous() || expanded) {
+    return view;
+  }
+  if (view.is_non_overlapping_and_dense()) {
+    // The dims from the largest stride to the smallest, as a contiguous block, permuted back.
+    const auto n = static_cast<int64_t>(sizes.size());
+    std::vector<int64_t> order(n), block(n), block_strides(n, 1), dims(n);
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) { return strides[a] > strides[b]; });
+    for (int64_t k = 0; k < n; ++k) {
+      block[k] = sizes[order[k]];
+      dims[order[k]] = k;
+    }
+    for (int64_t k = n - 2; k >= 0; --k) {
+      block_strides[k] = block_strides[k + 1] * block[k + 1];
+    }
+    return view_of(base, hpu_float_keys(), dtype, block, block_strides, storage_offset).permute(dims);
+  }
+  const auto numel = static_cast<int64_t>(base.storage().nbytes() / dtype.itemsize());
+  const int64_t inner = numel % 2 == 0 ? 2 : 1;
+  return at::as_strided(view_of(base, hpu_float_keys(), dtype, {numel / inner, inner}, {inner, 1}, 0), sizes, strides,
+                        storage_offset);
+}
+
 // float HPU [..., k, 2] (last stride 1) -> tagged complex64 [..., k], same storage.
 at::Tensor complex_view(const at::Tensor& pair) {
   TORCH_CHECK(pair.scalar_type() == at::kFloat && pair.size(-1) == 2 && pair.stride(-1) == 1,
@@ -112,7 +151,7 @@ at::Tensor raw_pair(const at::Tensor& c) {
   }
   sizes.push_back(2);
   strides.push_back(1);
-  return view_of(c, hpu_float_keys(), caffe2::TypeMeta::Make<float>(), sizes, strides, c.storage_offset() * 2);
+  return habana_view(c, caffe2::TypeMeta::Make<float>(), sizes, strides, c.storage_offset() * 2);
 }
 
 // The pair of c's values. Conjugate views only reach copy_ (the Conjugate key
@@ -120,6 +159,16 @@ at::Tensor raw_pair(const at::Tensor& c) {
 at::Tensor pair_view(const at::Tensor& c) {
   TORCH_CHECK(!c.is_conj(), "hpu_complex: unexpected conjugate view (resolve_conj() it first)");
   return raw_pair(c);
+}
+
+// The pair of c's values as an operand of Habana's compute kernels. Their result keeps a non-contiguous operand's
+// strides, and Habana copies a tensor of rank 6 or more with such strides as if it were contiguous, its own too
+// ((x.permute(0, 2, 1, 3, 4, 5) * 2).contiguous()); they also misread some of habana_view's as_strided views. The
+// operand's own copy is right, so such a pair is made contiguous first (complex_result covers results whose layout
+// comes from elsewhere).
+at::Tensor operand_pair(const at::Tensor& c) {
+  auto p = pair_view(c);
+  return p.dim() >= 6 && !p.is_contiguous() ? p.contiguous() : p;
 }
 
 at::Tensor make_complex_empty(c10::IntArrayRef size, c10::IntArrayRef stride, at::Device device) {
@@ -315,7 +364,7 @@ at::Tensor view_dtype_pu1(const at::Tensor& self, at::ScalarType dtype) {
   if (v.is_complex()) {
     return v;
   }
-  return view_of(v, hpu_float_keys(), v.dtype(), v.sizes(), v.strides(), v.storage_offset());
+  return habana_view(v, v.dtype(), v.sizes(), v.strides(), v.storage_offset());
 }
 
 // _neg_view (the imaginary part of a conjugate view, some complex derivatives): the Habana bridge's clone and copy
@@ -326,7 +375,7 @@ at::Tensor neg_view_hpu(const at::Tensor& self) {
 }
 
 at::Tensor neg_view_pu1(const at::Tensor& self) {
-  return complex_view(pair_view(self.resolve_conj()).neg().contiguous());
+  return complex_view(operand_pair(self.resolve_conj()).neg().contiguous());
 }
 
 // [..., 2] pair from real and imaginary parts, broadcast. The parts are made contiguous first: Habana's stack
@@ -352,7 +401,7 @@ std::optional<at::Tensor> pair_of(const at::Tensor& t, const at::Device& device)
   if (!t.is_complex()) {
     return std::nullopt;
   }
-  auto p = pair_view(t);
+  auto p = operand_pair(t);
   return p.device() == device && p.scalar_type() == at::kFloat ? p : p.to(device, at::kFloat);
 }
 
@@ -360,8 +409,13 @@ at::Device hpu_device_of(const at::Tensor& a, const at::Tensor& b) {
   return tagged(a) ? a.device() : b.device();
 }
 
+// A float result as complex. One of rank 6 or more can keep a permuted operand's strides (a broadcast, where's
+// condition), and Habana copies it as if it were contiguous; its permute view (habana_view) copies right.
 at::Tensor complex_result(const at::Tensor& pair) {
-  return complex_view(pair.contiguous());
+  auto p = pair.dim() >= 6 && !pair.is_contiguous()
+               ? habana_view(pair, pair.dtype(), pair.sizes(), pair.strides(), pair.storage_offset())
+               : pair;
+  return complex_view(p.contiguous());
 }
 
 // Neither operand complex: only the out= variants get here (out is the complex tensor), the plain op computes the
@@ -444,7 +498,7 @@ at::Tensor modulus(const at::Tensor& pair, bool keepdim) {
 
 at::Tensor abs_pu1(const at::Tensor& self) {
   HPU_COMPLEX_NO_AUTOCAST;
-  return modulus(pair_view(self), false);
+  return modulus(operand_pair(self), false);
 }
 
 at::Tensor sgn_pu1(const at::Tensor& self) {
@@ -580,7 +634,7 @@ at::Tensor sum_pu1(const at::Tensor& self, at::OptionalIntArrayRef dim, bool kee
   if (self.dim() == 0) {  // nothing to reduce: an empty dim list, or dim 0 of the pair, would reduce re/im
     return complex_result(pair_view(self).clone());
   }
-  return complex_result(pair_view(self).sum(dims, keepdim));
+  return complex_result(operand_pair(self).sum(dims, keepdim));
 }
 
 at::Tensor& sum_out_pu1(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,
