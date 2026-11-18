@@ -91,7 +91,11 @@ at::Tensor view_of(const at::Tensor& base, DispatchKeySet keys, caffe2::TypeMeta
 at::Tensor habana_view(const at::Tensor& base, caffe2::TypeMeta dtype, c10::IntArrayRef sizes, c10::IntArrayRef strides,
                        int64_t storage_offset) {
   auto view = view_of(base, hpu_float_keys(), dtype, sizes, strides, storage_offset);
-  if (view.dim() < 6 || view.is_contiguous() || std::find(strides.begin(), strides.end(), 0) != strides.end()) {
+  bool expanded = false;
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    expanded |= sizes[i] > 1 && strides[i] == 0;
+  }
+  if (view.dim() < 6 || view.is_contiguous() || expanded) {
     return view;
   }
   if (view.is_non_overlapping_and_dense()) {
@@ -159,9 +163,9 @@ at::Tensor pair_view(const at::Tensor& c) {
 
 // The pair of c's values as an operand of Habana's compute kernels. Their result keeps a non-contiguous operand's
 // strides, and Habana copies a tensor of rank 6 or more with such strides as if it were contiguous, its own too
-// ((x.permute(0, 2, 1, 3, 4, 5) * 2).contiguous(); here complex_result's copy, in products and sums of a permuted 5-D
-// complex tensor). They also misread some of habana_view's as_strided views. The operand's own copy is right, so such
-// a pair is made contiguous first.
+// ((x.permute(0, 2, 1, 3, 4, 5) * 2).contiguous()); they also misread some of habana_view's as_strided views. The
+// operand's own copy is right, so such a pair is made contiguous first (complex_result covers results whose layout
+// comes from elsewhere).
 at::Tensor operand_pair(const at::Tensor& c) {
   auto p = pair_view(c);
   return p.dim() >= 6 && !p.is_contiguous() ? p.contiguous() : p;
@@ -405,8 +409,13 @@ at::Device hpu_device_of(const at::Tensor& a, const at::Tensor& b) {
   return tagged(a) ? a.device() : b.device();
 }
 
+// A float result as complex. One of rank 6 or more can keep a permuted operand's strides (a broadcast, where's
+// condition), and Habana copies it as if it were contiguous; its permute view (habana_view) copies right.
 at::Tensor complex_result(const at::Tensor& pair) {
-  return complex_view(pair.contiguous());
+  auto p = pair.dim() >= 6 && !pair.is_contiguous()
+               ? habana_view(pair, pair.dtype(), pair.sizes(), pair.strides(), pair.storage_offset())
+               : pair;
+  return complex_view(p.contiguous());
 }
 
 // Neither operand complex: only the out= variants get here (out is the complex tensor), the plain op computes the
@@ -625,7 +634,7 @@ at::Tensor sum_pu1(const at::Tensor& self, at::OptionalIntArrayRef dim, bool kee
   if (self.dim() == 0) {  // nothing to reduce: an empty dim list, or dim 0 of the pair, would reduce re/im
     return complex_result(pair_view(self).clone());
   }
-  return complex_result(pair_view(self).sum(dims, keepdim));
+  return complex_result(operand_pair(self).sum(dims, keepdim));
 }
 
 at::Tensor& sum_out_pu1(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,

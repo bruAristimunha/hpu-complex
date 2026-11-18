@@ -301,6 +301,45 @@ def cross_spectra(t):  # X X^H per window, then |.|^2, as MetaNeuromotorHand doe
 spectra = torch.complex(torch.randn(2, 7, 3, 16, 16), torch.randn(2, 7, 3, 16, 16))
 check("cross-spectra of a permuted 5-D complex (relative)",
       lambda: grad_err(lambda t: cross_spectra(t.permute(0, 2, 1, 3, 4)), spectra, relative=True), 1e-5)
+
+
+def cplx(*shape):
+    return torch.complex(torch.randn(*shape), torch.randn(*shape))
+
+
+def written(device, write):
+    """A complex (2, 5, 3, 4, 6) of zeros after write(it)."""
+    base = torch.zeros(2, 5, 3, 4, 6, dtype=torch.cfloat, device=device)
+    write(base)
+    return base
+
+
+# Results of rank-6 pairs whose layout comes from a permuted operand of lower rank or a permuted condition; writes
+# through permuted and sliced destinations; more layouts: offsets, steps, chunks, rank 7, dtype views, expansions.
+c4, c5, r5, x5, src, z6 = cplx(3, 5, 4, 6), cplx(2, 3, 4, 5, 6), torch.randn(2, 3, 4, 5, 6), torch.randn(2, 5, 4, 6, 3), \
+    cplx(2, 3, 4, 4, 6), cplx(2, 3, 2, 4, 3, 5)
+permuted = lambda t: t.permute(0, 1, 3, 4, 2)  # noqa: E731
+for label, case in {
+    "permuted 4-D + 5-D complex": lambda d: c4.to(d).permute(0, 2, 1, 3) + c5.to(d),
+    "permuted 4-D complex * 5-D real": lambda d: c4.to(d).permute(0, 2, 1, 3) * r5.to(d),
+    "permuted 4-D complex / 5-D real": lambda d: c4.to(d).permute(0, 2, 1, 3) / (r5.to(d).abs() + 1),
+    "where(permuted 5-D condition, z, 0)": lambda d: torch.where(x5.to(d).permute(0, 1, 4, 2, 3) > 0, z5.to(d), 0),
+    "permuted 5-D real .to(complex64)": lambda d: permuted(z5.real.contiguous().to(d)).to(torch.complex64),
+    "zeros_like(permuted 5-D complex)": lambda d: torch.zeros_like(permuted(z5.to(d))) + permuted(z5.to(d)),
+    "full_like(permuted 5-D complex, 1+2j)": lambda d: torch.full_like(permuted(z5.to(d)), 1 + 2j),
+    "permuted 5-D complex .conj() * 2": lambda d: permuted(z5.to(d)).conj() * 2,
+    "copy_ into a sliced permuted view": lambda d: written(d, lambda b: b.permute(0, 2, 1, 3, 4)[:, :, 1:]
+                                                             .copy_(src.to(d))),
+    "mul_(2) of a sliced permuted view": lambda d: written(d, lambda b: b.copy_(z5.to(d)).permute(0, 2, 1, 3, 4)
+                                                             [:, :, 1:].mul_(2)),
+    "permuted at an offset (z[1:])": lambda d: permuted(z5.to(d)[1:]) * 2,
+    "stepped permuted (::2)": lambda d: permuted(z5.to(d))[..., ::2] * 2,
+    "chunk(2, 1)[1] permuted": lambda d: permuted(z5.to(d).chunk(2, 1)[1]) * 2,
+    "permuted 6-D complex (rank-7 pair)": lambda d: z6.to(d).permute(0, 2, 1, 3, 5, 4) * 2,
+    "permuted 6-D complex .view(float32)": lambda d: z6.to(d).permute(0, 2, 1, 3, 4, 5).view(torch.float32).contiguous(),
+    "expanded 6-D complex * 2": lambda d: z5.to(d).unsqueeze(1).expand(2, 3, 5, 3, 4, 6) * 2,
+}.items():
+    check(f"rank-6 pairs: {label}", lambda case=case: err(case(hpu), case("cpu")), 1e-5)
 passed = sum(results)
 print(f"PU1_CHECK {passed}/{len(results)} passed", flush=True)
 sys.exit(0 if passed == len(results) else 1)
