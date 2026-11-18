@@ -5,18 +5,17 @@ import pathlib
 import sys
 import time
 
+import habana_frameworks.torch.core  # noqa: F401
 import torch
-from torch.utils.cpp_extension import load
 
 here = pathlib.Path(__file__).parent
-pathlib.Path("/tmp/fft_ext_build").mkdir(exist_ok=True)
-load(name="hpu_complex_ext", sources=[str(here / "fft_ext.cpp")],
-     build_directory="/tmp/fft_ext_build", verbose=False,
-     is_python_module=False)
 sys.path.insert(0, str(here.parent.parent))
 import hpu_complex as H
 from hpu_complex.mode import MODE
 
+# One load, through the package: a second copy of the extension under another
+# name would register a second PrivateUse1 fallback and abort the process.
+H.enable()
 MODE.__enter__()
 print("BENCH LOADED", flush=True)
 
@@ -37,8 +36,6 @@ def cpu_roundtrip(x):
 
 
 print(f"{'shape':>14} {'ext':>9} {'compiled':>9} {'cpu-trip':>9}  (ms/call)")
-import hpu_complex as _hc
-_hc.enable()
 for rows, n in [(1024, 512), (1024, 1024), (1024, 1920), (256, 6000),
                 (8192, 512)]:
     x = torch.randn(rows, n, device="hpu")
@@ -68,7 +65,7 @@ print(f"stft 64x16000 n_fft=512: ext={cell5(lambda: torch.stft(x, 512, 256, retu
       f"pycore-mag={cell5(lambda: H.stft_magnitude(x, 512, 256))} ms", flush=True)
 print("BENCH_DONE")
 
-# accuracy at large n (four-step gate lives at n>=4096)
+# accuracy at large n (dense float32 accumulation)
 for n in (4096, 6000):
     x = torch.randn(8, n)
     got = torch.fft.rfft(x.to("hpu"))

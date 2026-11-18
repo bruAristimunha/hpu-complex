@@ -6,7 +6,7 @@ median of 10 after warmup, device-synchronized.
 ## rfft (ms/call, lower is better)
 
 | Shape | ext (first) | ext (plan cache) | ext (now) | CPU round-trip | Apple MPS* |
-|---|---|---|---|---|---|---|
+|---|---|---|---|---|---|
 | 1024×512 | 230 | 4.07 | **0.48** | 39.7 | 0.06 |
 | 1024×1024 | 250 | 4.42 | **0.29** | 50.0 | 0.11 |
 | 1024×1920 | 249 | 3.88 | **0.49** | 60.3 | — |
@@ -57,10 +57,12 @@ bmm+copy instead), and Habana `stack` rejects strided slice views
 1. **Fused TPC radix kernel** (one launch, radix-2/4, twiddle ROM, via
    `registerUserCustomOp` + `GC_KERNEL_PATH`). This is the only route to
    MPS-class 0.1–1 ms; est. 10–40× over current. Weeks of work.
-2. **Four-step (sqrt-decomposition) GEMM FFT** — implemented, opt-in via
-   `HPU_COMPLEX_FOURSTEP=1`: rel. err at n=6000 drops 5e-04 → 6e-06
-   (issue tolerance met), but it is launch-bound slow at large batch
-   (241 ms @ 256×6000 vs 0.5 ms dense), so dense stays the default.
+2. **Four-step (sqrt-decomposition) GEMM FFT** — tried up to v0.2.0
+   (opt-in), removed in v0.3.0: rel. err at n=6000 dropped 5e-04 → 6e-06
+   (issue tolerance met), but it was launch-bound slow at large batch
+   (241 ms @ 256×6000 vs 0.5 ms dense), so dense GEMMs are the only path.
+   Since the phase index is reduced mod n in integers, the dense path
+   itself is at 5e-07 at n=6000 (v0.3.0, `cpp_ext/bench.py`).
    Making four-step fast needs the twiddle folded into the stage-2 GEMM
    matrices (one batched GEMM, no elementwise pass).
 3. **Radix-2 via aten ops: not recommended.** On this stack we are

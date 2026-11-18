@@ -1,10 +1,19 @@
-"""On-device checks. Run in the Gaudi pod: python3 -m pytest tests/test_on_hpu.py
-Asserts the float FFT core computes correctly ON HPU (vs CPU torch.fft),
-gradients flow, and reports torch.compile behavior (expected: decomp path).
-"""
-import torch
+"""On-device checks: python3 -m pytest hpu_complex/tests/test_on_hpu.py, or, in the Gaudi image (no pytest),
+python3 hpu_complex/tests/run_on_hpu.py. Skipped on machines without habana_frameworks.
 
-import hpu_complex as H
+The float FFT core (hpu_complex.rfft/stft_magnitude) on HPU against torch.fft on the CPU, its gradients and
+torch.compile; complex arithmetic and clip_grad_norm_ with and without the dispatch mode.
+"""
+try:
+    import pytest
+except ImportError:  # the Gaudi image: run_on_hpu.py imports this module directly
+    pytest = None
+else:
+    pytest.importorskip("habana_frameworks.torch")
+import habana_frameworks.torch.core  # noqa: E402,F401
+import torch  # noqa: E402
+
+import hpu_complex as H  # noqa: E402
 
 
 def test_core_fft_on_hpu():
@@ -31,8 +40,9 @@ def test_stft_and_grad_on_hpu():
 
 def test_complex_without_mode_and_clip_grad():
     # Default enable(): no dispatch mode entered, yet complex forward
-    # (via the C++ .out kernels) and clip_grad_norm_ (0-d total_norm:
-    # regression for the stack({a,b}, -2) crash in float_addsub) work.
+    # (the extension's PrivateUse1 kernels) and clip_grad_norm_ (0-d
+    # total_norm: regression for the stack({a,b}, -2) crash in
+    # float_addsub) work.
     H.enable()
     a = torch.complex(torch.randn(4, 8, device="hpu"),
                       torch.randn(4, 8, device="hpu"))

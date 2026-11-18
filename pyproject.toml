@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hpu-complex"
-version = "0.2.0"
+version = "0.3.0"
 description = "Plugin that brings complex64 + torch.fft/torch.stft to Intel Gaudi HPU (unmodified model code, verified on Gaudi2)"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -20,7 +20,6 @@ packages = ["hpu_complex"]
 hpu_complex = [
     "cpp_ext/*.cpp",
     "cpp_ext/*.py",
-    "tpc_kernel/*.md",
     "tpc_kernel/CMakeLists.txt",
     "tpc_kernel/build.sh",
     "tpc_kernel/kernels/gaudi2/*.c",

@@ -7,8 +7,8 @@ sits above the dispatcher, intercepts only when a complex HPU tensor is
 involved, and computes with plain float ops -- float code paths are
 never touched.
 
-Opt-in: enable() does not enter this mode anymore (forward complex ops
-route through the C++ .out kernels instead). Enter it scoped via
+Opt-in: enable() does not enter this mode anymore (complex ops run on
+the extension's PrivateUse1 kernels instead). Enter it scoped via
 hpu_complex.complex_mode(), or globally via enable(enter_mode=True).
 Its remaining job is hosting hooks such as the fused TPC FFT
 (FFT_R2C_HOOK). Non-complex ops are re-called untouched under
