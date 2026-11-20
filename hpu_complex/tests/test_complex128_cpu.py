@@ -180,3 +180,58 @@ def test_gradients_match_torch():
 
     assert_hpu_exact(grad(a.to(HPU)), grad(a), atol=1e-12)
 
+
+
+def test_deepcopy_copies_host_memory_and_keeps_aliases():
+    import copy
+
+    from hpu_complex import _deepcopy_complex128_in_host_memory
+
+    _deepcopy_complex128_in_host_memory()  # enable() installs it; it needs torch.hpu, absent here
+    x = c128(3, 4)
+    z = x.to(HPU)
+    d = copy.deepcopy(z)
+    assert_hpu_exact(d, x)
+    d.mul_(2)  # an independent copy
+    assert_hpu_exact(z, x)
+    # Tensors sharing a storage share the copied one, as torch's deepcopy keeps them (z.real is a float64 view).
+    state = copy.deepcopy({"z": z, "real": z.real, "tail": z[1:], "f64": z.abs()})
+    state["z"].zero_()
+    assert_hpu_exact(state["real"], torch.zeros(3, 4, dtype=torch.float64))
+    assert_hpu_exact(state["tail"], torch.zeros(2, 4, dtype=torch.complex128))
+    assert_hpu_exact(state["f64"], x.abs())
+    # Conjugate views resolve, as torch's deepcopy does; requires_grad and .grad come along.
+    c = copy.deepcopy(z.conj())
+    assert not c.is_conj()
+    assert_hpu_exact(c, x.conj().resolve_conj())
+    w = z.clone().requires_grad_()
+    w.grad = z * 2
+    dw = copy.deepcopy(w)
+    assert dw.requires_grad and dw.is_leaf
+    assert_hpu_exact(dw.detach(), x)
+    assert_hpu_exact(dw.grad, x * 2)
+    p = copy.deepcopy(torch.nn.Parameter(z.clone()))
+    assert isinstance(p, torch.nn.Parameter)
+    assert_hpu_exact(p.detach(), x)
+
+
+@pytest.mark.parametrize("op", [
+    lambda t: t.t_(),
+    lambda t: t.transpose_(0, 1),
+    lambda t: t.unsqueeze_(0),
+    lambda t: t.unsqueeze_(1).squeeze_(1),
+    lambda t: t.as_strided_((2, 2), (1, 4), 1),
+])
+def test_inplace_restride_keeps_storage(op):
+    # torch only changes sizes and strides: other views of the tensor keep sharing its memory.
+    x = c128(3, 4)
+    z, ref = x.to(HPU), x.clone()
+    r, rr = z.real, ref.real
+    assert op(z) is z
+    op(ref)
+    assert z.shape == ref.shape and z.stride() == ref.stride() and z.storage_offset() == ref.storage_offset()
+    assert_hpu_exact(z, ref)
+    z.mul_(2)
+    ref.mul_(2)
+    assert_hpu_exact(r, rr)  # the old .real view sees the write
+    assert_hpu_exact(z, ref)

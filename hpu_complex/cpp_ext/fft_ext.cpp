@@ -46,6 +46,7 @@
 #include <c10/util/FunctionRef.h>
 
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <algorithm>
@@ -307,6 +308,35 @@ at::Tensor to_copy_pu1(const at::Tensor& self, std::optional<at::ScalarType> dty
                     self.device());
   }
   return at::native::_to_copy(self, dtype, layout, device, pin_memory, non_blocking, memory_format);
+}
+
+// copy.deepcopy of a host-backed tensor (hpu_complex.__init__ routes Tensor.__deepcopy__ here): torch's own path
+// clones the storage through Habana's storage copy, which reads the host pointer as device memory (segfault in eager).
+// Without storage_of: a fresh host copy of self's whole storage. With it (a copy made earlier in the same deepcopy, of a
+// tensor sharing self's storage): that copy's storage. Either way self's dtype, sizes, strides and offset, so tensors
+// that alias one another (z, z.real, z[1:]) still alias after the copy, as torch's deepcopy keeps them. Conjugate and
+// negative bits are not carried (torch's deepcopy resolves them: the caller does).
+at::Tensor host_deepcopy(const at::Tensor& self, const std::optional<at::Tensor>& storage_of) {
+  TORCH_CHECK(host_backed(self), "hpu_complex::host_deepcopy: not a complex128 HPU tensor (or a float64 view of one)");
+  c10::Storage storage;
+  if (storage_of.has_value() && storage_of->defined()) {
+    TORCH_CHECK(host_backed(*storage_of) && storage_of->storage().nbytes() == self.storage().nbytes(),
+                "hpu_complex::host_deepcopy: storage_of is not a copy of self's storage");
+    storage = storage_of->storage();
+  } else {
+    const auto nbytes = static_cast<int64_t>(self.storage().nbytes());
+    auto fresh = make_host_empty({nbytes}, {1}, caffe2::TypeMeta::Make<uint8_t>(), self.device());
+    if (nbytes > 0) {
+      std::memcpy(fresh.storage().mutable_data(), self.storage().data(), static_cast<size_t>(nbytes));
+    }
+    storage = fresh.storage();
+  }
+  auto out = at::detail::make_tensor<at::TensorImpl>(c10::TensorImpl::VIEW, std::move(storage), complex_keys(),
+                                                     self.dtype());
+  auto* impl = out.unsafeGetTensorImpl();
+  impl->set_sizes_and_strides(self.sizes(), self.strides());
+  impl->set_storage_offset(self.storage_offset());
+  return out;
 }
 
 // ---- BackendSelect factories -------------------------------------------------
@@ -1173,6 +1203,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("as_strided", TORCH_FN(at::native::as_strided_tensorimpl));
   m.impl("view", TORCH_FN(at::native::view));
   m.impl("_reshape_alias", TORCH_FN(at::native::_reshape_alias));
+  // In-place restride (t_, transpose_, unsqueeze_, squeeze_ call it): sizes and strides change on the same storage,
+  // so views of the tensor keep aliasing it. Its NonFunctional composite would otherwise reach structured_pu1, whose
+  // host path computes on a copy and writes back into fresh storage.
+  m.impl("as_strided_", TORCH_FN(at::native::as_strided__symint));
   m.impl("abs", &abs_pu1);
   m.impl("abs.out", &abs_out_pu1);
   m.impl("sgn", &sgn_pu1);
@@ -1195,6 +1229,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("fill_.Scalar", &fill_pu1);
   m.impl("zero_", &zero_pu1);
   m.impl("set_.source_Storage_storage_offset", &set_storage_pu1);
+}
+
+TORCH_LIBRARY_FRAGMENT(hpu_complex, m) {  // a fragment: Team C's branch may define the namespace too
+  m.def("host_deepcopy(Tensor self, Tensor? storage_of=None) -> Tensor", &host_deepcopy);
 }
 
 // After the registrations above (same translation unit: initialized in order).

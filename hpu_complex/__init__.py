@@ -84,11 +84,20 @@ def _complex_nodes_run_eagerly():
         not _touches_complex(node) and batchable(self, submodules, node))
 
 
+def _host_backed(t):
+    """A complex128 HPU tensor or a float64 view of one: tagged (PrivateUse1) and not complex64, so in host memory."""
+    import torch
+
+    return (t.device.type == "hpu" and t.dtype != torch.complex64
+            and torch._C._dispatch_keys(t).has(torch._C.DispatchKey.PrivateUse1))
+
+
 def _pickle_complex128_through_the_cpu():
     """torch.save of a complex128 HPU tensor (or a float64 view of one): pickled as its CPU values.
 
     Their storage is host memory reporting the HPU device; torch.save would copy it out through Habana's own storage
-    copy, which reads the pointer as device memory. They rebuild with .to(device), honoring map_location.
+    copy, which reads the pointer as device memory. They rebuild with .to(device), honoring map_location. Each tensor
+    is pickled on its own, so tensors that were views of one another load as independent copies.
     """
     import torch
 
@@ -97,14 +106,56 @@ def _pickle_complex128_through_the_cpu():
         return
 
     def _reduce_ex_internal(self, proto):
-        if (self.device.type == "hpu" and self.dtype != torch.complex64
-                and torch._C._dispatch_keys(self).has(torch._C.DispatchKey.PrivateUse1)):
+        if _host_backed(self):
             return (torch._utils._rebuild_device_tensor_from_cpu_tensor,
                     (self.detach().cpu(), self.dtype, str(self.device), self.requires_grad))
         return original(self, proto)
 
     _reduce_ex_internal.hpu_complex = True
     torch.Tensor._reduce_ex_internal = _reduce_ex_internal
+
+
+def _deepcopy_complex128_in_host_memory():
+    """copy.deepcopy of a complex128 HPU tensor (or a float64 view of one): a copy of its host memory.
+
+    torch's own __deepcopy__ clones the storage through Habana's storage copy, which reads the host pointer as device
+    memory (a segfault in eager mode). Here the storage is copied by the extension (hpu_complex::host_deepcopy), once per
+    storage and deepcopy call, so tensors that alias one another still alias in the copy, as torch keeps them. The rest
+    is torch's __deepcopy__: graph leaves only, conjugate/negative bits resolved, requires_grad, .grad and __dict__.
+    """
+    import copy
+
+    import torch
+
+    original = torch.Tensor.__deepcopy__
+    if getattr(original, "hpu_complex", False):
+        return
+
+    def __deepcopy__(self, memo):
+        if (type(self) is not torch.Tensor or not self.is_leaf or not _host_backed(self)
+                or torch.overrides.has_torch_function_unary(self)):
+            return original(self, memo)
+        if id(self) in memo:
+            return memo[id(self)]
+        copies = memo.setdefault("hpu_complex", {})  # storage -> a copy over its copied storage
+        key = self.untyped_storage()._cdata
+        with torch.no_grad():
+            new = torch.ops.hpu_complex.host_deepcopy(self, copies.get(key))
+            copies.setdefault(key, new)
+            if self.is_conj():
+                new = new.conj_physical()
+            if self.is_neg():
+                new = new.neg()
+        if self.requires_grad:
+            new.requires_grad_()
+        if self.grad is not None:
+            new.grad = copy.deepcopy(self.grad, memo)
+        new.__dict__ = copy.deepcopy(self.__dict__, memo)
+        memo[id(self)] = new
+        return new
+
+    __deepcopy__.hpu_complex = True
+    torch.Tensor.__deepcopy__ = __deepcopy__
 
 
 def enable(enter_mode: bool = False):
@@ -131,6 +182,7 @@ def enable(enter_mode: bool = False):
         load_extension()
         _complex_nodes_run_eagerly()
         _pickle_complex128_through_the_cpu()
+        _deepcopy_complex128_in_host_memory()
     elif not hasattr(torch, "hpu") and importlib.util.find_spec("habana_frameworks") is not None:
         warnings.warn("hpu_complex: habana_frameworks is installed but torch.hpu is not loaded, so the "
                       "extension is not enabled; import habana_frameworks.torch.core before "

@@ -266,6 +266,38 @@ def save_load():
 
 
 check("torch.save / torch.load(map_location='hpu')", save_load)
+
+
+def deepcopy_keeps_aliases():
+    import copy
+    state = copy.deepcopy({"z": Ah.clone(), "conj": Ah.conj()})
+    state = copy.deepcopy({"z": state["z"], "real": state["z"].real, "tail": state["z"][1:], "conj": state["conj"]})
+    copied_real = state["real"].clone()
+    state["z"].zero_()  # the copied .real and slice alias the copied z, as torch's deepcopy keeps them
+    return ((copied_real, state["real"], state["tail"], state["conj"], Ah),
+            (A.real, torch.zeros_like(A.real), torch.zeros_like(A[1:]), A.conj().resolve_conj(), A))
+
+
+check("copy.deepcopy (aliases kept, source untouched)", deepcopy_keeps_aliases, atol=0.0)
+
+
+def restride_inplace():
+    outs, refs = [], []
+    for op in (lambda t: t.t_(), lambda t: t.unsqueeze_(0), lambda t: t.unsqueeze_(1).squeeze_(1),
+               lambda t: t.as_strided_((2, 2), (1, 4), 1)):
+        z, ref = A[0, :3, :4].to(hpu), A[0, :3, :4].clone()
+        r, rr = z.real, ref.real
+        op(z)
+        op(ref)
+        assert z.stride() == ref.stride() and z.storage_offset() == ref.storage_offset(), (z.stride(), ref.stride())
+        z.mul_(2)
+        ref.mul_(2)
+        outs += [z, r]  # r: the .real view taken before the restride sees the write
+        refs += [ref, rr]
+    return outs, refs
+
+
+check("t_ / unsqueeze_ / squeeze_ / as_strided_ in place", restride_inplace, atol=0.0)
 check("repr of a complex128 HPU tensor", lambda: (
     Ah[0, 0, :2] if "complex128" in repr(Ah[0, 0, :2]) and "hpu" in repr(Ah[0, 0, :2]) else Ah[0, 0, :1], A[0, 0, :2]))
 

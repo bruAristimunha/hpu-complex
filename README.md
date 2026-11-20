@@ -108,7 +108,8 @@ on the CPU bit for bit (lstsq to 1.8e-15; eigh and svd, checked by reconstructio
 `.to`, `view_as_real`/`view_as_complex`, writes through views, conjugate views, arithmetic with float64 and Python
 scalars, the linear algebra of #7 (matmul, einsum, inv, solve, cholesky, lu, lstsq, det, pinv, matrix_exp, qr, eig,
 eigh, svd, householder_product), FFTs, a backward pass, odd shapes (n = 1, empty, 0-d, offset and transposed views),
-`torch.save`/`torch.load` and `torch.compile(backend="hpu_backend")`. `eigvals` of a float64 (32, 22, 22) batch:
+`torch.save`/`torch.load`, `copy.deepcopy`, in-place restrides (`t_`, `unsqueeze_`, `squeeze_`, `as_strided_`,
+which keep the storage and its views) and `torch.compile(backend="hpu_backend")`. `eigvals` of a float64 (32, 22, 22) batch:
 
 | (32, 22, 22), mean of 20 synced calls | eager | lazy |
 |---|---|---|
@@ -128,11 +129,13 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
 ## Limits
 
 - complex128 computes on the CPU (above): it costs what the CPU op costs (its values are never copied to the card), and runs nothing on the
-  card. Four edges: `torch.fft.rfft` of a float64 HPU tensor still returns complex64 (computed on the card in float32,
+  card. Five edges: `torch.fft.rfft` of a float64 HPU tensor still returns complex64 (computed on the card in float32,
   as before); `view_as_complex` of a float64 HPU tensor returns a complex128 copy, not a view (warned); a Python float
   written into a float64 view of a complex128 tensor (`z.real[i] = 0.1`) passes through a Habana float64 scalar, at
-  float32 precision; and the raw storage of a complex128 HPU tensor is host memory, so `untyped_storage()`-level
-  copies (`z.untyped_storage().cpu()`) are not supported (`torch.save` is, through the CPU values).
+  float32 precision; the raw storage of a complex128 HPU tensor is host memory, so `untyped_storage()`-level
+  copies (`z.untyped_storage().cpu()`) are not supported (`torch.save` and `copy.deepcopy` are); and `torch.save`
+  writes each complex128 HPU tensor as its own copy of its values, so tensors saved together that were views of one
+  another (`{"z": z, "re": z.real}`) load as independent tensors (`copy.deepcopy` keeps them linked, as torch does).
 
 - The dispatch mode is opt-in and scoped
   (`with hpu_complex.complex_mode():`), not global: `enable()` never
