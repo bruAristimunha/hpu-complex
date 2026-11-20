@@ -50,6 +50,14 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   `abs`/`sgn`/`where`, `sum`, copies and fills, `set_` (`torch.load`),
   `_fft_c2c/_fft_c2r`. An unregistered op falls back to the CPU and warns
   once with its name.
+- Complex `mm`/`bmm` (so `@`, `matmul`, `einsum` products) are one real GEMM on the card:
+  `[ar | ai] @ [[br, bi], [-bi, br]] = [cr | ci]`, conjugate operands included (they reach `mm`/`bmm`
+  unresolved). Products below 2²² multiply-adds (batch·m·k·n) go to the CPU instead, one copy each way, where
+  they are faster (warned once; `hpu_complex.set_matmul_cpu_threshold(0)` keeps all of them on the card). The
+  threshold comes from `tests/cmatmul_bench.py` (per-product timings), not from a model. In spd_learn's `Green`
+  no product falls below it; a train step took 296 ms median (291-351) with the card GEMM against 411 ms
+  (369-422) with every product on the CPU, 5 rotated rounds of 20 steps in one process. A second 2-round run
+  measured only 1.05x and 1.21x: the step time drifts by up to 30% within a process, so read it as 1.0-1.4x.
 - FFTs are one GEMM each with a cached real basis; phase indices are
   reduced mod n in integers, so float32 bases stay accurate at any n.
   Under autocast, the GEMMs and the complex arithmetic stay float32, as
@@ -62,7 +70,7 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
 
 ## Verified on Gaudi2 (habana 1.21.4 / torch 2.6.0)
 
-`hpu_complex/tests/pu1_check.py` passes 66/66 checks against torch on the CPU. Errors are max abs unless noted:
+`hpu_complex/tests/pu1_check.py` passes 161/161 checks against torch on the CPU. Errors are max abs unless noted:
 
 | case | error |
 |---|---|
@@ -76,6 +84,11 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
 | complex64 factories (`.to`, `*_like`, `new_zeros`, `full`, `zeros`, `randn`, `scalar_tensor`) give tagged tensors; `torch.load(map_location="hpu")`; `sgn` of NaN/inf/0 as `torch._refs.sgn` | exact |
 | compiled `rfft().abs()` with gradients, static and `dynamic=True` (3 batch shapes, one graph); compiled `stft().abs()` | ≤ 2.2e-05 |
 | compiled `rfft(dim=0)` raises the eager kernel's error | raises |
+| complex `mm`/`bmm`/`@` on both routes (card GEMM, CPU below the threshold): conjugate, strided, broadcast, n = 1, empty operands; `X Xᴴ` with gradients, compiled, and one above the threshold (64×22×300×22, relative); a float32 operand, or a float32 `out=` for `mm`/`bmm`, raises as on the CPU | ≤ 1.0e-06 |
+| inf / NaN through the card GEMM: the same entries non-finite as on the CPU (overflowing sums: ±inf on the card where the CPU gives NaN) | finite ≤ 8.3e-07 rel |
+| complex64 `linalg.eigh`, `svd`, `qr`, `eig`, `matrix_exp`, `householder_product` forward + backward (relative), products on either route | ≤ 1.0e-06 |
+| float32 `linalg.eig`/`eigvals` (complex output) forward + backward, incl. `.mT` and sliced inputs (relative) | ≤ 2.8e-06 |
+| spd_learn `Green` train step (22 channels, batch 32): gradients vs a CPU float64 run, next to the CPU's own float32 error (the card is about 7x float32's error, worst `spd_layers.0.shrinkage_logit`) | 1.1e-03 / 1.5e-04 |
 
 Plain float ops are unchanged. A float-only eager loop (`tests/float_tax.py`) takes 1.9–2.8 ms per iteration with or without the extension loaded (medians 2.70 and 2.58 ms over five runs each): the run-to-run spread is larger than any difference.
 
@@ -120,10 +133,19 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   explicit `RuntimeError` (no process abort). **Workaround:** run in
   eager mode (`PT_HPU_LAZY_MODE=0`), optionally with
   `torch.compile(model, backend="hpu_backend")` for simple complex+FFT
-  modules (note: `spd_learn.models.Green` currently hits
-  `RuntimeError: batch1 must be a 3D tensor` in `aten.bmm.default` under
-  `torch.compile(backend="hpu_backend")` and should use plain eager mode).
-  See `repro/lazy_complex64.py` for a standalone reproducer.
+  modules (note: compiled `spd_learn.models.Green` fails with
+  `synNodeCreateWithId failed for node: strided_view` at its graph's float32
+  `aten._linalg_eigh` node, not reproduced in isolation by `repro/compiled_real_eigh.py`;
+  it trains in plain eager mode).
+  See `repro/lazy_complex64.py` for a standalone reproducer. A real HPU tensor times a Python complex
+  scalar (`x * 2j`, `x + 1j`, as in spd_learn's Gabor wavelets `torch.exp(2j * pi * f * t)`) aborts the
+  process in lazy mode inside Habana's float `mul`/`add`, before any hpu_complex kernel runs, and does so
+  without hpu_complex too (`repro/lazy_complex_scalar.py`): no guard can catch it here, so such models
+  (`Green`) must run in eager mode.
+- The complex linear-algebra kernels themselves run on the CPU (warned): `eigh`, `svd`, `qr`, `eig`,
+  `matrix_exp`, `householder_product`, `solve`, `solve_triangular`, `triu`/`tril`; Habana's own CPU fallback
+  computes `linalg.eig`/`eigvals` of a float32 input (one op per call in the bridge metric). Their gradients
+  match the CPU (above), the rest of the backward stays on the card.
 - Ops outside the registered set run on the CPU
   (warned), among them the fills of complex `randn`/`rand`
   (`normal_`/`uniform_`). `torch.func` transforms and forward-mode AD do
@@ -151,12 +173,18 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
 
 ```bash
 python -m pytest hpu_complex/tests/ -q            # CPU (the HPU tests skip without habana_frameworks)
+# The CPU suite checks the complex GEMM's formula and block layout in pure torch (test_cmatmul_formula_cpu.py).
+# The C++ kernels themselves (mm/bmm and its CPU threshold, copy_pu1 staging, complex_view, the lazy guard)
+# need a Gaudi to run: they are covered only by pu1_check.py, run_on_hpu.py and lazy_check.py below.
 python hpu_complex/tests/pu1_check.py            # Gaudi: eager + compiled vs CPU
 python hpu_complex/tests/r2c_grad_check.py       # Gaudi: rfft gradients vs CPU float64
 python hpu_complex/tests/run_on_hpu.py           # Gaudi: test_on_hpu.py without pytest
 python hpu_complex/tests/lazy_check.py           # Gaudi (PT_HPU_LAZY_MODE=1): lazy-mode guards & real-only safety
 python repro/lazy_complex64.py --mode all        # Gaudi: Issue #3 reproducer (habana-bug, guarded, workaround)
 python hpu_complex/tests/float_tax.py [--ext]    # Gaudi: float-only loop with/without the extension
+python hpu_complex/tests/green_step.py [--ab]    # Gaudi: spd_learn Green train steps, gradients vs CPU, timing
+python hpu_complex/tests/linalg_bwd_bench.py     # Gaudi: complex linalg fwd+bwd, one process per op
+python hpu_complex/tests/cmatmul_bench.py [--sweep]  # Gaudi: complex bmm, card GEMM vs CPU round trip
 python hpu_complex/tpc_kernel/run_fft_test.py     # Gaudi + TPC lib
 ```
 
