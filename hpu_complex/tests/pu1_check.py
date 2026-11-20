@@ -463,8 +463,10 @@ for label, loss_fn, mk in (
 
 
 def hh_grad_err(slice_real=False):
-    ac = cplx(4, 8, 6).requires_grad_()
-    tc = cplx(4, 6).requires_grad_()
+    # Reflectors from geqrf: with a random tau the product is ill-conditioned, and two float32 runs differ by
+    # their summation order alone (CPU complex64 vs complex128: 5e-05 relative already).
+    a0, t0 = torch.geqrf(cplx(4, 8, 6))
+    ac, tc = a0.requires_grad_(), t0.requires_grad_()
     ah = ac.detach().clone().to(hpu).requires_grad_()
     th = tc.detach().clone().to(hpu).requires_grad_()
     loss_fn = (lambda a, t: torch.linalg.householder_product(a, t)[:, :4, :4].real.sum()) if slice_real else (
@@ -585,6 +587,110 @@ def c64_eigvals_fwd_err():
 check("complex64 linalg.eigvals fwd (4, 8, 8)", c64_eigvals_fwd_err, 1e-4)
 check("linalg.eigvals (w.abs.sum) fwd+bwd (rel)",
       lambda: linalg_grad_err(lambda t: torch.linalg.eigvals(t).abs().sum(), lambda: _eig_c64_3d.detach().clone()), 1e-4)
+
+# Complex mm / bmm on the card (one real GEMM): complex x complex, real x complex, complex x real, conjugate and
+# strided operands, matmul broadcasting, gradients through @ and .mH.
+_mm_gen = torch.Generator().manual_seed(7)
+_mc = lambda *s: torch.complex(torch.randn(*s, generator=_mm_gen), torch.randn(*s, generator=_mm_gen))  # noqa: E731
+_A, _B, _R = _mc(5, 7, 4), _mc(5, 4, 3), torch.randn(5, 4, 3, generator=_mm_gen)
+_A2, _B2 = _mc(7, 4), _mc(4, 3)
+def _empty_or_zero_err(got, ref):
+    """err() for results that may hold no element: shape, dtype and tag must match; values when there are any."""
+    if got.shape != ref.shape or got.dtype != ref.dtype or not tagged(got):
+        return math.inf
+    return err(got, ref) if ref.numel() else 0.0
+
+
+def _mixed_dtype_raises():
+    try:
+        torch.bmm(_A.to(hpu), _R.to(hpu))
+    except RuntimeError as e:
+        return 0.0 if "same dtype" in str(e) else 1.0, str(e)[:60]
+    return 1.0, "no error"
+
+
+check("complex bmm with a float32 operand raises, as on the CPU", _mixed_dtype_raises, 0)
+
+
+def _float_out_raises():
+    """mm.out / bmm.out into a float32 out raise on the CPU (dtype check); they must not write the real part here."""
+    msgs = []
+    for name, fn, a, b, shape in (("mm", torch.mm, _A2, _B2, (7, 3)), ("bmm", torch.bmm, _A, _B, (5, 7, 3))):
+        try:
+            fn(a.to(hpu), b.to(hpu), out=torch.empty(*shape, device=hpu))
+        except RuntimeError as e:
+            if "Expected out tensor to have dtype" not in str(e):
+                return 1.0, f"{name}: {str(e)[:60]}"
+            msgs.append(name)
+            continue
+        return 1.0, f"{name}: no error"
+    return 0.0, "raised: " + ", ".join(msgs)
+
+
+for _route, _threshold in (("card", 0), ("CPU<2^22", 1 << 22)):
+    hpu_complex.set_matmul_cpu_threshold(_threshold)
+    check(f"complex mm.out / bmm.out into a float32 out raise, as on the CPU {_route}", _float_out_raises, 0)
+# Both routes: every product on the card's GEMM (threshold 0), then the default (these small ones on the CPU).
+for _route, _threshold in (("card", 0), ("CPU<2^22", 1 << 22)):
+    hpu_complex.set_matmul_cpu_threshold(_threshold)
+    check(f"complex bmm / mm / matmul (incl. cast, conj, strided, broadcast) {_route}", lambda: worst(
+        err(torch.bmm(_A.to(hpu), _B.to(hpu)), torch.bmm(_A, _B)),
+        err(torch.mm(_A2.to(hpu), _B2.to(hpu)), torch.mm(_A2, _B2)),
+        err(_A.to(hpu) @ _R.to(hpu).to(torch.complex64), _A @ _R.to(torch.complex64)),
+        err(_A.to(hpu) @ _A.to(hpu).mH, _A @ _A.mH),
+        err(_A.to(hpu).conj() @ _B.to(hpu), _A.conj() @ _B),
+        err(_A.to(hpu)[:, 1:6:2] @ _B.to(hpu)[:, :, 1:], _A[:, 1:6:2] @ _B[:, :, 1:]),
+        err(_A.to(hpu) @ _B2.to(hpu), _A @ _B2),
+        err(_A2.to(hpu) @ _A2.to(hpu)[0], _A2 @ _A2[0]),
+        err(torch.bmm(_A.to(hpu), _B.to(hpu), out=torch.empty(5, 7, 3, dtype=torch.complex64, device=hpu)),
+            torch.bmm(_A, _B)),
+        (lambda u, v: err(u.to(hpu) @ v.to(hpu), u @ v))(_mc(1, 1, 1), _mc(1, 1, 1)),
+        (lambda u, v: err(u.to(hpu) @ v.to(hpu), u @ v))(_mc(3, 4, 5), _mc(3, 5, 1)),
+        (lambda u, v: err(u.to(hpu) @ v.to(hpu), u @ v))(_mc(3, 1, 5), _mc(3, 5, 4)),
+        (lambda u, v: _empty_or_zero_err(u.to(hpu) @ v.to(hpu), u @ v))(_mc(0, 4, 5), _mc(0, 5, 2)),
+        (lambda u, v: _empty_or_zero_err(u.to(hpu) @ v.to(hpu), u @ v))(_mc(4, 0), _mc(0, 3)),
+    ), 1e-5)
+    check(f"complex matmul X Xᴴ fwd+bwd (rel) {_route}", lambda: grad_err(lambda t: (t @ t.mH).abs(), _A, relative=True), 1e-5)
+    check(f"complex matmul complex@cast(real) fwd+bwd (rel) {_route}",
+          lambda: grad_err(lambda r: (_A.to(r.device) @ r.to(torch.complex64)).abs(), _R, relative=True), 1e-5)
+
+# Adversarial: extreme values through the card GEMM (NaN/inf propagate as on the CPU, overflow to inf), a
+# compiled product (complex nodes run eagerly on these kernels), and one large enough for the default card route.
+hpu_complex.set_matmul_cpu_threshold(0)
+_X = _mc(3, 4, 5)
+_X[0, 1, 2] = complex(float("inf"), 0.0)
+_X[1, 0, 0] = complex(float("nan"), 1.0)
+_X[2] *= 1e30
+_Y = _mc(3, 5, 2)
+_Y[2, :, 0] *= 1e10  # batch 2, column 0: |products| ~ 1e40 overflow float32 to inf
+
+
+def _extreme_rel_err():
+    """Elementwise |got - ref| / max(|ref|, 1) where finite; NaN unless the same entries are non-finite and the NaN
+    input's row is NaN. Overflowing sums are not compared by kind (CPU NaN, card +-inf here): Habana's own float32
+    GEMM treats overflowing intermediates differently from the CPU (measured: [3e38, -3e38] @ [10, 10] is 0.0 on the
+    card, inf on the CPU), while an explicit inf - inf is NaN on both."""
+    got, ref = torch.view_as_real((_X.to(hpu) @ _Y.to(hpu)).cpu()), torch.view_as_real(_X @ _Y)
+    same = torch.equal(got.isfinite(), ref.isfinite()) and bool(got[1, 0].isnan().all())
+    if not same:
+        return math.nan
+    fin = ref.isfinite()
+    return ((got[fin] - ref[fin]).abs() / ref[fin].abs().clamp_min(1)).max().item()
+
+
+check("complex bmm card: inf / NaN / overflow as on the CPU (rel)", _extreme_rel_err, 1e-5)
+hpu_complex.set_matmul_cpu_threshold(1 << 22)
+
+
+def _compiled_matmul_err():
+    f = torch.compile(lambda t: (t @ t.mH).abs().sum(-1), backend="hpu_backend")
+    return grad_err(f, _A, relative=True, reference=lambda t: (t @ t.mH).abs().sum(-1))
+
+
+check("compiled (t @ t.mH).abs() fwd+bwd (rel)", _compiled_matmul_err, 1e-5)
+_Big = _mc(64, 22, 300)
+check("complex X Xᴴ above the threshold (card route, 64x22x300x22) (rel)",
+      lambda: err(_Big.to(hpu) @ _Big.to(hpu).mH, _Big @ _Big.mH) / (_Big @ _Big.mH).abs().max().item(), 1e-5)
 
 x6_cpu = torch.randn(2, 3, 2, 4, 3, 5)
 c6_cpu_perm = (x6_cpu > 0).permute(0, 2, 4, 1, 3, 5)

@@ -132,15 +132,25 @@ at::Tensor habana_view(const at::Tensor& base, caffe2::TypeMeta dtype, c10::IntA
 
 // float HPU [..., k, 2] (last stride 1) -> tagged complex64 [..., k], same storage.
 at::Tensor complex_view(const at::Tensor& pair) {
-  TORCH_CHECK(pair.scalar_type() == at::kFloat && pair.size(-1) == 2 && pair.stride(-1) == 1,
+  TORCH_CHECK(pair.scalar_type() == at::kFloat && pair.size(-1) == 2 && (pair.stride(-1) == 1 || pair.numel() == 0),
               "hpu_complex: a complex view needs float32 [..., 2] with last stride 1");
   auto sizes = pair.sizes().vec();
-  auto strides = pair.strides().vec();
   sizes.pop_back();
+  if (pair.numel() == 0) {  // no element to address: the strides are free, kept contiguous
+    return view_of(pair, complex_keys(), caffe2::TypeMeta::Make<c10::complex<float>>(), sizes,
+                   c10::contiguous_strides(sizes), 0);
+  }
+  auto strides = pair.strides().vec();
   strides.pop_back();
-  for (auto& s : strides) {
-    TORCH_CHECK(s % 2 == 0, "hpu_complex: odd float stride cannot be a complex stride");
-    s /= 2;
+  for (size_t i = 0; i < strides.size(); ++i) {
+    // A size-1 dim's stride addresses nothing, and contiguous() keeps an odd one (a transposed [..., 1, 2] is
+    // already contiguous): any complex stride will do there.
+    if (sizes[i] == 1 && strides[i] % 2 != 0) {
+      strides[i] = 1;
+      continue;
+    }
+    TORCH_CHECK(strides[i] % 2 == 0, "hpu_complex: odd float stride cannot be a complex stride");
+    strides[i] /= 2;
   }
   TORCH_CHECK(pair.storage_offset() % 2 == 0, "hpu_complex: odd storage offset");
   return view_of(pair, complex_keys(), caffe2::TypeMeta::Make<c10::complex<float>>(), sizes, strides,
@@ -578,8 +588,89 @@ at::Tensor where_pu1(const at::Tensor& cond, const at::Tensor& a, const at::Tens
   return complex_result(at::where(cond_dev.unsqueeze(-1), as_pair(a, device), as_pair(b, device)));
 }
 
+// ---- matrix products (PrivateUse1) ----------------------------------------------------------
+
+// Below this many complex multiply-adds a product runs faster on the CPU, one copy each way, than as the card's
+// GEMM and its layout copies (launch-bound, ~0.3-1 ms; Gaudi2, bridge 1.21.4: tests/cmatmul_bench.py --sweep).
+std::atomic<int64_t>& matmul_cpu_below() {
+  static std::atomic<int64_t> macs{int64_t{1} << 22};
+  return macs;
+}
+
+void set_matmul_cpu_threshold(int64_t macs) {
+  TORCH_CHECK(macs >= 0, "hpu_complex: the threshold is a count of multiply-adds, got ", macs);
+  matmul_cpu_below().store(macs, std::memory_order_relaxed);
+}
+
+// a @ b (mm / bmm shapes) of two complex64 tensors, as one real GEMM on the card:
+// [ar | ai] @ [[br, bi], [-bi, br]] = [ar br - ai bi | ar bi + ai br] = [cr | ci]. The operand layouts are copied
+// contiguous first (Habana GEMMs mis-handle strided inputs, see the rfft backward). Mixed dtypes raise, as in torch.
+at::Tensor matmul_pu1(const at::Tensor& a, const at::Tensor& b) {
+  HPU_COMPLEX_NO_AUTOCAST;
+  TORCH_CHECK(a.scalar_type() == b.scalar_type(), "expected m1 and m2 to have the same dtype, but got: ",
+              a.scalar_type(), " != ", b.scalar_type());
+  const auto device = hpu_device_of(a, b);
+  const int64_t macs = a.numel() * b.size(-1);  // batch * m * k * n
+  if (macs < matmul_cpu_below().load(std::memory_order_relaxed)) {
+    TORCH_WARN_ONCE("hpu_complex: complex mm/bmm below the CPU threshold (default 2^22 multiply-adds; first one: ",
+                    macs, ") runs on the CPU, where it is faster than the card's GEMM "
+                    "(hpu_complex.set_matmul_cpu_threshold(0) keeps every product on the card)");
+    return at::matmul(a.to(at::kCPU), b.to(at::kCPU)).to(device);
+  }
+  // (..., r, c) complex -> (..., r, 2c) float = [re | im] per row. mm/bmm fall through the Conjugate key (BLAS folds
+  // the conjugation in), so a conjugate view arrives unresolved: raw_pair gives its stored values, and the
+  // imaginary half is negated here.
+  auto rows = [&](const at::Tensor& t) {
+    auto p = raw_pair(t);
+    p = p.device() == device && p.scalar_type() == at::kFloat ? p : p.to(device, at::kFloat);
+    auto s = p.sizes().vec();
+    s.pop_back();
+    const int64_t c = s.back();
+    s.back() = 2 * c;
+    auto r = p.transpose(-1, -2).contiguous().view(s);
+    return t.is_conj() ? at::cat({r.narrow(-1, 0, c), r.narrow(-1, c, c).neg()}, -1) : r;
+  };
+  const int64_t n = b.size(-1);
+  auto top = rows(b);                                                                   // [br | bi]
+  auto bottom = at::cat({top.narrow(-1, n, n).neg(), top.narrow(-1, 0, n)}, -1);        // [-bi | br]
+  auto out = at::matmul(rows(a), at::cat({top, bottom}, -2));                           // (..., m, 2n) = [cr | ci]
+  auto os = out.sizes().vec();
+  os.back() = n;
+  os.insert(os.end() - 1, 2);  // (..., m, 2, n)
+  return complex_result(out.view(os).transpose(-1, -2).contiguous());
+}
+
+at::Tensor mm_pu1(const at::Tensor& a, const at::Tensor& b) {
+  TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && a.size(1) == b.size(0), "hpu_complex: mm shapes ", a.sizes(), " @ ",
+              b.sizes());
+  return matmul_pu1(a, b);
+}
+
+at::Tensor bmm_pu1(const at::Tensor& a, const at::Tensor& b) {
+  TORCH_CHECK(a.dim() == 3 && b.dim() == 3 && a.size(0) == b.size(0) && a.size(2) == b.size(1),
+              "hpu_complex: bmm shapes ", a.sizes(), " @ ", b.sizes());
+  return matmul_pu1(a, b);
+}
+
 // out variants: compute, then resize and copy into out (complex or real).
 at::Tensor& copy_into(at::Tensor& out, const at::Tensor& value);
+
+// torch's mm.out/bmm.out raise on an out of another dtype; copy_into would write the real part into a float out.
+void check_out_dtype(const at::Tensor& out, const at::Tensor& value) {
+  TORCH_CHECK(out.scalar_type() == value.scalar_type(), "Expected out tensor to have dtype ", value.dtype(),
+              ", but got ", out.dtype(), " instead");
+}
+
+at::Tensor& mm_out_pu1(const at::Tensor& a, const at::Tensor& b, at::Tensor& out) {
+  auto value = mm_pu1(a, b);
+  check_out_dtype(out, value);
+  return copy_into(out, value);
+}
+at::Tensor& bmm_out_pu1(const at::Tensor& a, const at::Tensor& b, at::Tensor& out) {
+  auto value = bmm_pu1(a, b);
+  check_out_dtype(out, value);
+  return copy_into(out, value);
+}
 
 at::Tensor& mul_out_pu1(const at::Tensor& a, const at::Tensor& b, at::Tensor& out) {
   return copy_into(out, mul_pu1(a, b));
@@ -846,6 +937,8 @@ void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
 TORCH_LIBRARY(hpu_complex, m) {
   m.def("set_lazy_mode(bool enabled) -> ()");
   m.impl("set_lazy_mode", &set_lazy_mode);
+  m.def("set_matmul_cpu_threshold(int macs) -> ()");
+  m.impl("set_matmul_cpu_threshold", &set_matmul_cpu_threshold);
 }
 
 TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
@@ -894,6 +987,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("sub.Tensor", &sub_pu1);
   m.impl("sub.out", &sub_out_pu1);
   m.impl("where.self", &where_pu1);
+  m.impl("mm", &mm_pu1);
+  m.impl("mm.out", &mm_out_pu1);
+  m.impl("bmm", &bmm_pu1);
+  m.impl("bmm.out", &bmm_out_pu1);
   m.impl("sum.dim_IntList", &sum_pu1);
   m.impl("sum.IntList_out", &sum_out_pu1);
   m.impl("_copy_from_and_resize", &copy_from_and_resize_pu1);

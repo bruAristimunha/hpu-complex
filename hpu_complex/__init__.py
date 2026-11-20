@@ -126,6 +126,17 @@ def enable(enter_mode: bool = False):
         _MODE_ENTERED = True
 
 
+def set_matmul_cpu_threshold(macs: int):
+    """Complex mm/bmm with fewer multiply-adds (batch * m * k * n) than ``macs`` run on the CPU (warned once).
+
+    Default 2**22: below it, one copy each way and the CPU product beat the card's GEMM and its layout copies on
+    Gaudi2 (bridge 1.21.4). 0 keeps every product on the card. Needs ``enable()`` on a Gaudi first.
+    """
+    import torch
+
+    torch.ops.hpu_complex.set_matmul_cpu_threshold(int(macs))
+
+
 def complex_mode():
     """Scope the complex-arithmetic dispatch mode to a block.
 
@@ -139,5 +150,5 @@ def complex_mode():
     return ComplexMode()
 
 
-__all__ = ["core", "enable", "complex_mode", "rfft", "irfft", "fft",
+__all__ = ["core", "enable", "complex_mode", "set_matmul_cpu_threshold", "rfft", "irfft", "fft",
            "magnitude", "stft", "stft_magnitude"]
