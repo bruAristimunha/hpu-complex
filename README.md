@@ -56,6 +56,16 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   complex64 does on other backends.
 - `torch.compile(backend="hpu_backend")`: complex nodes run eagerly on
   these kernels, the float nodes around them stay in Synapse graphs.
+- `complex128` (e.g. `torch.linalg.eig`/`eigvals` of a float64 matrix):
+  Gaudi2 holds float64 at float32 precision (`1 + 1e-12` copied to the
+  card and back is `1`), so a complex128 in Habana storage could not keep
+  its values. A complex128 HPU tensor is instead kept in host memory that
+  reports the HPU device, and every op on it computes on the CPU in
+  float64: exact, with torch's semantics (views, `view_as_real`,
+  `.real`/`.imag` and conjugate views alias it; float64 results such as
+  `abs`, eigenvalues of `eigh` or `svd`'s `S` stay there too; bool and
+  int results are ordinary HPU tensors). One warning at the first
+  complex128 allocation. `complex64` keeps computing on the card.
 - Optional: a fused TPC kernel (`hpu_complex.tpc.enable_tpc_fft()`,
   needs the kernel lib from `hpu_complex/tpc_kernel/build.sh` on
   `GC_KERNEL_PATH`). Correct, currently slower than the GEMM path.
@@ -92,11 +102,37 @@ braindecode models with `braindecode_kernels.patch_braindecode()` (v0.2.2), one 
 
 No op falls back to the CPU in these runs. The gap is in forward plus backward, where the complex nodes run eagerly outside the Synapse graphs.
 
+`hpu_complex/tests/c128_check.py` (complex128) passes 61/61 checks in eager mode and 57/57 in lazy mode (the 4 left
+out need complex64, which lazy mode lacks), with and without `hpu_ops.enable()`. Every complex128 result equals torch
+on the CPU bit for bit (lstsq to 1.8e-15; eigh and svd, checked by reconstruction, to 1.1e-14), against the same input values as the card holds them: creation, copies,
+`.to`, `view_as_real`/`view_as_complex`, writes through views, conjugate views, arithmetic with float64 and Python
+scalars, the linear algebra of #7 (matmul, einsum, inv, solve, cholesky, lu, lstsq, det, pinv, matrix_exp, qr, eig,
+eigh, svd, householder_product), FFTs, a backward pass, odd shapes (n = 1, empty, 0-d, offset and transposed views),
+`torch.save`/`torch.load` and `torch.compile(backend="hpu_backend")`. `eigvals` of a float64 (32, 22, 22) batch:
+
+| (32, 22, 22), mean of 20 synced calls | eager | lazy |
+|---|---|---|
+| `eigvals(x)`, x float64 HPU → complex128 HPU | 2.90 ms | 2.06 ms |
+| `eig(x)` → complex128 HPU | 5.03 ms | 3.55 ms |
+| baseline: `eigvals(x.cpu())`, same values | 2.80 ms | 2.00 ms |
+| baseline: `eigvals(x.float())` → complex64 HPU | 3.54 ms | — |
+
+`eig` has no Habana kernel: the bridge's own CPU fallback runs once per call for float64 and float32 input alike
+(`cpu_fallback` +1 per call); complex128 ops after it add no bridge fallback. Before this, both failed with
+`Complex datatype is not supported on HPU device.`
+
 Details: [BENCHMARKS.md](BENCHMARKS.md) ·
 why native support is blocked: [ECOSYSTEM.md](ECOSYSTEM.md) ·
 how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
 
 ## Limits
+
+- complex128 computes on the CPU (above): it costs what the CPU op costs (its values are never copied to the card), and runs nothing on the
+  card. Four edges: `torch.fft.rfft` of a float64 HPU tensor still returns complex64 (computed on the card in float32,
+  as before); `view_as_complex` of a float64 HPU tensor returns a complex128 copy, not a view (warned); a Python float
+  written into a float64 view of a complex128 tensor (`z.real[i] = 0.1`) passes through a Habana float64 scalar, at
+  float32 precision; and the raw storage of a complex128 HPU tensor is host memory, so `untyped_storage()`-level
+  copies (`z.untyped_storage().cpu()`) are not supported (`torch.save` is, through the CPU values).
 
 - The dispatch mode is opt-in and scoped
   (`with hpu_complex.complex_mode():`), not global: `enable()` never
@@ -134,11 +170,13 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
 ## Tests
 
 ```bash
-python -m pytest hpu_complex/tests/ -q            # CPU (the HPU tests skip without habana_frameworks)
+python -m pytest hpu_complex/tests/ -q            # CPU (the HPU tests skip without habana_frameworks;
+                                                 #  the complex128 ones build the extension: need ninja)
 python hpu_complex/tests/pu1_check.py            # Gaudi: eager + compiled vs CPU
 python hpu_complex/tests/r2c_grad_check.py       # Gaudi: rfft gradients vs CPU float64
 python hpu_complex/tests/run_on_hpu.py           # Gaudi: test_on_hpu.py without pytest
 python hpu_complex/tests/float_tax.py [--ext]    # Gaudi: float-only loop with/without the extension
+python hpu_complex/tests/c128_check.py [--hpu-ops] [--time]  # Gaudi: complex128 vs CPU (eager and PT_HPU_LAZY_MODE=1)
 python hpu_complex/tpc_kernel/run_fft_test.py     # Gaudi + TPC lib
 ```
 

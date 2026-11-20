@@ -84,6 +84,29 @@ def _complex_nodes_run_eagerly():
         not _touches_complex(node) and batchable(self, submodules, node))
 
 
+def _pickle_complex128_through_the_cpu():
+    """torch.save of a complex128 HPU tensor (or a float64 view of one): pickled as its CPU values.
+
+    Their storage is host memory reporting the HPU device; torch.save would copy it out through Habana's own storage
+    copy, which reads the pointer as device memory. They rebuild with .to(device), honoring map_location.
+    """
+    import torch
+
+    original = torch.Tensor._reduce_ex_internal
+    if getattr(original, "hpu_complex", False):
+        return
+
+    def _reduce_ex_internal(self, proto):
+        if (self.device.type == "hpu" and self.dtype != torch.complex64
+                and torch._C._dispatch_keys(self).has(torch._C.DispatchKey.PrivateUse1)):
+            return (torch._utils._rebuild_device_tensor_from_cpu_tensor,
+                    (self.detach().cpu(), self.dtype, str(self.device), self.requires_grad))
+        return original(self, proto)
+
+    _reduce_ex_internal.hpu_complex = True
+    torch.Tensor._reduce_ex_internal = _reduce_ex_internal
+
+
 def enable(enter_mode: bool = False):
     """Activate: C++ kernels (Gaudi stack); complex nodes of compiled graphs run eagerly on them.
 
@@ -107,6 +130,7 @@ def enable(enter_mode: bool = False):
 
         load_extension()
         _complex_nodes_run_eagerly()
+        _pickle_complex128_through_the_cpu()
     elif not hasattr(torch, "hpu") and importlib.util.find_spec("habana_frameworks") is not None:
         warnings.warn("hpu_complex: habana_frameworks is installed but torch.hpu is not loaded, so the "
                       "extension is not enabled; import habana_frameworks.torch.core before "
