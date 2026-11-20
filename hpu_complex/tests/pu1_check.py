@@ -481,6 +481,42 @@ def hh_grad_err(slice_real=False):
 
 check("linalg.householder_product (abs.sum) fwd+bwd (rel)", lambda: hh_grad_err(False), 5e-4)
 check("linalg.householder_product (slice real.sum) fwd+bwd (rel)", lambda: hh_grad_err(True), 5e-4)
+
+x6_cpu = torch.randn(2, 3, 2, 4, 3, 5)
+c6_cpu_perm = (x6_cpu > 0).permute(0, 2, 4, 1, 3, 5)
+c6_cpu_off_perm = (x6_cpu > 0)[1:].permute(0, 2, 4, 1, 3, 5)
+f6_cpu_perm = x6_cpu.permute(0, 2, 4, 1, 3, 5)
+z6_perm_shape = cplx(*f6_cpu_perm.shape)
+x7_cpu = torch.randn(2, 2, 2, 3, 2, 3, 2)
+c7_cpu_perm = (x7_cpu > 0).permute(1, 0, 2, 3, 4, 5, 6)
+z7_perm_shape = cplx(*c7_cpu_perm.shape)
+for label, case in {
+    "where(6D CPU perm cond, z6_hpu, 0)": lambda d: torch.where(c6_cpu_perm, z6_perm_shape.to(d), 0),
+    "where(6D CPU offset perm cond, z6_hpu[1:], 0)": lambda d: torch.where(
+        c6_cpu_off_perm, z6_perm_shape.to(d)[1:], 0),
+    "where(7D CPU perm cond, z7_hpu, 0)": lambda d: torch.where(c7_cpu_perm, z7_perm_shape.to(d), 0),
+}.items():
+    check(f"rank-6+ CPU exact: {label}", lambda case=case: err(case(hpu), case("cpu")), 0)
+
+c6_hpu_perm = (x6_cpu.to(hpu) > 0).permute(0, 2, 4, 1, 3, 5)
+for label, hpu_fn, cpu_fn in (
+    ("z6_hpu * f6_cpu_perm", lambda: z6_perm_shape.to(hpu) * f6_cpu_perm, lambda: z6_perm_shape * f6_cpu_perm),
+    ("z6_hpu + f6_cpu_perm", lambda: z6_perm_shape.to(hpu) + f6_cpu_perm, lambda: z6_perm_shape + f6_cpu_perm),
+    ("z6_hpu - f6_cpu_perm", lambda: z6_perm_shape.to(hpu) - f6_cpu_perm, lambda: z6_perm_shape - f6_cpu_perm),
+    ("z6_hpu / (f6_cpu_perm.abs() + 1)", lambda: z6_perm_shape.to(hpu) / (f6_cpu_perm.abs() + 1),
+     lambda: z6_perm_shape / (f6_cpu_perm.abs() + 1)),
+    ("where(cond6_hpu, z6_hpu, f6_cpu_perm)", lambda: torch.where(c6_hpu_perm, z6_perm_shape.to(hpu), f6_cpu_perm),
+     lambda: torch.where(c6_cpu_perm, z6_perm_shape, f6_cpu_perm)),
+    ("z6_hpu * f6_cpu_perm.double()", lambda: z6_perm_shape.to(hpu) * f6_cpu_perm.double(),
+     lambda: z6_perm_shape * f6_cpu_perm.double()),
+    ("z6_hpu.copy_(z6_cpu_perm.cdouble())", lambda: torch.zeros_like(z6_perm_shape, device=hpu).copy_(
+        z6.cdouble().permute(0, 2, 4, 1, 3, 5)),
+     lambda: z6.cdouble().permute(0, 2, 4, 1, 3, 5).to(torch.complex64)),
+    ("f6_cpu_perm.double().to(hpu, complex64)", lambda: f6_cpu_perm.double().to(device=hpu, dtype=torch.complex64),
+     lambda: f6_cpu_perm.double().to(torch.complex64)),
+):
+    check(f"rank-6+ CPU float/copy: {label}", lambda hf=hpu_fn, cf=cpu_fn: err(hf(), cf()), 1e-5)
+
 passed = sum(results)
 print(f"PU1_CHECK {passed}/{len(results)} passed", flush=True)
 sys.exit(0 if passed == len(results) else 1)

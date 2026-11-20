@@ -399,7 +399,8 @@ at::Tensor complex_hpu(const at::Tensor& real, const at::Tensor& imag) {
 
 // A real operand as float32 on the HPU (CPU 0-dim tensors are Python numbers).
 at::Tensor hpu_float(const at::Tensor& t, const at::Device& device) {
-  auto r = t.to(device, at::kFloat);
+  auto src = !t.is_hpu() && t.dim() >= 5 && !t.is_contiguous() ? t.contiguous() : t;
+  auto r = src.to(device, at::kFloat);
   return r.dim() >= 5 && !r.is_contiguous() ? r.contiguous() : r;
 }
 
@@ -530,7 +531,8 @@ at::Tensor as_pair(const at::Tensor& t, const at::Device& device) {
 at::Tensor where_pu1(const at::Tensor& cond, const at::Tensor& a, const at::Tensor& b) {
   HPU_COMPLEX_NO_AUTOCAST;
   const auto device = hpu_device_of(a, b);
-  auto cond_dev = cond.to(device);
+  auto cond_src = !cond.is_hpu() && cond.dim() >= 5 && !cond.is_contiguous() ? cond.contiguous() : cond;
+  auto cond_dev = cond_src.to(device);
   if (cond_dev.dim() >= 5 && !cond_dev.is_contiguous()) {
     cond_dev = cond_dev.contiguous();
   }
@@ -581,7 +583,7 @@ at::Tensor& copy_pu1(at::Tensor& self, const at::Tensor& src, bool non_blocking)
     auto dst = raw_pair(self);
     if (src.is_complex()) {
       auto src_pair = raw_pair(src);
-      if (tagged(src) && !src_pair.is_contiguous()) {
+      if (!src_pair.is_contiguous()) {
         src_pair = src_pair.contiguous();
       }
       dst.copy_(src_pair, non_blocking);
@@ -590,7 +592,8 @@ at::Tensor& copy_pu1(at::Tensor& self, const at::Tensor& src, bool non_blocking)
       }
     } else {  // real -> complex: imaginary part 0
       auto src_f = src;
-      if (src_f.is_hpu() && src_f.dim() >= 6 && !src_f.is_contiguous()) {
+      if ((!src_f.is_hpu() && src_f.dim() >= 5 && !src_f.is_contiguous()) ||
+          (src_f.is_hpu() && src_f.dim() >= 6 && !src_f.is_contiguous())) {
         src_f = src_f.contiguous();
       }
       dst.select(-1, 0).copy_(src_f, non_blocking);
@@ -601,7 +604,7 @@ at::Tensor& copy_pu1(at::Tensor& self, const at::Tensor& src, bool non_blocking)
   // complex -> real keeps the real part, as torch does (it warns there).
   TORCH_WARN_ONCE("hpu_complex: casting complex values to real discards the imaginary part");
   auto src_pair = raw_pair(src);
-  if (tagged(src) && !src_pair.is_contiguous()) {
+  if (!src_pair.is_contiguous()) {
     src_pair = src_pair.contiguous();
   }
   auto real_part = src_pair.select(-1, 0);
