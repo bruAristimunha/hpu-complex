@@ -342,6 +342,19 @@ for label, case in {
 }.items():
     check(f"rank-6 pairs: {label}", lambda case=case: err(case(hpu), case("cpu")), 1e-5)
 
+cond_scalar = torch.tensor(True)
+for label, case in {
+    "z6.to(float32)": lambda d: z6.to(d).to(torch.float32),
+    "r6.copy_(z6)": lambda d: torch.empty(z6.shape, dtype=torch.float32, device=d).copy_(z6.to(d)),
+    "where((x5 > 0).permute(...), z5, 0)": lambda d: torch.where(
+        (x5.to(d) > 0).permute(0, 1, 4, 2, 3), z5.to(d), 0),
+    "where(cond_scalar.expand(2, 3, 4, 5, 6), c5, 0)": lambda d: torch.where(
+        cond_scalar.to(d).expand(2, 3, 4, 5, 6), c5.to(d), 0),
+    "where(cond_scalar.expand(2, 5, 3, 4, 6), z5, 0)": lambda d: torch.where(
+        cond_scalar.to(d).expand(2, 5, 3, 4, 6), z5.to(d), 0),
+}.items():
+    check(f"rank-6+ exact: {label}", lambda case=case: err(case(hpu), case("cpu")), 0)
+
 # <6D strided views (slices, transposes, diagonals, stepped, expanded/stride=0) & in-place storage mutation.
 z3, r3, s3 = cplx(3, 5, 5), torch.randn(3, 5, 5), cplx(3, 1, 5)
 z2 = cplx(3, 5)

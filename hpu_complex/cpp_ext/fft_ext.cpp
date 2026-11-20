@@ -530,7 +530,11 @@ at::Tensor as_pair(const at::Tensor& t, const at::Device& device) {
 at::Tensor where_pu1(const at::Tensor& cond, const at::Tensor& a, const at::Tensor& b) {
   HPU_COMPLEX_NO_AUTOCAST;
   const auto device = hpu_device_of(a, b);
-  return complex_result(at::where(cond.to(device).unsqueeze(-1), as_pair(a, device), as_pair(b, device)));
+  auto cond_dev = cond.to(device);
+  if (cond_dev.dim() >= 5 && !cond_dev.is_contiguous()) {
+    cond_dev = cond_dev.contiguous();
+  }
+  return complex_result(at::where(cond_dev.unsqueeze(-1), as_pair(a, device), as_pair(b, device)));
 }
 
 // out variants: compute, then resize and copy into out (complex or real).
@@ -600,7 +604,11 @@ at::Tensor& copy_pu1(at::Tensor& self, const at::Tensor& src, bool non_blocking)
   if (tagged(src) && !src_pair.is_contiguous()) {
     src_pair = src_pair.contiguous();
   }
-  self.copy_(src_pair.select(-1, 0), non_blocking);
+  auto real_part = src_pair.select(-1, 0);
+  if (real_part.is_hpu() && real_part.dim() >= 6 && !real_part.is_contiguous()) {
+    real_part = real_part.contiguous();
+  }
+  self.copy_(real_part, non_blocking);
   return self;
 }
 
