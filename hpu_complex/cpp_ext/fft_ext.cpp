@@ -586,17 +586,41 @@ at::Tensor& copy_pu1(at::Tensor& self, const at::Tensor& src, bool non_blocking)
       if (!src_pair.is_contiguous()) {
         src_pair = src_pair.contiguous();
       }
-      dst.copy_(src_pair, non_blocking);
+      if (!self.is_hpu() && (!dst.is_contiguous() || !src_pair.sizes().equals(dst.sizes()))) {
+        // Habana D2H copy_ fails on non-dense CPU targets and does not broadcast smaller HPU sources; stage via CPU.
+        auto cpu_src = src_pair.to(at::kCPU);
+        if (self.is_conj() != src.is_conj()) {
+          cpu_src.select(-1, 1).neg_();
+        }
+        dst.copy_(cpu_src);
+        return self;
+      }
+      if (self.is_hpu() && !src.is_hpu() && !src_pair.sizes().equals(dst.sizes())) {
+        // Habana H2D copy_ does not broadcast smaller CPU tensors across dst; stage to HPU first.
+        src_pair = src_pair.to(dst.scalar_type()).to(dst.device(), non_blocking);
+      }
+      dst.copy_(src_pair, non_blocking && (self.is_hpu() || self.is_conj() == src.is_conj()));
       if (self.is_conj() != src.is_conj()) {  // the stored values differ by one conjugation
         dst.select(-1, 1).neg_();
       }
     } else {  // real -> complex: imaginary part 0
       auto src_f = src;
-      if ((!src_f.is_hpu() && src_f.dim() >= 5 && !src_f.is_contiguous()) ||
-          (src_f.is_hpu() && src_f.dim() >= 6 && !src_f.is_contiguous())) {
+      if (src_f.dim() >= 5 && !src_f.is_contiguous()) {
         src_f = src_f.contiguous();
       }
-      dst.select(-1, 0).copy_(src_f, non_blocking);
+      auto dst_re = dst.select(-1, 0);
+      if (!self.is_hpu()) {
+        if (src_f.is_hpu()) {
+          src_f = src_f.to(at::kCPU);
+        }
+        dst_re.copy_(src_f);
+        dst.select(-1, 1).zero_();
+        return self;
+      }
+      if (!src_f.is_hpu() && !src_f.sizes().equals(dst_re.sizes())) {
+        src_f = src_f.to(dst_re.scalar_type()).to(dst_re.device(), non_blocking);
+      }
+      dst_re.copy_(src_f, non_blocking);
       dst.select(-1, 1).zero_();
     }
     return self;
@@ -608,8 +632,12 @@ at::Tensor& copy_pu1(at::Tensor& self, const at::Tensor& src, bool non_blocking)
     src_pair = src_pair.contiguous();
   }
   auto real_part = src_pair.select(-1, 0);
-  if (real_part.is_hpu() && real_part.dim() >= 6 && !real_part.is_contiguous()) {
+  if (real_part.is_hpu() && (real_part.dim() >= 5 || !self.is_hpu()) && !real_part.is_contiguous()) {
     real_part = real_part.contiguous();
+  }
+  if (!self.is_hpu() && (!self.is_contiguous() || !real_part.sizes().equals(self.sizes()))) {
+    self.copy_(real_part.to(at::kCPU));
+    return self;
   }
   self.copy_(real_part, non_blocking);
   return self;

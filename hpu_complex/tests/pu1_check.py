@@ -517,6 +517,74 @@ for label, hpu_fn, cpu_fn in (
 ):
     check(f"rank-6+ CPU float/copy: {label}", lambda hf=hpu_fn, cf=cpu_fn: err(hf(), cf()), 1e-5)
 
+# D2H copy_ into non-dense CPU targets (sentinel-filled) and 5-D complex->real D2H.
+def d2h_nondense_copy(view_fn, src_conj=False, dst_conj=False, real_dst=False):
+    if real_dst:
+        ref = torch.full_like(r3, 99.0)
+        got = torch.full_like(r3, 99.0)
+        src_c = view_fn(z3).conj() if src_conj else view_fn(z3)
+        src_h = view_fn(z3.to(hpu)).conj() if src_conj else view_fn(z3.to(hpu))
+        view_fn(ref).copy_(src_c.real)
+        view_fn(got).copy_(src_h)
+        return err(got, ref)
+    ref = torch.full_like(z3, 99.0 + 99.0j)
+    got = torch.full_like(z3, 99.0 + 99.0j)
+    dst_c = view_fn(ref).conj() if dst_conj else view_fn(ref)
+    dst_h = view_fn(got).conj() if dst_conj else view_fn(got)
+    src_c = view_fn(z3).conj() if src_conj else view_fn(z3)
+    src_h = view_fn(z3.to(hpu)).conj() if src_conj else view_fn(z3.to(hpu))
+    dst_c.copy_(src_c)
+    dst_h.copy_(src_h)
+    return err(got, ref)
+
+
+for vname, vf in (
+    ("diagonal", lambda t: t.diagonal(dim1=-2, dim2=-1)),
+    ("narrow", lambda t: t.narrow(-1, 1, 3)),
+    ("step", lambda t: t[:, ::2, 1::2]),
+):
+    check(f"D2H cplx<-cplx {vname}", lambda vf=vf: d2h_nondense_copy(vf), 0)
+    check(f"D2H cplx<-cplx {vname} (src conj)", lambda vf=vf: d2h_nondense_copy(vf, src_conj=True), 0)
+    check(f"D2H cplx<-cplx {vname} (dst conj)", lambda vf=vf: d2h_nondense_copy(vf, dst_conj=True), 0)
+    check(f"D2H real<-cplx {vname}", lambda vf=vf: d2h_nondense_copy(vf, real_dst=True), 0)
+
+check("D2H 5-D real<-cplx (contig & diagonal)", lambda: worst(
+    err(torch.full_like(z5.real, 99.0).copy_(z5.to(hpu)), torch.full_like(z5.real, 99.0).copy_(z5.real)),
+    err((lambda b: (b.diagonal(-2, -1).copy_(z5.to(hpu).diagonal(-2, -1)), b)[1])(torch.full_like(z5.real, 99.0)),
+        (lambda b: (b.diagonal(-2, -1).copy_(z5.diagonal(-2, -1).real), b)[1])(torch.full_like(z5.real, 99.0))),
+), 0)
+
+sc_cplx, sc_real = torch.tensor(1.5 - 2.25j), torch.tensor(3.25)
+v1_cplx, v1_real = cplx(5), torch.randn(5)
+check("D2H broadcast smaller HPU->CPU (cplx & real)", lambda: worst(
+    err(torch.full_like(z3, 99.0 + 99.0j).copy_(sc_cplx.to(hpu)), torch.full_like(z3, 99.0 + 99.0j).copy_(sc_cplx)),
+    err((lambda b: (b.diagonal(-2, -1).copy_(sc_cplx.to(hpu).conj()), b)[1])(torch.full_like(z3, 99.0 + 99.0j)),
+        (lambda b: (b.diagonal(-2, -1).copy_(sc_cplx.conj()), b)[1])(torch.full_like(z3, 99.0 + 99.0j))),
+    err(torch.full_like(r3, 99.0).copy_(sc_cplx.to(hpu)), torch.full_like(r3, 99.0).copy_(sc_cplx.real)),
+), 0)
+
+# H2D copy_ from broadcast-smaller CPU tensors.
+def h2d_broadcast_copy(make_target, src):
+    bc = make_target("cpu")
+    bh = make_target(hpu)
+    (bc[1:] if bc.shape == z3.shape else bc).copy_(src)
+    (bh[1:] if bh.shape == z3.shape else bh).copy_(src)
+    return err(bh, bc)
+
+
+check("H2D broadcast-smaller CPU->HPU copies", lambda: worst(
+    err(torch.zeros_like(z3, device=hpu).copy_(sc_cplx), torch.zeros_like(z3).copy_(sc_cplx)),
+    h2d_broadcast_copy(lambda d: torch.zeros_like(z3, device=d), sc_cplx),
+    err((lambda b: (b.diagonal(-2, -1).copy_(sc_cplx.conj()), b)[1])(torch.zeros_like(z3, device=hpu)),
+        (lambda b: (b.diagonal(-2, -1).copy_(sc_cplx.conj()), b)[1])(torch.zeros_like(z3))),
+    err(torch.zeros_like(z3, device=hpu).copy_(sc_real), torch.zeros_like(z3).copy_(sc_real)),
+    h2d_broadcast_copy(lambda d: torch.zeros_like(z3, device=d), sc_real),
+    h2d_broadcast_copy(lambda d: torch.zeros_like(z3, device=d), v1_cplx),
+    h2d_broadcast_copy(lambda d: torch.zeros_like(z3, device=d), v1_real),
+    err((lambda b: (b.diagonal(-2, -1).copy_(sc_cplx), b)[1])(torch.zeros_like(z6, device=hpu)),
+        (lambda b: (b.diagonal(-2, -1).copy_(sc_cplx), b)[1])(torch.zeros_like(z6))),
+), 0)
+
 passed = sum(results)
 print(f"PU1_CHECK {passed}/{len(results)} passed", flush=True)
 sys.exit(0 if passed == len(results) else 1)

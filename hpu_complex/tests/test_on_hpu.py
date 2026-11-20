@@ -187,3 +187,39 @@ def test_complex_linalg_backward_on_hpu():
         assert _max_err(ah.grad, ac.grad) / max(ac.grad.abs().max().item(), 1e-12) < 5e-4
         assert _max_err(th.grad, tc.grad) / max(tc.grad.abs().max().item(), 1e-12) < 5e-4
     print("complex64 linalg 6-op fwd+bwd: OK")
+
+
+def test_complex_d2h_nondense_and_h2d_broadcast_copy_on_hpu():
+    H.enable()
+    torch.manual_seed(0)
+    hpu = torch.device("hpu")
+    z = torch.complex(torch.randn(3, 5, 5), torch.randn(3, 5, 5))
+    z5 = torch.complex(torch.randn(2, 3, 4, 5, 6), torch.randn(2, 3, 4, 5, 6))
+
+    for vf in (lambda t: t.diagonal(dim1=-2, dim2=-1), lambda t: t.narrow(-1, 1, 3), lambda t: t[:, ::2, 1::2]):
+        for conj_src in (False, True):
+            ref = torch.full_like(z, 99.0 + 99.0j)
+            got = torch.full_like(z, 99.0 + 99.0j)
+            vf(ref).copy_(vf(z).conj() if conj_src else vf(z))
+            vf(got).copy_(vf(z.to(hpu)).conj() if conj_src else vf(z.to(hpu)))
+            assert _max_err(got, ref) == 0.0
+        ref_r = torch.full_like(z.real, 99.0)
+        got_r = torch.full_like(z.real, 99.0)
+        vf(ref_r).copy_(vf(z).real)
+        vf(got_r).copy_(vf(z.to(hpu)))
+        assert _max_err(got_r, ref_r) == 0.0
+
+    ref5 = torch.full_like(z5.real, 99.0)
+    got5 = torch.full_like(z5.real, 99.0)
+    ref5.copy_(z5.real)
+    got5.copy_(z5.to(hpu))
+    assert _max_err(got5, ref5) == 0.0
+
+    for src in (torch.tensor(1.5 - 2.25j), torch.tensor(3.25), torch.complex(torch.randn(5), torch.randn(5))):
+        bc = torch.zeros_like(z)
+        bh = torch.zeros_like(z, device=hpu)
+        bc[1:].copy_(src)
+        bh[1:].copy_(src)
+        torch.hpu.synchronize()
+        assert _max_err(bh, bc) == 0.0
+    print("complex64 D2H non-dense & H2D broadcast copy_: OK")
