@@ -207,6 +207,81 @@ def test_complex_linalg_backward_on_hpu():
     print("complex64 linalg 6-op fwd+bwd: OK")
 
 
+def test_real_eig_and_eigvals_on_hpu():
+    if _skip_if_lazy("test_real_eig_and_eigvals_on_hpu"):
+        return
+    H.enable()
+    torch.manual_seed(42)
+    hpu = torch.device("hpu")
+
+    base_2d = torch.randn(8, 8)
+    base_3d = torch.randn(4, 8, 8)
+    base_4d = torch.randn(2, 3, 6, 6)
+
+    # Forward-only eigvals (requires_grad=False -> aten::_linalg_eigvals).
+    for name, base, vf in (
+        ("2D (8,8)", base_2d, lambda t: t),
+        ("3D (4,8,8)", base_3d, lambda t: t),
+        ("4D (2,3,6,6)", base_4d, lambda t: t),
+        (".mT", base_3d, lambda t: t.mT),
+        ("[:, 1:7, 1:7]", base_3d, lambda t: t[:, 1:7, 1:7]),
+    ):
+        with torch.no_grad():
+            wc = torch.linalg.eigvals(vf(base))
+            wh = torch.linalg.eigvals(vf(base.detach().clone().to(hpu)))
+        torch.hpu.synchronize()
+        assert wh.dtype == torch.complex64, (name, wh.dtype)
+        assert _max_err(wh, wc) < 1e-4, (name, _max_err(wh, wc))
+
+    # Forward + backward for real float32 linalg.eig and linalg.eigvals.
+    cases = [
+        ("eig 2D", base_2d, lambda t: t,
+         lambda t: (lambda w, V: w.abs().sum() + V.abs().sum())(*torch.linalg.eig(t))),
+        ("eig 3D", base_3d, lambda t: t,
+         lambda t: (lambda w, V: w.abs().sum() + V.abs().sum())(*torch.linalg.eig(t))),
+        ("eig 3D gauge-inv", base_3d, lambda t: t,
+         lambda t: (lambda w, V: w[:, :4].real.sum() + (V[:, :4, :4] * V[:, :4, :4].conj()).real.sum())(
+             *torch.linalg.eig(t))),
+        ("eig 4D", base_4d, lambda t: t,
+         lambda t: (lambda w, V: w.abs().sum() + V.abs().sum())(*torch.linalg.eig(t))),
+        ("eig .mT", base_3d, lambda t: t.mT,
+         lambda t: (lambda w, V: w.abs().sum() + V.abs().sum())(*torch.linalg.eig(t))),
+        ("eig slice", base_3d, lambda t: t[:, 1:7, 1:7],
+         lambda t: (lambda w, V: w.abs().sum() + V.abs().sum())(*torch.linalg.eig(t))),
+        ("eigvals 2D", base_2d, lambda t: t, lambda t: torch.linalg.eigvals(t).abs().sum()),
+        ("eigvals 3D", base_3d, lambda t: t, lambda t: torch.linalg.eigvals(t).abs().sum()),
+        ("eigvals 4D", base_4d, lambda t: t, lambda t: torch.linalg.eigvals(t).abs().sum()),
+        ("eigvals .mT", base_3d, lambda t: t.mT, lambda t: torch.linalg.eigvals(t).abs().sum()),
+        ("eigvals slice", base_3d, lambda t: t[:, 1:7, 1:7], lambda t: torch.linalg.eigvals(t).abs().sum()),
+    ]
+    for name, base, vf, loss_fn in cases:
+        bc = base.detach().clone().requires_grad_()
+        bh = base.detach().clone().to(hpu).requires_grad_()
+        yc, yh = loss_fn(vf(bc)), loss_fn(vf(bh))
+        yc.backward()
+        yh.backward()
+        torch.hpu.synchronize()
+        assert bh.grad.dtype == torch.float32, (name, bh.grad.dtype)
+        fwd_rel = _max_err(yh, yc) / max(yc.detach().abs().max().item(), 1.0)
+        bwd_rel = _max_err(bh.grad, bc.grad) / max(bc.grad.abs().max().item(), 1e-12)
+        assert fwd_rel < 1e-4, (name, "fwd", fwd_rel)
+        assert bwd_rel < 1e-4, (name, "bwd", bwd_rel)
+
+    # float64 -> complex128 remains unsupported on HPU (Issue #6).
+    x64 = torch.randn(4, 4, dtype=torch.float64, device=hpu)
+    for name, fn in (
+        ("eig(f64)", lambda: torch.linalg.eig(x64)),
+        ("eigvals(f64)", lambda: torch.linalg.eigvals(x64)),
+    ):
+        try:
+            fn()
+        except RuntimeError as exc:
+            assert "Complex datatype is not supported on HPU device." in str(exc), (name, str(exc))
+        else:
+            raise AssertionError(f"Expected RuntimeError for {name}")
+    print("real float32 eig/eigvals fwd+bwd & float64 RuntimeError: OK")
+
+
 def test_complex_d2h_nondense_and_h2d_broadcast_copy_on_hpu():
     if _skip_if_lazy("test_complex_d2h_nondense_and_h2d_broadcast_copy_on_hpu"):
         return
@@ -297,6 +372,7 @@ def test_lazy_mode_guard_and_real_safety():
         ("torch.complex", lambda: torch.complex(real_re, real_im)),
         ("torch.fft.rfft", lambda: torch.fft.rfft(real_sig)),
         ("torch.linalg.eig(f32)", lambda: torch.linalg.eig(real_mat)),
+        ("torch.linalg.eigvals(f32)", lambda: torch.linalg.eigvals(real_mat)),
     ):
         try:
             fn()

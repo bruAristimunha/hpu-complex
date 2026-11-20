@@ -482,6 +482,110 @@ def hh_grad_err(slice_real=False):
 check("linalg.householder_product (abs.sum) fwd+bwd (rel)", lambda: hh_grad_err(False), 5e-4)
 check("linalg.householder_product (slice real.sum) fwd+bwd (rel)", lambda: hh_grad_err(True), 5e-4)
 
+# Issue #5: real float32 linalg.eig / linalg.eigvals (+ complex64 eigvals) fwd + bwd vs CPU.
+# Use an isolated Generator so existing checks above/below keep their exact RNG sequence.
+_eig_gen = torch.Generator().manual_seed(42)
+_eig_f32_2d = torch.randn(8, 8, generator=_eig_gen)
+_eig_f32_3d = torch.randn(4, 8, 8, generator=_eig_gen)
+_eig_f32_32 = torch.randn(32, 22, 22, generator=_eig_gen)
+_eig_f32_4d = torch.randn(2, 3, 6, 6, generator=_eig_gen)
+_eig_c64_3d = torch.complex(torch.randn(4, 8, 8, generator=_eig_gen),
+                            torch.randn(4, 8, 8, generator=_eig_gen))
+
+
+def real_eig_fwd_err(base, view_fn=lambda t: t, eigvals_only=False):
+    xc = view_fn(base)
+    xh = view_fn(base.detach().clone().to(hpu))
+    with torch.no_grad():
+        if eigvals_only:
+            wc = torch.linalg.eigvals(xc)
+            wh = torch.linalg.eigvals(xh)
+            assert wh.dtype == torch.complex64 and tagged(wh), (wh.dtype, torch._C._dispatch_keys(wh))
+            return err(wh, wc)
+        wc, Vc = torch.linalg.eig(xc)
+        wh, Vh = torch.linalg.eig(xh)
+    assert wh.dtype == torch.complex64 and Vh.dtype == torch.complex64, (wh.dtype, Vh.dtype)
+    assert tagged(wh) and tagged(Vh), (torch._C._dispatch_keys(wh), torch._C._dispatch_keys(Vh))
+    return worst(err(wh, wc), err(Vh, Vc))
+
+
+def real_eig_bwd_err(loss_fn, base, view_fn=lambda t: t):
+    bc = base.detach().clone().requires_grad_()
+    bh = base.detach().clone().to(hpu).requires_grad_()
+    yc, yh = loss_fn(view_fn(bc)), loss_fn(view_fn(bh))
+    yc.backward()
+    yh.backward()
+    assert bh.grad.dtype == torch.float32, bh.grad.dtype
+    assert not tagged(bh.grad), torch._C._dispatch_keys(bh.grad)
+    return worst(
+        err(yh, yc) / max(yc.detach().abs().max().item(), 1.0),
+        err(bh.grad, bc.grad) / max(bc.grad.abs().max().item(), 1e-12),
+    )
+
+
+for label, base, vf in (
+    ("2D (8, 8)", _eig_f32_2d, lambda t: t),
+    ("3D (4, 8, 8)", _eig_f32_3d, lambda t: t),
+    ("3D (32, 22, 22)", _eig_f32_32, lambda t: t),
+    ("4D (2, 3, 6, 6)", _eig_f32_4d, lambda t: t),
+    (".mT", _eig_f32_3d, lambda t: t.mT),
+    ("[:, 1:7, 1:7]", _eig_f32_3d, lambda t: t[:, 1:7, 1:7]),
+):
+    check(f"real f32 linalg.eig fwd {label}", lambda b=base, vf=vf: real_eig_fwd_err(b, vf), 1e-4)
+
+for label, loss_fn, base, vf in (
+    ("3D (w.abs + V.abs)", lambda t: (lambda w, V: w.abs().sum() + V.abs().sum())(*torch.linalg.eig(t)),
+     _eig_f32_3d, lambda t: t),
+    ("3D (gauge-inv)", lambda t: (lambda w, V: w[:, :4].real.sum() + (V[:, :4, :4] * V[:, :4, :4].conj()).real.sum())(
+        *torch.linalg.eig(t)), _eig_f32_3d, lambda t: t),
+    ("3D (w.abs only)", lambda t: torch.linalg.eig(t)[0].abs().sum(), _eig_f32_3d, lambda t: t),
+    ("3D (V.abs only)", lambda t: torch.linalg.eig(t)[1].abs().sum(), _eig_f32_3d, lambda t: t),
+    ("2D (8, 8)", lambda t: (lambda w, V: w.abs().sum() + V.abs().sum())(*torch.linalg.eig(t)),
+     _eig_f32_2d, lambda t: t),
+    ("4D (2, 3, 6, 6)", lambda t: (lambda w, V: w.abs().sum() + V.abs().sum())(*torch.linalg.eig(t)),
+     _eig_f32_4d, lambda t: t),
+    (".mT", lambda t: (lambda w, V: w.abs().sum() + V.abs().sum())(*torch.linalg.eig(t)),
+     _eig_f32_3d, lambda t: t.mT),
+    ("[:, 1:7, 1:7]", lambda t: (lambda w, V: w.abs().sum() + V.abs().sum())(*torch.linalg.eig(t)),
+     _eig_f32_3d, lambda t: t[:, 1:7, 1:7]),
+    ("V.permute(1, 0, 2) grad_V",
+     lambda t: (lambda w, V: w.abs().sum() + V.permute(1, 0, 2).abs().sum())(*torch.linalg.eig(t)),
+     _eig_f32_3d, lambda t: t),
+):
+    check(f"real f32 linalg.eig {label} fwd+bwd (rel)",
+          lambda lf=loss_fn, b=base, vf=vf: real_eig_bwd_err(lf, b, vf), 1e-4)
+
+for label, base, vf in (
+    ("2D (8, 8)", _eig_f32_2d, lambda t: t),
+    ("3D (4, 8, 8)", _eig_f32_3d, lambda t: t),
+    (".mT", _eig_f32_3d, lambda t: t.mT),
+    ("[:, 1:7, 1:7]", _eig_f32_3d, lambda t: t[:, 1:7, 1:7]),
+):
+    check(f"real f32 linalg.eigvals fwd {label}",
+          lambda b=base, vf=vf: real_eig_fwd_err(b, vf, eigvals_only=True), 1e-4)
+
+for label, base, vf in (
+    ("2D (8, 8)", _eig_f32_2d, lambda t: t),
+    ("3D (4, 8, 8)", _eig_f32_3d, lambda t: t),
+    ("4D (2, 3, 6, 6)", _eig_f32_4d, lambda t: t),
+    (".mT", _eig_f32_3d, lambda t: t.mT),
+    ("[:, 1:7, 1:7]", _eig_f32_3d, lambda t: t[:, 1:7, 1:7]),
+):
+    check(f"real f32 linalg.eigvals {label} fwd+bwd (rel)",
+          lambda b=base, vf=vf: real_eig_bwd_err(lambda t: torch.linalg.eigvals(t).abs().sum(), b, vf), 1e-4)
+
+def c64_eigvals_fwd_err():
+    with torch.no_grad():
+        wc = torch.linalg.eigvals(_eig_c64_3d)
+        wh = torch.linalg.eigvals(_eig_c64_3d.detach().clone().to(hpu))
+    assert wh.dtype == torch.complex64 and tagged(wh), (wh.dtype, torch._C._dispatch_keys(wh))
+    return err(wh, wc)
+
+
+check("complex64 linalg.eigvals fwd (4, 8, 8)", c64_eigvals_fwd_err, 1e-4)
+check("linalg.eigvals (w.abs.sum) fwd+bwd (rel)",
+      lambda: linalg_grad_err(lambda t: torch.linalg.eigvals(t).abs().sum(), lambda: _eig_c64_3d.detach().clone()), 1e-4)
+
 x6_cpu = torch.randn(2, 3, 2, 4, 3, 5)
 c6_cpu_perm = (x6_cpu > 0).permute(0, 2, 4, 1, 3, 5)
 c6_cpu_off_perm = (x6_cpu > 0)[1:].permute(0, 2, 4, 1, 3, 5)
