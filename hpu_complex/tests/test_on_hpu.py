@@ -78,3 +78,112 @@ def test_compile_attempt():
     torch.hpu.synchronize()
     assert y.device.type == "hpu" and y.shape == (2, 513)
     print(f"compile via core ops: OK {tuple(y.shape)} {y.device}")
+
+
+def _max_err(a, b):
+    a, b = a.detach().cpu(), b.detach().cpu()
+    if a.is_complex():
+        a = torch.view_as_real(a.resolve_conj())
+        b = torch.view_as_real(b.to(a.dtype if not b.is_complex() else b.dtype).resolve_conj())
+    return (a.double() - b.double()).abs().max().item()
+
+
+def test_complex_strided_and_inplace_views_on_hpu():
+    H.enable()
+    torch.manual_seed(0)
+    hpu = torch.device("hpu")
+    z = torch.complex(torch.randn(3, 5, 5), torch.randn(3, 5, 5))
+    r = torch.randn(3, 5, 5)
+    s = torch.complex(torch.randn(3, 1, 5), torch.randn(3, 1, 5))
+
+    for name, view_fn in (
+        ("slice", lambda t: t[1:, 1:, 1:]),
+        ("transpose", lambda t: t.transpose(1, 2)),
+        ("diagonal", lambda t: t.diagonal(dim1=-2, dim2=-1)),
+    ):
+        zh, zc = view_fn(z.to(hpu)), view_fn(z)
+        for got, ref in (
+            (zh * zh, zc * zc),
+            (zh / (zh.abs() + 1), zc / (zc.abs() + 1)),
+            (zh + 1.5, zc + 1.5),
+            (zh - zh, zc - zc),
+            (zh.abs(), zc.abs()),
+            (zh.sgn(), zc.sgn()),
+            (torch.view_as_real(zh).contiguous(), torch.view_as_real(zc)),
+        ):
+            assert _max_err(got, ref) < 1e-5, (name, _max_err(got, ref))
+
+        for mutate in (
+            lambda b: view_fn(b).fill_(1.25 - 0.75j),
+            lambda b: view_fn(b).zero_(),
+            lambda b: view_fn(b).mul_(2.0 + 0.5j),
+            lambda b: view_fn(b).add_(0.5 - 1.0j),
+            lambda b: view_fn(b).copy_(view_fn(z.to(b.device)).conj()),
+        ):
+            bc, bh = z.clone(), z.to(hpu)
+            mutate(bc)
+            mutate(bh)
+            torch.hpu.synchronize()
+            assert _max_err(bh, bc) < 1e-5, (name, _max_err(bh, bc))
+
+    zh_exp, zc_exp = s[1:].to(hpu).expand(2, 5, 5), s[1:].expand(2, 5, 5)
+    assert _max_err(zh_exp * 2.0, zc_exp * 2.0) < 1e-5
+    assert _max_err(zh_exp + z[1:].to(hpu), zc_exp + z[1:]) < 1e-5
+    assert _max_err(zh_exp.abs(), zc_exp.abs()) < 1e-5
+    assert _max_err(zh_exp.sgn(), zc_exp.sgn()) < 1e-5
+    assert _max_err(z.to(hpu) * torch.ones((), device=hpu).expand(3, 5, 5),
+                    z * torch.ones(()).expand(3, 5, 5)) < 1e-5
+    assert _max_err(z.to(hpu) / torch.full((), 2.0, device=hpu).expand(3, 5, 5),
+                    z / torch.full((), 2.0).expand(3, 5, 5)) < 1e-5
+    assert _max_err(z.to(hpu)[2, 3].sum(), z[2, 3].sum()) < 1e-5
+    assert _max_err(z.to(hpu) + r.to(hpu), z + r) < 1e-5
+    print("complex <6D strided, expanded & in-place views: OK")
+
+
+def test_complex_linalg_backward_on_hpu():
+    H.enable()
+    torch.manual_seed(0)
+    hpu = torch.device("hpu")
+
+    def cplx(*shape):
+        return torch.complex(torch.randn(*shape), torch.randn(*shape))
+
+    a_h = cplx(4, 8, 8)
+    herm = (a_h @ a_h.mH + 8 * torch.eye(8, dtype=torch.complex64)).detach()
+    sq = cplx(4, 8, 8)
+    rect = cplx(4, 8, 6)
+
+    cases = [
+        ("eigh", lambda t: (lambda w, V: w.sum() + V.abs().sum())(*torch.linalg.eigh(t)), herm, 1e-4),
+        ("svd", lambda t: (lambda U, S, Vh: U.abs().sum() + S.sum() + Vh.abs().sum())(
+            *torch.linalg.svd(t, full_matrices=False)), rect, 1e-4),
+        ("qr", lambda t: (lambda Q, R: Q.real.sum() + R[:, :2].abs().sum())(*torch.linalg.qr(t)), rect, 1e-4),
+        ("eig", lambda t: (lambda w, V: w.abs().sum() + V.abs().sum())(*torch.linalg.eig(t)), sq, 1e-4),
+        ("matrix_exp", lambda t: torch.linalg.matrix_exp(t).real.sum() +
+         torch.linalg.matrix_exp(t)[:, :2, :2].abs().sum(), sq, 1e-4),
+        ("matrix_exp_mH", lambda t: torch.linalg.matrix_exp(t.mH).abs().sum(), sq, 1e-4),
+    ]
+    for name, fn, inp, tol in cases:
+        xc = inp.clone().requires_grad_()
+        xh = inp.clone().to(hpu).requires_grad_()
+        yc, yh = fn(xc), fn(xh)
+        yc.backward()
+        yh.backward()
+        torch.hpu.synchronize()
+        assert _max_err(yh, yc) / max(yc.detach().abs().max().item(), 1.0) < tol, (name, "fwd", _max_err(yh, yc))
+        rel = _max_err(xh.grad, xc.grad) / max(xc.grad.abs().max().item(), 1e-12)
+        assert rel < tol, (name, "bwd", rel)
+
+    for hh_fn in (
+        lambda a, tau: torch.linalg.householder_product(a, tau).abs().sum(),
+        lambda a, tau: torch.linalg.householder_product(a, tau)[:, :4, :4].real.sum(),
+    ):
+        ac, tc = cplx(4, 8, 6).requires_grad_(), cplx(4, 6).requires_grad_()
+        ah, th = ac.detach().clone().to(hpu).requires_grad_(), tc.detach().clone().to(hpu).requires_grad_()
+        yc, yh = hh_fn(ac, tc), hh_fn(ah, th)
+        yc.backward()
+        yh.backward()
+        torch.hpu.synchronize()
+        assert _max_err(ah.grad, ac.grad) / max(ac.grad.abs().max().item(), 1e-12) < 5e-4
+        assert _max_err(th.grad, tc.grad) / max(tc.grad.abs().max().item(), 1e-12) < 5e-4
+    print("complex64 linalg 6-op fwd+bwd: OK")

@@ -338,8 +338,136 @@ for label, case in {
     "permuted 6-D complex (rank-7 pair)": lambda d: z6.to(d).permute(0, 2, 1, 3, 5, 4) * 2,
     "permuted 6-D complex .view(float32)": lambda d: z6.to(d).permute(0, 2, 1, 3, 4, 5).view(torch.float32).contiguous(),
     "expanded 6-D complex * 2": lambda d: z5.to(d).unsqueeze(1).expand(2, 3, 5, 3, 4, 6) * 2,
+    "fill_ on offset permuted 5-D": lambda d: written(d, lambda b: b[1:].permute(0, 2, 1, 3, 4).fill_(3 + 4j)),
 }.items():
     check(f"rank-6 pairs: {label}", lambda case=case: err(case(hpu), case("cpu")), 1e-5)
+
+# <6D strided views (slices, transposes, diagonals, stepped, expanded/stride=0) & in-place storage mutation.
+z3, r3, s3 = cplx(3, 5, 5), torch.randn(3, 5, 5), cplx(3, 1, 5)
+z2 = cplx(3, 5)
+for vname, view_fn in (
+    ("slice offset", lambda t: t[1:, 1:, 1:]),
+    ("transpose", lambda t: t.transpose(1, 2)),
+    ("mH", lambda t: t.mH),
+    ("diagonal", lambda t: t.diagonal(dim1=-2, dim2=-1)),
+    ("stepped", lambda t: t[::2, 1::2, ::2]),
+):
+    check(f"<6D {vname}: mul/div/add/sub/abs/sgn/view_as_real", lambda vf=view_fn: worst(
+        err(vf(z3.to(hpu)) * vf(z3.to(hpu)), vf(z3) * vf(z3)),
+        err(vf(z3.to(hpu)) / (vf(z3.to(hpu)).abs() + 1), vf(z3) / (vf(z3).abs() + 1)),
+        err(vf(z3.to(hpu)) + 1.5, vf(z3) + 1.5),
+        err(vf(z3.to(hpu)) - vf(z3.to(hpu)), vf(z3) - vf(z3)),
+        err(vf(z3.to(hpu)).abs(), vf(z3).abs()),
+        err(vf(z3.to(hpu)).sgn(), vf(z3).sgn()),
+        err(torch.view_as_real(vf(z3.to(hpu)).resolve_conj()).contiguous(),
+            torch.view_as_real(vf(z3).resolve_conj())),
+    ), 1e-5)
+
+    def inplace_view(vf=view_fn):
+        errors = []
+        for mutate in (
+            lambda b: vf(b).fill_(1.25 - 0.75j),
+            lambda b: vf(b).zero_(),
+            lambda b: vf(b).mul_(2.0 + 0.5j),
+            lambda b: vf(b).add_(0.5 - 1.0j),
+            lambda b: vf(b).copy_(vf(z3.to(b.device)).conj()),
+            lambda b: vf(b).copy_(torch.ones_like(vf(b).real)),
+        ):
+            bc, bh = z3.clone(), z3.to(hpu)
+            mutate(bc)
+            mutate(bh)
+            errors.append(err(bh, bc))
+        return worst(*errors)
+
+    check(f"<6D {vname}: inplace fill_/zero_/mul_/add_/copy_", inplace_view, 1e-5)
+
+check("<6D expanded (offset, stride=0): ops & view_as_real", lambda: worst(
+    err(s3[1:].to(hpu).expand(2, 5, 5) * 2.0, s3[1:].expand(2, 5, 5) * 2.0),
+    err(s3[1:].to(hpu).expand(2, 5, 5) + z3[1:].to(hpu), s3[1:].expand(2, 5, 5) + z3[1:]),
+    err(s3[1:].to(hpu).expand(2, 5, 5).abs(), s3[1:].expand(2, 5, 5).abs()),
+    err(s3[1:].to(hpu).expand(2, 5, 5).sgn(), s3[1:].expand(2, 5, 5).sgn()),
+    err(torch.view_as_real(s3[1:].to(hpu).expand(2, 5, 5)).contiguous(),
+        torch.view_as_real(s3[1:].expand(2, 5, 5))),
+), 1e-5)
+
+check("<6D real stride-0 / diag / 5D-perm with complex", lambda: worst(
+    err(z3.to(hpu) * torch.ones((), device=hpu).expand(3, 5, 5), z3 * torch.ones(()).expand(3, 5, 5)),
+    err(z3.to(hpu) / torch.full((), 2.0, device=hpu).expand(3, 5, 5), z3 / torch.full((), 2.0).expand(3, 5, 5)),
+    err(torch.full((), 2.0, device=hpu).expand(3, 5, 5) / (z3.to(hpu) + 10),
+        torch.full((), 2.0).expand(3, 5, 5) / (z3 + 10)),
+    err(z2.to(hpu) * r3.to(hpu).diagonal(dim1=-2, dim2=-1), z2 * r3.diagonal(dim1=-2, dim2=-1)),
+    err(c5.to(hpu).permute(0, 2, 1, 3, 4) * r5.to(hpu).permute(0, 2, 1, 3, 4),
+        c5.permute(0, 2, 1, 3, 4) * r5.permute(0, 2, 1, 3, 4)),
+    err(torch.where(torch.tensor(True, device=hpu).expand(3, 5, 5), z3.to(hpu), r3.to(hpu)),
+        torch.where(torch.tensor(True).expand(3, 5, 5), z3, r3)),
+    err(z3.to(hpu)[2, 3].sum(), z3[2, 3].sum()),
+), 1e-5)
+
+# Issue #4: complex64 linalg forward + backward gradient accuracy vs CPU (with .sum() / sliced / .real.sum() losses).
+def linalg_grad_err(loss_fn, make_inp):
+    xc = make_inp().requires_grad_()
+    xh = xc.detach().clone().to(hpu).requires_grad_()
+    yc, yh = loss_fn(xc), loss_fn(xh)
+    yc.backward()
+    yh.backward()
+    return worst(
+        err(yh, yc) / max(yc.detach().abs().max().item(), 1.0),
+        err(xh.grad, xc.grad) / max(xc.grad.abs().max().item(), 1e-12),
+    )
+
+
+mk_herm = lambda: (lambda a: (a @ a.mH + 8 * torch.eye(8, dtype=torch.complex64)).detach())(cplx(4, 8, 8))  # noqa: E731
+mk_sq = lambda: cplx(4, 8, 8)  # noqa: E731
+mk_rect = lambda: cplx(4, 8, 6)  # noqa: E731
+
+for label, loss_fn, mk in (
+    ("linalg.eigh (w.sum + V.abs.sum)",
+     lambda t: (lambda w, V: w.sum() + V.abs().sum())(*torch.linalg.eigh(t)), mk_herm),
+    ("linalg.eigh (sliced gauge-inv V @ V.mH)",
+     lambda t: (lambda w, V: w[:, :4].sum() + (V[:, :4, :4] @ V[:, :4, :4].mH).real.sum())(*torch.linalg.eigh(t)),
+     mk_herm),
+    ("linalg.svd (U.abs + S + Vh.abs)",
+     lambda t: (lambda U, S, Vh: U.abs().sum() + S.sum() + Vh.abs().sum())(
+         *torch.linalg.svd(t, full_matrices=False)), mk_rect),
+    ("linalg.svd (sliced gauge-inv U @ U.mH + S)",
+     lambda t: (lambda U, S, Vh: (U[:, :4, :4] @ U[:, :4, :4].mH).real.sum() + S[:, :4].sum())(
+         *torch.linalg.svd(t, full_matrices=False)), mk_rect),
+    ("linalg.qr (Q.abs + R.abs)",
+     lambda t: (lambda Q, R: Q.abs().sum() + R.abs().sum())(*torch.linalg.qr(t)), mk_rect),
+    ("linalg.qr (Q.real + R[:, :2].abs)",
+     lambda t: (lambda Q, R: Q.real.sum() + R[:, :2].abs().sum())(*torch.linalg.qr(t)), mk_rect),
+    ("linalg.eig (w.abs + V.abs)",
+     lambda t: (lambda w, V: w.abs().sum() + V.abs().sum())(*torch.linalg.eig(t)), mk_sq),
+    ("linalg.eig (w.real + gauge-inv V*V.conj)",
+     lambda t: (lambda w, V: w[:, :4].real.sum() + (V[:, :4, :4] * V[:, :4, :4].conj()).real.sum())(
+         *torch.linalg.eig(t)), mk_sq),
+    ("linalg.matrix_exp (abs.sum)", lambda t: torch.linalg.matrix_exp(t).abs().sum(), mk_sq),
+    ("linalg.matrix_exp (real.sum & slice)",
+     lambda t: torch.linalg.matrix_exp(t).real.sum() + torch.linalg.matrix_exp(t)[:, :2, :2].abs().sum(), mk_sq),
+    ("linalg.matrix_exp (mH input)", lambda t: torch.linalg.matrix_exp(t.mH).abs().sum(), mk_sq),
+):
+    check(f"{label} fwd+bwd (rel)", lambda lf=loss_fn, mk=mk: linalg_grad_err(lf, mk), 1e-4)
+
+
+def hh_grad_err(slice_real=False):
+    ac = cplx(4, 8, 6).requires_grad_()
+    tc = cplx(4, 6).requires_grad_()
+    ah = ac.detach().clone().to(hpu).requires_grad_()
+    th = tc.detach().clone().to(hpu).requires_grad_()
+    loss_fn = (lambda a, t: torch.linalg.householder_product(a, t)[:, :4, :4].real.sum()) if slice_real else (
+        lambda a, t: torch.linalg.householder_product(a, t).abs().sum())
+    yc, yh = loss_fn(ac, tc), loss_fn(ah, th)
+    yc.backward()
+    yh.backward()
+    return worst(
+        err(yh, yc) / max(yc.detach().abs().max().item(), 1.0),
+        err(ah.grad, ac.grad) / max(ac.grad.abs().max().item(), 1e-12),
+        err(th.grad, tc.grad) / max(tc.grad.abs().max().item(), 1e-12),
+    )
+
+
+check("linalg.householder_product (abs.sum) fwd+bwd (rel)", lambda: hh_grad_err(False), 5e-4)
+check("linalg.householder_product (slice real.sum) fwd+bwd (rel)", lambda: hh_grad_err(True), 5e-4)
 passed = sum(results)
 print(f"PU1_CHECK {passed}/{len(results)} passed", flush=True)
 sys.exit(0 if passed == len(results) else 1)

@@ -82,12 +82,12 @@ at::Tensor view_of(const at::Tensor& base, DispatchKeySet keys, caffe2::TypeMeta
   return result;
 }
 
-// A real view of base's storage for Habana's kernels. Habana misreads a non-contiguous view of rank 6 or more built
-// as a bare TensorImpl (view_of) or with as_strided, its own tensors' too, e.g. the float pair of a permuted 5-D complex
-// tensor; it reads the same layout right as a permute of a contiguous view. So a dense one (a permuted contiguous
-// block) is built that way. Other layouts of rank 6 or more go through Habana's as_strided on a contiguous 2-D base
-// over the whole storage, which it reads right for some of them. Lower ranks and expanded views stay bare: Habana
-// reads them right, and rejects some expanded views as strided views (synStatus 1 in strided_view / strided_insert).
+// A real view of base's storage for Habana's kernels. Habana misreads a bare TensorImpl (view_of) whenever its
+// storage_offset is nonzero or its layout is non-contiguous/expanded (Synapse treats sizes as the physical buffer
+// bounds and rejects out-of-bounds offsets or strides with synStatus 1 in strided_view / strided_insert). It also
+// misreads as_strided views of rank 6 or more, so dense rank-6+ layouts are built via narrow + view + permute on a
+// zero-offset full-storage view_of, while lower-rank / non-dense / expanded layouts go through Habana's as_strided
+// over the full storage.
 at::Tensor habana_view(const at::Tensor& base, caffe2::TypeMeta dtype, c10::IntArrayRef sizes, c10::IntArrayRef strides,
                        int64_t storage_offset) {
   auto view = view_of(base, hpu_float_keys(), dtype, sizes, strides, storage_offset);
@@ -95,10 +95,11 @@ at::Tensor habana_view(const at::Tensor& base, caffe2::TypeMeta dtype, c10::IntA
   for (size_t i = 0; i < sizes.size(); ++i) {
     expanded |= sizes[i] > 1 && strides[i] == 0;
   }
-  if (view.dim() < 6 || view.is_contiguous() || expanded) {
+  if (storage_offset == 0 && view.is_contiguous() && !expanded) {
     return view;
   }
-  if (view.is_non_overlapping_and_dense()) {
+  const auto base_numel = static_cast<int64_t>(base.storage().nbytes() / dtype.itemsize());
+  if (view.dim() >= 6 && !expanded && view.is_non_overlapping_and_dense()) {
     // The dims from the largest stride to the smallest, as a contiguous block, permuted back.
     const auto n = static_cast<int64_t>(sizes.size());
     std::vector<int64_t> order(n), block(n), block_strides(n, 1), dims(n);
@@ -111,12 +112,19 @@ at::Tensor habana_view(const at::Tensor& base, caffe2::TypeMeta dtype, c10::IntA
     for (int64_t k = n - 2; k >= 0; --k) {
       block_strides[k] = block_strides[k + 1] * block[k + 1];
     }
-    return view_of(base, hpu_float_keys(), dtype, block, block_strides, storage_offset).permute(dims);
+    if (storage_offset == 0) {
+      return view_of(base, hpu_float_keys(), dtype, block, block_strides, 0).permute(dims);
+    }
+    const int64_t view_numel = view.numel();
+    const int64_t off = view_numel == 0 ? std::min(storage_offset, base_numel) : storage_offset;
+    return view_of(base, hpu_float_keys(), dtype, {base_numel}, {1}, 0)
+        .narrow(0, off, view_numel)
+        .view(block)
+        .permute(dims);
   }
-  const auto numel = static_cast<int64_t>(base.storage().nbytes() / dtype.itemsize());
-  const int64_t inner = numel % 2 == 0 ? 2 : 1;
-  return at::as_strided(view_of(base, hpu_float_keys(), dtype, {numel / inner, inner}, {inner, 1}, 0), sizes, strides,
-                        storage_offset);
+  const int64_t inner = base_numel % 2 == 0 ? 2 : 1;
+  return at::as_strided(view_of(base, hpu_float_keys(), dtype, {base_numel / inner, inner}, {inner, 1}, 0), sizes,
+                        strides, storage_offset);
 }
 
 // float HPU [..., k, 2] (last stride 1) -> tagged complex64 [..., k], same storage.
@@ -161,14 +169,12 @@ at::Tensor pair_view(const at::Tensor& c) {
   return raw_pair(c);
 }
 
-// The pair of c's values as an operand of Habana's compute kernels. Their result keeps a non-contiguous operand's
-// strides, and Habana copies a tensor of rank 6 or more with such strides as if it were contiguous, its own too
-// ((x.permute(0, 2, 1, 3, 4, 5) * 2).contiguous()); they also misread some of habana_view's as_strided views. The
-// operand's own copy is right, so such a pair is made contiguous first (complex_result covers results whose layout
-// comes from elsewhere).
+// The pair of c's values as an operand of Habana's compute kernels. Non-contiguous / expanded pair views are
+// materialized contiguous so Habana compute ops (and their output stride propagation) never receive strided or
+// stride-0 views.
 at::Tensor operand_pair(const at::Tensor& c) {
   auto p = pair_view(c);
-  return p.dim() >= 6 && !p.is_contiguous() ? p.contiguous() : p;
+  return p.is_contiguous() ? p : p.contiguous();
 }
 
 at::Tensor make_complex_empty(c10::IntArrayRef size, c10::IntArrayRef stride, at::Device device) {
@@ -393,7 +399,8 @@ at::Tensor complex_hpu(const at::Tensor& real, const at::Tensor& imag) {
 
 // A real operand as float32 on the HPU (CPU 0-dim tensors are Python numbers).
 at::Tensor hpu_float(const at::Tensor& t, const at::Device& device) {
-  return t.to(device, at::kFloat);
+  auto r = t.to(device, at::kFloat);
+  return r.dim() >= 5 && !r.is_contiguous() ? r.contiguous() : r;
 }
 
 // [..., 2] float32 pair of an operand: complex -> its pair (on the HPU), real -> nullopt.
@@ -569,19 +576,31 @@ at::Tensor& copy_pu1(at::Tensor& self, const at::Tensor& src, bool non_blocking)
   if (self.is_complex()) {
     auto dst = raw_pair(self);
     if (src.is_complex()) {
-      dst.copy_(raw_pair(src), non_blocking);
+      auto src_pair = raw_pair(src);
+      if (tagged(src) && !src_pair.is_contiguous()) {
+        src_pair = src_pair.contiguous();
+      }
+      dst.copy_(src_pair, non_blocking);
       if (self.is_conj() != src.is_conj()) {  // the stored values differ by one conjugation
         dst.select(-1, 1).neg_();
       }
     } else {  // real -> complex: imaginary part 0
-      dst.select(-1, 0).copy_(src, non_blocking);
+      auto src_f = src;
+      if (src_f.is_hpu() && src_f.dim() >= 6 && !src_f.is_contiguous()) {
+        src_f = src_f.contiguous();
+      }
+      dst.select(-1, 0).copy_(src_f, non_blocking);
       dst.select(-1, 1).zero_();
     }
     return self;
   }
   // complex -> real keeps the real part, as torch does (it warns there).
   TORCH_WARN_ONCE("hpu_complex: casting complex values to real discards the imaginary part");
-  self.copy_(raw_pair(src).select(-1, 0), non_blocking);
+  auto src_pair = raw_pair(src);
+  if (tagged(src) && !src_pair.is_contiguous()) {
+    src_pair = src_pair.contiguous();
+  }
+  self.copy_(src_pair.select(-1, 0), non_blocking);
   return self;
 }
 
