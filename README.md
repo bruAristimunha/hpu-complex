@@ -102,7 +102,7 @@ braindecode models with `braindecode_kernels.patch_braindecode()` (v0.2.2), one 
 
 No op falls back to the CPU in these runs. The gap is in forward plus backward, where the complex nodes run eagerly outside the Synapse graphs.
 
-`hpu_complex/tests/c128_check.py` (complex128) passes 61/61 checks in eager mode and 57/57 in lazy mode (the 4 left
+`hpu_complex/tests/c128_check.py` (complex128) passes 63/63 checks in eager mode and 59/59 in lazy mode (the 4 left
 out need complex64, which lazy mode lacks), with and without `hpu_ops.enable()`. Every complex128 result equals torch
 on the CPU bit for bit (lstsq to 1.8e-15; eigh and svd, checked by reconstruction, to 1.1e-14), against the same input values as the card holds them: creation, copies,
 `.to`, `view_as_real`/`view_as_complex`, writes through views, conjugate views, arithmetic with float64 and Python
