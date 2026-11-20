@@ -12,6 +12,7 @@ hpu_complex.rfft/irfft/fft/stft (the _core module) are a separate,
 device-agnostic float API on [..., 2] pairs.
 """
 import importlib.util
+import os
 import warnings
 
 from . import _core as core
@@ -106,6 +107,13 @@ def enable(enter_mode: bool = False):
         from .extension import load_extension
 
         load_extension()
+        try:
+            from habana_frameworks.torch.utils.internal import is_lazy
+
+            lazy = bool(is_lazy())
+        except Exception:
+            lazy = os.environ.get("PT_HPU_LAZY_MODE", "0") != "0"
+        torch.ops.hpu_complex.set_lazy_mode(lazy)
         _complex_nodes_run_eagerly()
     elif not hasattr(torch, "hpu") and importlib.util.find_spec("habana_frameworks") is not None:
         warnings.warn("hpu_complex: habana_frameworks is installed but torch.hpu is not loaded, so the "

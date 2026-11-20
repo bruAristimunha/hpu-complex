@@ -10,10 +10,20 @@ except ImportError:  # the Gaudi image: run_on_hpu.py imports this module direct
     pytest = None
 else:
     pytest.importorskip("habana_frameworks.torch")
-import habana_frameworks.torch.core  # noqa: E402,F401
+import habana_frameworks.torch.core as htcore  # noqa: E402
+from habana_frameworks.torch.utils.internal import is_lazy  # noqa: E402
 import torch  # noqa: E402
 
 import hpu_complex as H  # noqa: E402
+
+
+def _skip_if_lazy(name):
+    if not is_lazy():
+        return False
+    if pytest is not None:
+        pytest.skip(f"{name} requires eager mode (PT_HPU_LAZY_MODE=0)")
+    print(f"{name}: SKIP (lazy mode)")
+    return True
 
 
 def test_core_fft_on_hpu():
@@ -39,6 +49,8 @@ def test_stft_and_grad_on_hpu():
 
 
 def test_complex_without_mode_and_clip_grad():
+    if _skip_if_lazy("test_complex_without_mode_and_clip_grad"):
+        return
     # Default enable(): no dispatch mode entered, yet complex forward
     # (the extension's PrivateUse1 kernels) and clip_grad_norm_ (0-d
     # total_norm: regression for the stack({a,b}, -2) crash in
@@ -71,6 +83,8 @@ def test_complex_without_mode_and_clip_grad():
 
 
 def test_compile_attempt():
+    if _skip_if_lazy("test_compile_attempt"):
+        return
     H.enable()
     f = torch.compile(lambda t: H.magnitude(H.rfft(t)), backend="hpu_backend")
     x = torch.randn(2, 1024, device="hpu")
@@ -89,6 +103,8 @@ def _max_err(a, b):
 
 
 def test_complex_strided_and_inplace_views_on_hpu():
+    if _skip_if_lazy("test_complex_strided_and_inplace_views_on_hpu"):
+        return
     H.enable()
     torch.manual_seed(0)
     hpu = torch.device("hpu")
@@ -141,6 +157,8 @@ def test_complex_strided_and_inplace_views_on_hpu():
 
 
 def test_complex_linalg_backward_on_hpu():
+    if _skip_if_lazy("test_complex_linalg_backward_on_hpu"):
+        return
     H.enable()
     torch.manual_seed(0)
     hpu = torch.device("hpu")
@@ -190,6 +208,8 @@ def test_complex_linalg_backward_on_hpu():
 
 
 def test_complex_d2h_nondense_and_h2d_broadcast_copy_on_hpu():
+    if _skip_if_lazy("test_complex_d2h_nondense_and_h2d_broadcast_copy_on_hpu"):
+        return
     H.enable()
     torch.manual_seed(0)
     hpu = torch.device("hpu")
@@ -223,3 +243,65 @@ def test_complex_d2h_nondense_and_h2d_broadcast_copy_on_hpu():
         torch.hpu.synchronize()
         assert _max_err(bh, bc) == 0.0
     print("complex64 D2H non-dense & H2D broadcast copy_: OK")
+
+
+def test_lazy_mode_guard_and_real_safety():
+    H.enable()
+    hpu = torch.device("hpu")
+    # Real-only float32 fwd+bwd must stay untouched in both eager and lazy modes.
+    xc = torch.randn(4, 4, requires_grad=True)
+    xh = xc.detach().clone().to(hpu).requires_grad_()
+    (xc @ xc.T).sum().backward()
+    (xh @ xh.T).sum().backward()
+    if is_lazy():
+        htcore.mark_step()
+    torch.hpu.synchronize()
+    assert _max_err(xh.grad, xc.grad) < 1e-4
+
+    # Float-pair core API works in both eager and lazy modes.
+    sig = torch.randn(2, 64, device=hpu)
+    spec = H.rfft(sig)
+    stft = H.stft(sig, 32, 16)
+    if is_lazy():
+        htcore.mark_step()
+    torch.hpu.synchronize()
+    assert spec.shape == (2, 33, 2) and stft.shape[0] == 2
+
+    if not is_lazy():
+        # Verify the lazy-mode guard is wired and toggleable via set_lazy_mode.
+        torch.ops.hpu_complex.set_lazy_mode(True)
+        try:
+            try:
+                torch.zeros(2, 2, dtype=torch.complex64, device=hpu)
+            except RuntimeError as exc:
+                assert "PT_HPU_LAZY_MODE=0" in str(exc)
+            else:
+                raise AssertionError("Expected RuntimeError when lazy guard is active")
+        finally:
+            torch.ops.hpu_complex.set_lazy_mode(False)
+        print("lazy mode guard (toggled) + real safety: OK")
+        return
+
+    real_pair = torch.randn(4, 4, 2, device=hpu)
+    real_re = torch.randn(4, 4, device=hpu)
+    real_im = torch.randn(4, 4, device=hpu)
+    real_sig = torch.randn(4, 32, device=hpu)
+    real_mat = torch.randn(4, 4, device=hpu)
+    cpu_c64 = torch.randn(4, 4, dtype=torch.complex64)
+    htcore.mark_step()
+    for name, fn in (
+        ("zeros_c64", lambda: torch.zeros(4, 4, dtype=torch.complex64, device=hpu)),
+        ("ones_c64", lambda: torch.ones(4, 4, dtype=torch.complex64, device=hpu)),
+        ("to_hpu_then_cpu", lambda: cpu_c64.to(hpu).cpu()),
+        ("view_as_complex", lambda: torch.view_as_complex(real_pair)),
+        ("torch.complex", lambda: torch.complex(real_re, real_im)),
+        ("torch.fft.rfft", lambda: torch.fft.rfft(real_sig)),
+        ("torch.linalg.eig(f32)", lambda: torch.linalg.eig(real_mat)),
+    ):
+        try:
+            fn()
+        except RuntimeError as exc:
+            assert "PT_HPU_LAZY_MODE=0" in str(exc), (name, str(exc))
+        else:
+            raise AssertionError(f"Expected RuntimeError for {name} in lazy mode")
+    print("lazy mode guard + real safety: OK")

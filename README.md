@@ -108,7 +108,23 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   Complex tensors of rank 5 or more are covered here (their float pairs
   and results are read as permutes of contiguous blocks, compute operands
   are copied contiguous first); float code with such tensors is not.
-- Lazy mode untouched. Ops outside the registered set run on the CPU
+- **Lazy mode (`PT_HPU_LAZY_MODE=1`)**: Habana's `HbLazyTensor` bridge
+  rejects `complex64` directly and cannot wrap `PrivateUse1` storage
+  views (`empty(0).set_()` fails with `synStatus 30` when a lazy op is
+  dropped behind `storage()`, and gives wrong values on strided/offset
+  views and `copy_()`). `hpu_complex.enable()` stays safe and silent in
+  lazy mode for real-only `float32`/`bfloat16` models and for the
+  float-pair API (`hpu_complex.rfft`, `hpu_complex.stft`), while
+  `complex64` creation, `torch.fft.*`, `torch.view_as_complex`,
+  `torch.complex`, and `torch.linalg.eig`/`eigvals` on HPU raise an
+  explicit `RuntimeError` (no process abort). **Workaround:** run in
+  eager mode (`PT_HPU_LAZY_MODE=0`), optionally with
+  `torch.compile(model, backend="hpu_backend")` for simple complex+FFT
+  modules (note: `spd_learn.models.Green` currently hits
+  `RuntimeError: batch1 must be a 3D tensor` in `aten.bmm.default` under
+  `torch.compile(backend="hpu_backend")` and should use plain eager mode).
+  See `repro/lazy_complex64.py` for a standalone reproducer.
+- Ops outside the registered set run on the CPU
   (warned), among them the fills of complex `randn`/`rand`
   (`normal_`/`uniform_`). `torch.func` transforms and forward-mode AD do
   not run through `rfft`/`stft`: their backward is a C++ autograd
@@ -138,6 +154,8 @@ python -m pytest hpu_complex/tests/ -q            # CPU (the HPU tests skip with
 python hpu_complex/tests/pu1_check.py            # Gaudi: eager + compiled vs CPU
 python hpu_complex/tests/r2c_grad_check.py       # Gaudi: rfft gradients vs CPU float64
 python hpu_complex/tests/run_on_hpu.py           # Gaudi: test_on_hpu.py without pytest
+python hpu_complex/tests/lazy_check.py           # Gaudi (PT_HPU_LAZY_MODE=1): lazy-mode guards & real-only safety
+python repro/lazy_complex64.py --mode all        # Gaudi: Issue #3 reproducer (habana-bug, guarded, workaround)
 python hpu_complex/tests/float_tax.py [--ext]    # Gaudi: float-only loop with/without the extension
 python hpu_complex/tpc_kernel/run_fft_test.py     # Gaudi + TPC lib
 ```

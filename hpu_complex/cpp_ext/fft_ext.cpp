@@ -38,15 +38,18 @@
 #include <c10/core/impl/LocalDispatchKeySet.h>
 #include <c10/util/FunctionRef.h>
 
-#include <cmath>
-#include <limits>
-#include <mutex>
 #include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdlib>
+#include <limits>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <set>
 #include <string>
+#include <string_view>
 #include <tuple>
-#include <map>
 
 namespace {
 
@@ -198,13 +201,44 @@ bool complex_on_hpu(std::optional<at::ScalarType> dtype, DispatchKeySet ks) {
   return dtype.has_value() && *dtype == at::kComplexFloat && ks.highestPriorityTypeId() == DispatchKey::HPU;
 }
 
+std::atomic<int>& lazy_mode_flag() {
+  static std::atomic<int> flag{-1};
+  return flag;
+}
+
+void set_lazy_mode(bool enabled) {
+  lazy_mode_flag().store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+bool is_lazy_mode() {
+  const int flag = lazy_mode_flag().load(std::memory_order_relaxed);
+  if (flag >= 0) {
+    return flag != 0;
+  }
+  const char* env = std::getenv("PT_HPU_LAZY_MODE");
+  return env != nullptr && std::string_view(env) != "0";
+}
+
+void check_not_lazy(const at::Device& device, const char* op) {
+  TORCH_CHECK(
+      !(device.is_hpu() && is_lazy_mode()),
+      "hpu_complex: ", op,
+      " is not supported in Habana lazy mode (PT_HPU_LAZY_MODE=1): "
+      "HbLazyTensor cannot wrap PrivateUse1 complex64 views. "
+      "Run in eager mode (PT_HPU_LAZY_MODE=0) -- optionally with "
+      "torch.compile(model, backend=\"hpu_backend\") for simple models -- "
+      "or use the float-pair API (hpu_complex.rfft / hpu_complex.stft).");
+}
+
 at::Tensor empty_backend_select(c10::SymIntArrayRef size, std::optional<at::ScalarType> dtype,
                                 std::optional<at::Layout> layout, std::optional<at::Device> device,
                                 std::optional<bool> pin_memory, std::optional<at::MemoryFormat> memory_format) {
   auto ks = factory_keys(dtype, layout, device);
   if (complex_on_hpu(dtype, ks)) {
+    const auto dev = device ? *device : at::Device(at::kHPU);
+    check_not_lazy(dev, "complex64 tensor creation on HPU");
     auto sizes = C10_AS_INTARRAYREF_SLOW(size);
-    return make_complex_empty(sizes, c10::contiguous_strides(sizes), *device);
+    return make_complex_empty(sizes, c10::contiguous_strides(sizes), dev);
   }
   return at::_ops::empty_memory_format::redispatch(ks, size, dtype, layout, device, pin_memory, memory_format);
 }
@@ -214,7 +248,9 @@ at::Tensor empty_strided_backend_select(c10::SymIntArrayRef size, c10::SymIntArr
                                         std::optional<at::Device> device, std::optional<bool> pin_memory) {
   auto ks = factory_keys(dtype, layout, device);
   if (complex_on_hpu(dtype, ks)) {
-    return make_complex_empty(C10_AS_INTARRAYREF_SLOW(size), C10_AS_INTARRAYREF_SLOW(stride), *device);
+    const auto dev = device ? *device : at::Device(at::kHPU);
+    check_not_lazy(dev, "complex64 tensor creation on HPU");
+    return make_complex_empty(C10_AS_INTARRAYREF_SLOW(size), C10_AS_INTARRAYREF_SLOW(stride), dev);
   }
   return at::_ops::empty_strided::redispatch(ks, size, stride, dtype, layout, device, pin_memory);
 }
@@ -321,6 +357,7 @@ void check_last_dim(const at::Tensor& self, c10::IntArrayRef dim) {
 // ---- FFT ------------------------------------------------------------------------------
 
 at::Tensor fft_r2c_hpu(const at::Tensor& self, c10::IntArrayRef dim, int64_t normalization, bool onesided) {
+  check_not_lazy(self.device(), "torch.fft.rfft");
   HPU_COMPLEX_NO_AUTOCAST;
   check_last_dim(self, dim);
   const int64_t n = self.size(-1);
@@ -355,6 +392,7 @@ at::Tensor fft_c2r_pu1(const at::Tensor& self, c10::IntArrayRef dim, int64_t nor
 }
 
 at::Tensor view_as_complex_hpu(const at::Tensor& self) {
+  check_not_lazy(self.device(), "torch.view_as_complex");
   return complex_view(self);
 }
 
@@ -392,6 +430,7 @@ at::Tensor stack_pair(const at::Tensor& re, const at::Tensor& im) {
 }
 
 at::Tensor complex_hpu(const at::Tensor& real, const at::Tensor& imag) {
+  check_not_lazy(real.is_hpu() ? real.device() : imag.device(), "torch.complex");
   return complex_view(stack_pair(real.to(at::kFloat), imag.to(at::kFloat)));
 }
 
@@ -803,6 +842,11 @@ void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
 }
 
 }  // namespace
+
+TORCH_LIBRARY(hpu_complex, m) {
+  m.def("set_lazy_mode(bool enabled) -> ()");
+  m.impl("set_lazy_mode", &set_lazy_mode);
+}
 
 TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
   m.fallback(torch::CppFunction::makeFromBoxedFunction<&cpu_fallback>());
