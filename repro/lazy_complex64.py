@@ -16,9 +16,9 @@ Demonstrates three modes:
       process aborts).
   --mode workaround : In eager mode (PT_HPU_LAZY_MODE=0) with hpu_complex:
       complex64 ops, torch.fft.rfft fwd+bwd, and torch.compile(backend="hpu_backend")
-      on simple complex+FFT modules pass cleanly. (Note: spd_learn.models.Green
-      hits RuntimeError("batch1 must be a 3D tensor") in aten.bmm.default under
-      torch.compile(backend="hpu_backend") and should run in plain eager mode.)
+      on simple complex+FFT modules pass cleanly. (Note: compiled spd_learn.models.Green
+      fails with "strided_view synStatus 1" at its float32 aten._linalg_eigh node,
+      see repro/compiled_real_eigh.py; it trains in plain eager mode.)
 
 Usage on Gaudi2:
   python3 repro/lazy_complex64.py --mode all
@@ -221,9 +221,8 @@ def run_workaround() -> None:
     print("[workaround] eager PT_HPU_LAZY_MODE=0 complex64 + rfft fwd+bwd: PASS")
 
     # Simple complex+FFT module also works with torch.compile(backend="hpu_backend") in eager mode.
-    # Caveat: larger models like spd_learn.models.Green hit
-    # RuntimeError("batch1 must be a 3D tensor") inside aten.bmm.default under
-    # torch.compile(backend="hpu_backend") and should run in plain eager mode.
+    # Caveat: compiled spd_learn.models.Green fails with "strided_view synStatus 1" at its
+    # float32 aten._linalg_eigh node (repro/compiled_real_eigh.py); it trains in plain eager mode.
     xh2 = xc.detach().clone().to(hpu).requires_grad_()
     rh2 = rc.detach().clone().to(hpu).requires_grad_()
     compiled_fn = torch.compile(fn, backend="hpu_backend")
