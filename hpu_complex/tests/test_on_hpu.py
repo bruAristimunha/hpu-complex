@@ -350,20 +350,11 @@ def test_lazy_mode_guard_and_real_safety():
     assert spec.shape == (2, 33, 2) and stft.shape[0] == 2
 
     if not is_lazy():
-        # Verify the lazy-mode guard is wired and toggleable via set_lazy_mode: in lazy mode it refuses complex64
-        # under torch.inference_mode (complex64 itself runs there, on lazy views).
-        torch.ops.hpu_complex.set_lazy_mode(True)
-        try:
-            try:
-                with torch.inference_mode():
-                    torch.zeros(2, 2, dtype=torch.complex64, device=hpu)
-            except RuntimeError as exc:
-                assert "PT_HPU_LAZY_MODE=0" in str(exc)
-            else:
-                raise AssertionError("Expected RuntimeError when lazy guard is active")
-        finally:
-            torch.ops.hpu_complex.set_lazy_mode(False)
-        print("lazy mode guard (toggled) + real safety: OK")
+        # complex64 under torch.inference_mode: inference tensors, as torch makes them (lazy mode runs it too).
+        with torch.inference_mode():
+            z = torch.zeros(2, 2, dtype=torch.complex64, device=hpu) + 1j
+        assert z.is_inference() and torch.equal(z.cpu(), torch.full((2, 2), 1j))
+        print("complex64 under inference_mode + real safety: OK")
         return
 
     real_pair = torch.randn(4, 4, 2, device=hpu)
@@ -387,11 +378,8 @@ def test_lazy_mode_guard_and_real_safety():
         htcore.mark_step()
         for t in out if isinstance(out, tuple) else (out,):
             assert torch.isfinite(torch.view_as_real(t.cpu())).all(), name
-    try:
-        with torch.inference_mode():
-            torch.fft.rfft(real_sig)
-    except RuntimeError as exc:
-        assert "PT_HPU_LAZY_MODE=0" in str(exc), str(exc)
-    else:
-        raise AssertionError("Expected RuntimeError for complex64 under inference_mode in lazy mode")
-    print("lazy mode complex64 + guard + real safety: OK")
+    with torch.inference_mode():  # runs in lazy mode now: inference tensors (inference_check.py)
+        spec = torch.fft.rfft(real_sig)
+        htcore.mark_step()
+    assert spec.is_inference() and (spec.cpu() - torch.fft.rfft(real_sig.cpu())).abs().max() < 1e-3
+    print("lazy mode complex64 (inference_mode too) + real safety: OK")
