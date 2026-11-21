@@ -276,3 +276,23 @@ def test_complex64_made_under_inference_mode_is_an_inference_tensor():
         z.add_(1)
     with pytest.raises(RuntimeError, match="[Ii]nference"):
         torch.view_as_real(z).fill_(0)
+
+
+@pytest.mark.parametrize("device", ["cpu", HPU])
+def test_backend_select_kernels_return_like_torch(device):
+    """The BackendSelect kernels (unboxed for the common overloads) return self for in-place forms and out for out=,
+    on CPU tensors (handed on at once) and HPU ones, in and out of inference mode."""
+    for inference in (False, True):
+        with torch.inference_mode(inference):
+            x = torch.tensor([1.0, 2.0]).to(device)
+            y = torch.tensor([3.0, 4.0]).to(device)
+            assert x.add_(y) is x and x.mul_(2) is x and x.sub_(y, alpha=2) is x and x.div_(2.0) is x
+            assert torch.equal(x.cpu(), torch.tensor([1.0, 2.0]))
+            out = torch.empty(2).to(device)
+            assert torch.add(x, y, alpha=3, out=out) is out and torch.mul(x, y, out=out) is out
+            assert torch.div(x, y, out=out) is out and torch.equal(out.cpu(), torch.tensor([1 / 3, 0.5]))
+            zc = torch.empty(2, dtype=C64).to(device)
+            assert torch.mul(x, 2j, out=zc) is zc  # real x, complex scalar, complex out
+            bits_equal(zc, torch.tensor([1.0, 2.0]) * 2j)
+            bits_equal(torch.div(x, y, rounding_mode="floor"), torch.tensor([0.0, 0.0]))
+            bits_equal(torch.rsub(x, 1j), 1j - torch.tensor([1.0, 2.0]))

@@ -64,6 +64,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 
 namespace {
 
@@ -1458,9 +1459,49 @@ void complex_scalar_autograd_hpu(const c10::OperatorHandle& op, DispatchKeySet k
 // its own an op falls through it. The promoted call dispatches again with the caller's TLS: no autograd under
 // inference mode (inference-tensor results, as torch makes them), none below autograd either. A call that the
 // AutogradHPU kernel above already promoted arrives here with a complex operand and passes through.
-void complex_scalar_backend_select(const c10::OperatorHandle& op, DispatchKeySet ks, torch::jit::Stack* stack) {
-  complex_scalar_promote(op, ks & DispatchKeySet(DispatchKeySet::FULL_AFTER, DispatchKey::BackendSelect), stack);
+DispatchKeySet after_backend_select(DispatchKeySet ks) {
+  return ks & DispatchKeySet(DispatchKeySet::FULL_AFTER, DispatchKey::BackendSelect);
 }
+
+void complex_scalar_backend_select(const c10::OperatorHandle& op, DispatchKeySet ks, torch::jit::Stack* stack) {
+  complex_scalar_promote(op, after_backend_select(ks), stack);
+}
+
+// BackendSelect sees every call of these ops below autograd, on any device (CPU code too). Measured on the CPU: the
+// boxed kernel alone cost 0.6-1.2 us a call (x * y: 1.2 -> 1.8 us). The unboxed kernel below hands a call without an
+// HPU tensor on at once, and boxes the rest (complex_scalar_backend_select).
+template <class T>
+bool on_hpu(const T& v) {
+  if constexpr (std::is_same_v<std::decay_t<T>, at::Tensor>) {
+    return v.defined() && v.is_hpu();
+  } else {
+    return false;
+  }
+}
+
+// Written: the index of the argument an in-place (0, self) or out= (the last) form returns; -1 for a fresh result.
+template <class Op, int Written, class Schema = typename Op::schema>
+struct BackendSelectFast;
+
+template <class Op, int Written, class Ret, class... Args>
+struct BackendSelectFast<Op, Written, Ret(Args...)> {
+  static Ret call(DispatchKeySet ks, Args... args) {
+    if (!(on_hpu(args) || ...)) {
+      return Op::redispatch(after_backend_select(ks), args...);
+    }
+    static const c10::OperatorHandle op =
+        c10::Dispatcher::singleton().findSchemaOrThrow(Op::name, Op::overload_name);
+    torch::jit::Stack stack;
+    stack.reserve(sizeof...(Args));
+    (torch::jit::push(stack, args), ...);
+    complex_scalar_promote(op, after_backend_select(ks), &stack);
+    if constexpr (Written >= 0) {
+      return std::get<Written>(std::forward_as_tuple(args...));
+    } else {
+      return std::move(stack.back()).template to<Ret>();
+    }
+  }
+};
 
 // ---- copies and fills (PrivateUse1) ------------------------------------------------------
 
@@ -2298,7 +2339,38 @@ TORCH_LIBRARY_IMPL(aten, AutogradHPU, m) {
 }
 
 TORCH_LIBRARY_IMPL(aten, BackendSelect, m) {
-  for (const char* name : kComplexScalarOps) {  // the calls that skip AutogradHPU (torch.inference_mode)
+  // the calls that skip AutogradHPU (torch.inference_mode, inference tensors); the hot overloads unboxed first
+#define HPU_COMPLEX_BS(op, written, name) m.impl(name, TORCH_FN((BackendSelectFast<at::_ops::op, written>::call)))
+  HPU_COMPLEX_BS(mul_Tensor, -1, "mul.Tensor");
+  HPU_COMPLEX_BS(mul_Scalar, -1, "mul.Scalar");
+  HPU_COMPLEX_BS(mul__Tensor, 0, "mul_.Tensor");
+  HPU_COMPLEX_BS(mul__Scalar, 0, "mul_.Scalar");
+  HPU_COMPLEX_BS(mul_out, 2, "mul.out");
+  HPU_COMPLEX_BS(add_Tensor, -1, "add.Tensor");
+  HPU_COMPLEX_BS(add_Scalar, -1, "add.Scalar");
+  HPU_COMPLEX_BS(add__Tensor, 0, "add_.Tensor");
+  HPU_COMPLEX_BS(add__Scalar, 0, "add_.Scalar");
+  HPU_COMPLEX_BS(add_out, 3, "add.out");
+  HPU_COMPLEX_BS(sub_Tensor, -1, "sub.Tensor");
+  HPU_COMPLEX_BS(sub_Scalar, -1, "sub.Scalar");
+  HPU_COMPLEX_BS(sub__Tensor, 0, "sub_.Tensor");
+  HPU_COMPLEX_BS(sub__Scalar, 0, "sub_.Scalar");
+  HPU_COMPLEX_BS(sub_out, 3, "sub.out");
+  HPU_COMPLEX_BS(div_Tensor, -1, "div.Tensor");
+  HPU_COMPLEX_BS(div_Scalar, -1, "div.Scalar");
+  HPU_COMPLEX_BS(div__Tensor, 0, "div_.Tensor");
+  HPU_COMPLEX_BS(div__Scalar, 0, "div_.Scalar");
+  HPU_COMPLEX_BS(div_out, 2, "div.out");
+  HPU_COMPLEX_BS(rsub_Tensor, -1, "rsub.Tensor");
+  HPU_COMPLEX_BS(rsub_Scalar, -1, "rsub.Scalar");
+  HPU_COMPLEX_BS(div_Tensor_mode, -1, "div.Tensor_mode");
+  HPU_COMPLEX_BS(div_Scalar_mode, -1, "div.Scalar_mode");
+  HPU_COMPLEX_BS(div__Tensor_mode, 0, "div_.Tensor_mode");
+  HPU_COMPLEX_BS(div__Scalar_mode, 0, "div_.Scalar_mode");
+#undef HPU_COMPLEX_BS
+  // the rarer out= forms: boxed
+  for (const char* name : {"mul.Scalar_out", "add.Scalar_out", "sub.Scalar_out", "div.Scalar_out",
+                           "div.Scalar_mode_out", "rsub.Tensor_out", "rsub.Scalar_out", "div.out_mode"}) {
     m.impl(name, torch::CppFunction::makeFromBoxedFunction<&complex_scalar_backend_select>());
   }
   m.impl("empty.memory_format", &empty_backend_select);
