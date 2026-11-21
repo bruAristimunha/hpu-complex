@@ -166,7 +166,18 @@ def test_exp_kernel_matches_torch_at_edges():
 def test_neg_kernel_with_conjugate_views():
     z = torch.randn(3, 4, dtype=C64, generator=torch.Generator().manual_seed(1))
     bits_equal(-(z.to(HPU).conj()), -(z.conj()))
-    bits_equal(torch.neg(h(EDGE.tolist())), torch.neg(EDGE))
+    # The pair kernel negates each float part: a sign flip, torch's float neg on every platform.
+    pairs = torch.view_as_real(EDGE)
+    flip = torch.view_as_complex(-pairs)
+    bits_equal(torch.neg(h(EDGE.tolist())), flip)
+    # torch's own complex neg is that sign flip on arm64 (-z per element) but 0 - z in its x86 AVX kernel, which
+    # differ only at a +0 part (0 - (+0) = +0, where the flip gives -0): each part of torch.neg(EDGE) is one of the two.
+    sub = torch.view_as_complex(torch.zeros_like(pairs) - pairs)
+    ref_bits, flip_bits, sub_bits = (torch.view_as_real(t).view(torch.int32) for t in (torch.neg(EDGE), flip, sub))
+    known = torch.view_as_real(flip).isnan().logical_not()
+    assert torch.equal(torch.view_as_real(torch.neg(EDGE)).isnan(), ~known)
+    assert ((ref_bits == flip_bits) | (ref_bits == sub_bits))[known].all(), torch.view_as_real(torch.neg(EDGE))
+    assert torch.equal((flip_bits != sub_bits)[known], ((pairs == 0) & ~pairs.signbit())[known])
 
 
 @pytest.mark.parametrize("value", [0, -0.0, complex(0, -0.0), 2.5, -1j, 1 + 2j, INF, complex(NAN, 1)])
