@@ -89,6 +89,9 @@ def check_lazy_complex_guards():
         ("torch.fft.rfft", lambda: torch.fft.rfft(real_sig)),
         ("torch.linalg.eig(f32)", lambda: torch.linalg.eig(real_mat)),
         ("torch.linalg.eigvals(f32)", lambda: torch.linalg.eigvals(real_mat)),
+        ("real.to(complex64)", lambda: real_mat.to(torch.complex64)),
+        ("real.view(complex64)", lambda: real_pair.view(torch.complex64)),
+        ("torch.polar", lambda: torch.polar(real_re.abs(), real_im)),
     ]
     for name, fn in cases:
         try:
