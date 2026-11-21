@@ -1,6 +1,6 @@
-"""Adversarial probe of complex128 on the HPU (team J, review round 2). One Gaudi, eager or PT_HPU_LAZY_MODE=1.
+"""Adversarial card check of complex128 on the HPU. One Gaudi, eager or PT_HPU_LAZY_MODE=1.
 
-python3 tests/probe_adversarial_j.py [--hpu-ops] [--rounds N] [--only substr] [--skip substr] [--models]
+python3 hpu_complex/tests/c128_adversarial_check.py [--hpu-ops] [--rounds N] [--only substr] [--skip substr] [--models]
 
 Each case builds its inputs on the card, runs the op there and on the CPU (torch, float64/complex128) from the values
 the card holds, and prints OK / DIFF / ERR with the bridge cpu_fallback delta and any "runs on the CPU" warning. A
