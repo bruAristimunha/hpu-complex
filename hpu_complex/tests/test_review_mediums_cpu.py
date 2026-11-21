@@ -128,9 +128,11 @@ def test_neg_of_a_real_tensor_into_a_complex_out_raises():
 
 
 def test_complex_result_into_a_real_out_raises():
+    """Elementwise ops only: a reduction casts its input to out's dtype first (sum(complex, out=float) is the sum of the
+    real parts, test_review2_cpu.py)."""
     for fn in (lambda o: torch.exp(h([1j]), out=o), lambda o: torch.mul(h([1j]), 2, out=o),
-               lambda o: torch.neg(h([1j]), out=o), lambda o: torch.sum(h([1j]), 0, out=o)):
-        with pytest.raises(RuntimeError, match="can't be cast"):
+               lambda o: torch.neg(h([1j]), out=o)):
+        with pytest.raises(RuntimeError, match="can't be cast|Found dtype Float but expected ComplexFloat"):  # torch's
             fn(torch.empty(1, device=HPU))
 
 
@@ -193,9 +195,7 @@ def test_real_tensor_and_complex_scalar_bitwise(c, op):
     x = torch.tensor([1.5, -2.0, 0.0, -0.0, 1e-30, 3e38])
     f = {"mul": lambda t: t * c, "rmul": lambda t: c * t, "add": lambda t: t + c, "sub": lambda t: t - c,
          "rsub": lambda t: c - t, "div": lambda t: t / c}[op]
-    if op == "div" and c == complex(0, -0.0):
-        pytest.skip("division by zero: NaN payloads differ")
-    bits_equal(f(x.to(HPU)), f(x))
+    bits_equal(f(x.to(HPU)), f(x))  # bits_equal masks NaN payloads: division by a zero c is checked too
 
 
 def test_vector_norm_kernel_gradient_like_torch():

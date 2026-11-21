@@ -64,10 +64,16 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   `vector_norm`) is a hypot scaled by `max(|re|, |im|)`: Habana's float norm squares unscaled
   (`|3e19 + 3e19j|` was inf, `|1e-30|` was 0). `vector_norm` scales every order too (by the largest modulus over
   `dim`, the smallest for a negative order), so a norm that fits in float32 is not lost (torch's own complex64
-  kernel gives inf for `[1e-30, 3e19, 1+1j]` and 0 for `[1e-25 + 1e-25j, 2e-25j]`). `exp` follows C99 cexp at
+  kernel gives inf for `[1e-30, 3e19, 1+1j]` and 0 for `[1e-25 + 1e-25j, 2e-25j]`); for `|ord| < 1` a term whose
+  ratio to the scale under- or overflows, and the final power, come from logarithms (`‖[1e20, 1e-30]‖₀.₀₁ = 8.57e31`, not 1e20). A NaN
+  modulus anywhere makes the norm NaN, an infinite part makes its element's modulus inf (`hypot(inf, nan)`), as
+  torch. `exp` follows C99 cexp at
   non-finite inputs and computes e^a in two halves, so `exp(88.75 + i pi/4) = 2.47e38 (1 + i)` fits (torch's
   complex64 kernel: inf + inf i; within 2 ulp of torch elsewhere). Complex division is Smith's algorithm, as
-  torch's (`1 / 1e20j` is `-1e-20j`, not 0). complex64 with a float64 HPU tensor is complex128, in host memory.
+  torch's (`1 / 1e20j` is `-1e-20j`, not 0), also by a real tensor (`(inf + 1j) / 2` is `inf + nan j`, as torch; zero signs, a zero divisor next to an infinite
+  part and torch's own `1 / c` overflow are left as the per-part quotient gives them, kept for speed: README Limits).
+  complex64 with a float64 HPU tensor is complex128, in host memory; a float64 `self` of `add_`/`mul_` with a
+  complex operand raises torch's cast error, and a complex32 result type (a 0-d complex64 or complex128 with float16) raises.
 - complex64 linalg from real ops (`hpu_complex/linalg.py`, at `AutogradPrivateUse1`). The block embedding
   `E(A) = [[Ar, -Ai], [Ai, Ar]]` keeps products, inverses, adjoints, `exp` and `pinv` (`E(A^-1) = E(A)^-1`, ...), and
   `|x| = |[xr; xi]|`, so `solve`, `inv`, `pinv`, `lstsq` and `matrix_exp` are the real op on `E(A)` (hpu-ops' TPC
@@ -217,13 +223,17 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   writes each complex128 HPU tensor as its own copy of its values, so tensors saved together that were views of one
   another (`{"z": z, "re": z.real}`) load as independent tensors (`copy.deepcopy` keeps them linked, as torch does);
   float64 results of complex128 ops load back into host memory, exact. Such a checkpoint loads in a process without a
-  Gaudi once `hpu_complex` is imported (`torch.load(f, map_location="cpu")`, also with a callable `map_location`),
-  and a dense layout (a transpose) keeps its strides. An `out=` that partly overlaps an input in a
+  Gaudi once `hpu_complex` is imported (`torch.load(f, map_location="cpu")`, in the zip and the legacy format; a
+  callable `map_location` gets the storage, and the storage it returns is restored, as torch does), and a dense layout
+  (a transpose) keeps its strides; any dtype view saves (bfloat16 included). An `out=` that partly overlaps an input in a
   layout torch's alias check cannot settle (`torch.add(z[:, :-1], 1, out=z[:, 1:])`, no error on the CPU either) is
   computed from the inputs before the write, so its values can differ from the CPU's in-place order. Under
   `torch.compile(backend="hpu_backend")`, a graph that holds a complex128 value (or, once the process has allocated
   one, a float64 value) runs eagerly as a whole: its complex128 ops compute on the CPU either way, Synapse graphs
   cannot read host memory, and Habana's graph passes gave a wrong gradient through `eig` even with every node eager.
+  A graph compiled for card tensors runs eagerly on a call whose input is host memory (Dynamo's guards see dtype,
+  shape and strides, not where the storage lives). `set_` onto a Python slice of a complex128 storage (`s[16:32]`) or
+  of a complex64 storage made in lazy mode raises: use the whole storage with an offset.
 
 - The dispatch mode is opt-in and scoped
   (`with hpu_complex.complex_mode():`), not global: `enable()` never
@@ -279,20 +289,30 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   views taken before see the result, also in lazy mode, where Habana's own `resize_` grows the storage), an
   expanded `out` raises, a result dtype that cannot be cast to `out`'s raises (`cat`: in `out`'s dtype, exact for
   int32 into complex128), and so does an `mm`/`bmm` `out` on another device; `copy_`, in-place `add_`/`mul_` and
-  `out=` raise on a partial overlap with an input. A failed `set_` (out of bounds) leaves the tensor unchanged;
-  `set_()` detaches it from its storage.
+  `out=` raise on a partial overlap with an input, real views of `out`'s storage included (`cat` on any overlap). A
+  reduction writes like torch's: `sum(z, 0, out=float32)` sums the real parts, `out=complex128` sums in
+  complex128; `neg`'s `out` must have `self`'s dtype exactly. A failed `set_` (out of bounds, a negative stride or
+  offset) leaves the tensor unchanged; a negative stride of a size-1 dim is accepted, as on the CPU; `set_()`
+  detaches it from its storage. `alpha` is checked as torch's kernels do (a bool `alpha`, or one that overflows
+  complex64, raises before anything is written).
 - Departures from torch kept for speed (measured on spd_learn's `Green`, Gaudi2, bridge 1.21.4): two complex64
   tensors on the card with a real `alpha` (`a + b`, `a - b`, gradient accumulation) are added per part, where
   torch multiplies `b` by `alpha + 0i` first: at an infinite or NaN part of `b` torch puts a NaN in the other part
   (`inf + 0i` gives `inf + nan i`), and exact-zero signs can differ (the exact form cost 25 ms of a 75 ms lazy step;
-  a Python scalar, a real operand and a complex `alpha` keep torch's form). A complex64 HPU tensor with a 0-d CPU
+  a Python scalar, a real operand and a complex `alpha`, `1 + 0j` included, keep torch's form). A complex64 tensor
+  divided by a real one is the per-part quotient plus torch's NaN cross terms (2 ops; the exact Smith form cost lazy
+  Green 18 ms a step): NaN placement as torch, zero signs and the last ulp can differ, and so does a division by `-0.0`: the
+  quotient gives `(1 + 1j) / -0.0 = -inf - inf j`, torch's own result there depends on its build (`-inf + inf j` on an
+  ARM Mac, `inf + inf j` where `std::abs(-0.0)` is `+0`). A complex64 HPU tensor with a 0-d CPU
   complex128 or float64 tensor stays complex64 on the card, where torch gives complex128: autograd hands saved
   Python scalars to the backward as such tensors, and complex128 would route every such gradient through host
   memory and a device sync (+12 ms a lazy step); torch's engine casts the gradient back to complex64 anyway. A real
   HPU tensor times a 0-d complex CPU tensor that needs no gradient and has no forward-AD tangent reads it with
   `.item()`: modifying that tensor in place between the product and the backward is not detected.
 - Devices follow torch's rule: a complex HPU tensor with a CPU tensor that is not 0-d raises "Expected all tensors
-  to be on the same device", as do `hpu:0` with `hpu:1` (complex128 copies keep their `hpu:N` index). A complex128
+  to be on the same device", as do `hpu:0` with `hpu:1` (complex128 copies keep their `hpu:N` index), for written
+  tensors too (`add_`, `mul_`, `out=`, `cat.out`) and `where`'s mask. One exception, kept from before: complex64
+  `where` accepts a CPU mask or real CPU operand of any shape (copied to the card), where torch raises. A complex128
   or float64 view of complex64 storage (`z64.view(torch.complex128)`) raises (complex128 lives in host memory); a
   complex64 view of complex128 memory stays host memory, computed on the CPU.
 - Copies between a plain CPU tensor and a plain HPU tensor never reach
@@ -328,7 +348,7 @@ python -m pytest hpu_complex/tests/ -q            # CPU (the HPU tests skip with
 # test_extension_build_cpu.py builds the C++ extension against CPU torch and checks its dispatcher registrations.
 # test_pair_kernels_formula_cpu.py mirrors the pair formulas of exp, neg, masked_fill_, cat, vector_norm and of the
 # real x complex-scalar path against torch (the scalar path bit for bit, signed zeros included).
-# test_review_fixes_cpu.py / test_review_mediums_cpu.py run the C++ kernels themselves on the CPU: cpu_stub/
+# test_review_fixes_cpu.py / test_review_mediums_cpu.py / test_review2_cpu.py run the C++ kernels themselves on the CPU: cpu_stub/
 # hpu_guard_stub.cpp is a fake HPU backend (host memory reporting the HPU device, torch's CPU kernels in place of
 # Habana's), so complex64 runs the card path (pair kernels, storages, out=, overlap, the complex-scalar interception,
 # set_, checkpoints in a fresh process) against torch. Lazy mode and Habana's numerics (its float32 GEMM, its layout
