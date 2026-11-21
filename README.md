@@ -81,8 +81,18 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   squaring). With rows and columns interleaved (re, im per index), `E(L)` of a triangle with a real diagonal is
   triangular, and the real Cholesky factor of `E(H)` is `E(L)` (unique), so `cholesky` is one real Cholesky
   (Habana's). `householder_product` is the compact WY form `I - V T V^H`, `T = (I + diag(tau) striu(V^H V))^-1
-  diag(tau)` (no division: `tau = 0` needs no special case). Gradients: autograd through the real ops, or torch's
-  formulas (`cholesky`, `cholesky_solve`); `info` is nonzero exactly when torch's is, its index may differ.
+  diag(tau)` (no division: `tau = 0` needs no special case). `cholesky`'s `info` is torch's, read from the factor's
+  diagonal (Habana's is a constant 0). `solve_triangular` rotates each row by the conjugate phase of its diagonal
+  entry and runs one real substitution (hpu-ops' TPC kernel); `cholesky_inverse` is Habana's on the interleaved factor
+  (`E(H^-1)`; the factor's columns first rotated by the conjugate phase of its diagonal, which keeps `L L^H`, so a
+  complex diagonal is right: torch's `cholesky_solve`, and `(L L^H)^-1` for `cholesky_inverse`, where torch's LAPACK
+  result is not) and `cholesky_solve` that times `v(B)`; `qr` is Habana's real QR of `W E(A)` (a fixed orthogonal `W`:
+  Habana's qr is NaN on a zero Householder tail, `repro/habana_qr_nan.py`) re-signed to a positive real diagonal
+  (torch's factors up to those real signs; a rank-deficient matrix, e.g. a zero column, is still NaN); `eigvalsh` the means of the sorted pairs of the embedding's eigenvalues;
+  `hpu_complex.linalg.hpd_slogdet` / `hpd_logdet` (explicit: torch has no Hermitian flag) the log of the Cholesky
+  diagonal of an HPD matrix, with torch's slogdet gradient. Gradients: autograd through the real ops, or torch's
+  formulas (`cholesky`, `cholesky_solve`, `cholesky_inverse`, `solve_triangular`, `qr`); the `info` of `solve`/`inv`
+  is nonzero exactly when torch's is, its index may differ.
   Batch 32, Gaudi2, bridge 1.21.4, median of 3 alternating rounds of 20 synced calls, speed-up over the CPU route
   (forward / forward + backward; `tests/clinalg_card_check.py`), errors within 10x of CPU complex64's:
 
@@ -90,14 +100,20 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   |---|---|---|
   | `solve` (`left=False`: lazy only, eager 0.8-1.0x with backward) | 1.5-1.8x / 1.05-1.6x | 1.3-1.5x / 1.2-1.5x |
   | `inv` | 1.3-1.8x / 0.98-1.2x | 1.2-1.4x / 1.3-1.6x |
-  | `cholesky` | 1.1-1.3x / 1.2-1.3x | 1.1-1.5x / 1.7-2.1x |
+  | `cholesky` (torch's `info` computed) | 0.8-1.1x / 1.0-1.3x | 0.8-1.2x / 1.6-2.1x |
+  | `cholesky_solve` (n = 4-32) | 0.8-3.0x / 1.0-1.2x | 0.4-1.9x / 1.1-1.9x |
+  | `cholesky_inverse` (n = 4-32) | 0.75-3.5x / 0.9-1.2x | 0.8-2.5x / 1.2-2.1x |
+  | `solve_triangular` (lazy with grad only, n = 4-32) | 0.45-0.83x / 0.88-1.01x (off) | 0.38-0.78x / 1.05-1.32x |
+  | `eigvalsh` (lazy with grad only, n <= 16) | 0.16-0.28x / 0.7-0.9x (off) | 0.67-0.69x / 1.05-1.67x |
   | `pinv` (n = 16) | 4.0x / 1.4x | 2.4x / 3.6x |
   | `matrix_exp` | 1.0x / 1.3x (n = 16; composite 0.2-0.4x, off) | 1.0-2.1x / 1.7-4.0x |
   | `householder_product` (with grad only) | 0.2-0.3x / 10-19x | 0.35-0.54x / 13-28x |
   | `lstsq` (with grad only, n = 16) | 0.9x / 2.0x | 0.7x / 3.0x |
 
   Habana's float32 `cholesky` returns NaN with `info = 0` when the dim before the matrix equals its order (a batch
-  of 32 matrices of order 32): `repro/habana_cholesky_nan.py`; the module views such a batch as `(b, 1, n, n)`.
+  of 32 matrices of order 32): `repro/habana_cholesky_nan.py`, swept in `repro/habana_linalg_shape_sweep.py`
+  (orders 2-64, eager and lazy: only that dim; padding the batch by one identity moves the trap to b + 1 = n); the
+  module views such a batch as `(b, 1, n, n)`.
 - Complex `mm`/`bmm` (so `@`, `matmul`, `einsum` products) are one real GEMM on the card:
   `[ar | ai] @ [[br, bi], [-bi, br]] = [cr | ci]`, conjugate operands included (they reach `mm`/`bmm`
   unresolved). Products below 2²² multiply-adds (batch·m·k·n) go to the CPU instead, one copy each way, where
@@ -267,11 +283,14 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   hpu_complex, a real HPU tensor times a Python complex scalar still aborts the process in lazy mode, inside
   Habana's float `mul`/`add` (`repro/lazy_complex_scalar.py`, the `no-ext` rows).
 - complex64 linear algebra on the card (`hpu_complex/linalg.py`, needs `hpu_ops.enable()` for its TPC kernels):
-  `solve`, `inv`, `cholesky`, `pinv`, `matrix_exp` (and `householder_product`, `lstsq` when a gradient is
-  computed) run as the real problem on float pairs, eager and lazy, where measured not slower than the CPU route
-  (table below; `HPU_COMPLEX_LINALG=all` takes every op the module has, `=0` none). Still on the CPU (warned): `svd`,
-  `qr`, `eig`, `det`, `slogdet`, `eigh` (the module's `eigh`, n <= 16, is 3-5x slower than the CPU route and off by
-  default), `solve_triangular` and `cholesky_solve` (on the card only with `HPU_COMPLEX_LINALG=all`: 0.3-0.96x),
+  `solve`, `inv`, `cholesky`, `cholesky_solve`, `cholesky_inverse`, `pinv`, `matrix_exp` (and `householder_product`,
+  `lstsq` when a gradient is computed; `solve_triangular` and `eigvalsh` in lazy mode when a gradient is computed) run
+  as the real problem on float pairs, eager and lazy, where measured at about parity or faster than the CPU route (some
+  sizes slower, see the table; everything on the card comes first;
+  `HPU_COMPLEX_LINALG=all` takes every op the module has, `=0` none); `hpu_complex.linalg.hpd_slogdet` / `hpd_logdet`
+  for HPD input (1.5-4.8x). Still on the CPU (warned): `svd`, `eig`, `det`, `slogdet`, `qr` (the module's, through
+  Habana's real qr, is 0.45-0.85x eager and 0.1-4 s per call lazy: off by default), `eigh` (the module's `eigh`,
+  n <= 16, is 3-5x slower than the CPU route and off by default), `solve_triangular` forward alone (0.4-0.8x),
   sizes past hpu-ops' kernels (n > 32; `pinv`/`lstsq` n > 16), `torch.inference_mode`, `solve` under
   `torch.no_grad()` (a compiled graph's forward runs with grad off, and its traced backward reads the LU factors, which
   the card route does not compute: NaN gradients before this rule, measured), and traced calls (`torch.compile`

@@ -10,11 +10,15 @@ or hpu-ops' TPC kernels compute it:
   ``inv``, ``matrix_exp``, ``pinv`` and ``lstsq`` are the real op on ``E(A)``, and the complex result is read back
   from the first block column.
 - the interleaved embedding (rows and columns ordered re, im, re, im, ...) maps a triangular matrix with a real
-  diagonal to a triangular real matrix: ``solve_triangular`` (after scaling the rows by the diagonal, which makes it
-  unit) and ``cholesky_solve`` are real substitutions; for a Hermitian positive-definite ``H`` the real Cholesky
+  diagonal to a triangular real matrix: ``solve_triangular`` (after rotating each row by the phase of its diagonal
+  entry) is one real substitution (hpu-ops' TPC kernel); for a Hermitian positive-definite ``H`` the real Cholesky
   factor of the interleaved ``E(H)`` is the interleaved ``E(L)`` of the complex factor (``E(L)`` is lower triangular
   with a positive diagonal and ``E(L) E(L)^T = E(H)``; the Cholesky factor is unique), so ``cholesky`` is one real
-  Cholesky.
+  Cholesky (its ``info`` read from the factor's diagonal), ``cholesky_inverse`` is Habana's real one on ``E(L)``
+  (``E(H^-1)``), ``cholesky_solve`` that times ``v(B)``, and ``hpd_slogdet`` / ``hpd_logdet`` (explicit functions for
+  HPD input) the log of the factor's diagonal. ``qr`` is Habana's real QR of the interleaved ``E(A)`` re-signed to a
+  positive diagonal (``E(Q) E(R)`` by uniqueness), and ``eigvalsh`` the means of the pairs of the embedding's sorted
+  eigenvalues.
 - ``householder_product`` is the compact WY form ``I - V T V^H`` with ``T^-1 = diag(1/tau) + striu(V^H V)``: complex
   products as real GEMMs and one triangular solve.
 
@@ -72,7 +76,7 @@ def _real_on_card(kind, n2, batch=1):
     """Whether the float32 op ``kind`` on real matrices of order ``n2`` runs on the card (not a CPU fallback)."""
     if FORCE_REAL_ON_CARD:
         return True
-    if kind == "cholesky":  # Habana's own kernel (bridge 1.21.4: no fallback, measured)
+    if kind in ("cholesky", "cholesky_inverse", "qr"):  # Habana's own kernels (bridge 1.21.4: no fallback, measured)
         return True
     tpc = _hpu_ops_tpc()
     if tpc is None or not tpc.ready():
@@ -162,10 +166,11 @@ def _complex(re, im):
     return _as_complex(torch.stack([re, im], -1))
 
 
-def _embed(re, im, interleaved):
+def _embed(re, im, interleaved, conj=False):
     """The real embedding of a complex (..., n, m) matrix, (..., 2n, 2m): block ``[[re, -im], [im, re]]``, or
-    ``interleaved`` (rows and columns ordered re, im per index: ``E[2i + a, 2j + c]``). One stack and one copy."""
-    E = torch.stack([re, -im, im, re], -1).unflatten(-1, (2, 2))  # [..., i, j, a, c]
+    ``interleaved`` (rows and columns ordered re, im per index: ``E[2i + a, 2j + c]``). One stack and one copy.
+    ``conj``: the embedding of ``re - i im`` (no negation op of its own)."""
+    E = torch.stack([re, im, -im, re] if conj else [re, -im, im, re], -1).unflatten(-1, (2, 2))  # [..., i, j, a, c]
     n, m = re.shape[-2], re.shape[-1]
     E = E.permute(*range(re.dim() - 2), -4, -2, -3, -1) if interleaved else \
         E.permute(*range(re.dim() - 2), -2, -4, -1, -3)
@@ -211,12 +216,6 @@ def _cmm(ar, ai, br, bi):
     right = torch.cat([torch.cat([br, bi], -1), torch.cat([-bi, br], -1)], -2)
     out = left @ right
     return out[..., :n], out[..., n:]
-
-
-def _info_from_real(info):
-    """The complex info from the interleaved real Cholesky's: 0 stays 0; it fails first at an odd real index 2j - 1
-    (the real pivot there is the complex one), hence j = (info + 1) // 2."""
-    return torch.where(info > 0, (info + 1) // 2, info)
 
 
 def _info_from_block(info, n):
@@ -279,33 +278,94 @@ def _triangle(t, upper, diagonal=0):
     return t.triu(diagonal) if upper else t.tril(-diagonal)
 
 
-def _reciprocal(re, im):
-    """1 / (re + i im) in pairs, scaled by max(|re|, |im|) (no overflow or underflow of |d|^2)."""
-    s = torch.maximum(re.abs(), im.abs())
-    r, i = re / s, im / s
-    q = s * (r * r + i * i)
-    return r / q, -i / q
+def _real_tri(E, R, upper, unitriangular):
+    """The real triangular solve ``E X = R`` (float32, one triangle of ``E`` read): hpu-ops' TPC substitution kernel
+    called directly (one launch, no dispatcher route or autograd of its own), or torch's op where hpu-ops' kernels are
+    not loaded (the CPU stand-in)."""
+    tpc = _hpu_ops_tpc()
+    if tpc is not None and E.device.type == "hpu" and E.shape[-1] <= tpc.MAXN and tpc.ready():
+        if E.dim() == 3 and R.dim() == 3 and E.shape[0] == R.shape[0] and R.shape[-1] <= tpc.MAXN and \
+                _fresh(E) and _fresh(R):
+            # the kernel itself (through hpu-ops' lazy-mode guard): ``tri_solve`` copies every input that is a view,
+            # which its own batch reshape always makes one (two copies per call, measured as launches)
+            return tpc._call(tpc._tri_op(upper, unitriangular), E, R)
+        return tpc.tri_solve(E, R, upper=upper, unitriangular=unitriangular)
+    return torch.linalg.solve_triangular(E, R, upper=upper, unitriangular=unitriangular)
+
+
+def _fresh(t):
+    """A contiguous float32 tensor that owns its storage from offset 0 (no view: views break hpu-ops' kernels in lazy
+    mode)."""
+    return t.dtype == torch.float32 and t._base is None and t.storage_offset() == 0 and t.is_contiguous()
+
+
+# Row i of the interleaved embedding of ``conj(phi_i) T``, ``phi_i = d_i / |d_i| = ur + i ui`` (``d = diag T``): entry
+# ``[2i + a, 2j + c] = sum_e N[i, a, c, e] * (re, im)[T_ij][e]``, the rotation ``[[ur, ui], [-ui, ur]]`` (multiplication
+# by conj(phi)) followed by row a = 0 ``(re, -im)``, a = 1 ``(im, re)``: N[i] = [[[ur, ui], [ui, -ur]], [[-ui, ur],
+# [ur, ui]]]. Its c = 0 half is the rotation itself, which gives v(conj(phi) B).
+
+
+def _tri_left_forward(A, B, upper, unitriangular):
+    """``A X = B`` for triangular complex ``A``: the interleaved embedding of a triangle with a real diagonal is a real
+    triangle. Non-unit: the rows of ``A`` and ``B`` are rotated by ``conj(phi_i)`` (``phi = diag / |diag|``), which
+    makes the diagonal ``|d_i|`` (a pure rotation: no reciprocal, no scaling of the solution), and the real
+    substitution divides by it. Unit: the diagonal is not read (its imaginary part, which the real kernel would read
+    at ``[2i + 1, 2i]``, is masked). The embedding and the rotation are one multiply and one sum per operand."""
+    n, k = A.shape[-1], B.shape[-1]
+    # contiguous first: on the card a transposed view (A^H in the backward) through the broadcast products below gave
+    # wrong values (relative error 0.45, measured; the same matrix copied first is right). Free when contiguous.
+    va = torch.view_as_real(A.resolve_conj().resolve_neg().contiguous())  # (..., n, n, 2)
+    vb = torch.view_as_real(B.resolve_conj().resolve_neg().contiguous())  # (..., n, k, 2)
+    if unitriangular:
+        ar, ai = va[..., 0], va[..., 1]
+        E = _interleaved(ar, ai.triu(1) if upper else ai.tril(-1))
+        R = vb.transpose(-1, -2).reshape(*vb.shape[:-3], 2 * n, k)  # v(B): rows (re, im) per index
+    else:
+        d = torch.diagonal(va, 0, -3, -2)  # (..., 2, n): (re, im) of the diagonal
+        p = (d / torch.hypot(d[..., :1, :], d[..., 1:, :])).mT  # (..., n, 2): phi_i (a zero diagonal: NaN, as torch's inf)
+        m = -p
+        N = torch.stack([p[..., 0], p[..., 1], p[..., 1], m[..., 0], m[..., 1], p[..., 0], p[..., 0], p[..., 1]],
+                        -1).unflatten(-1, (2, 2, 2))  # (..., n, a, c, e)
+        # reshaped before the sum, so E and R are fresh tensors, not views (hpu-ops copies a view before its kernel)
+        E = (N[..., :, :, None, :, :] * va[..., :, None, :, None, :]).reshape(*va.shape[:-3], 2 * n, 2 * n, 2).sum(-1)
+        R = N[..., :, :, None, 0, :] * vb[..., :, None, :, :]
+        R = R.reshape(*R.shape[:-4], 2 * n, k, 2).sum(-1)
+    return _from_interleaved_rhs(_real_tri(E, R, upper, unitriangular))
+
+
+class _SolveTriangular(torch.autograd.Function):
+    """torch's ``linalg_solve_triangular_backward`` (left): ``gB = A^-H g`` (the other triangle), ``gA = -gB X^H``
+    restricted to the triangle (strict when unit)."""
+
+    @staticmethod
+    def forward(ctx, A, B, upper, unitriangular):
+        X = _tri_left_forward(A, B, upper, unitriangular)
+        ctx.save_for_backward(A, X)
+        ctx.flags = (upper, unitriangular)
+        ctx.shapes = (A.shape, B.shape)
+        return X
+
+    @staticmethod
+    def backward(ctx, g):
+        A, X = ctx.saved_tensors
+        upper, unit = ctx.flags
+        gB = _SolveTriangular.apply(A.mH, g, not upper, unit)
+        gA = None
+        if ctx.needs_input_grad[0]:
+            gr, gi = _pair(gB)
+            xr, xi = _pair(X)
+            pr, pi = _cmm(gr, gi, xr.mT, -xi.mT)  # gB X^H
+            gA = _complex(-_triangle(pr, upper, int(unit)), -_triangle(pi, upper, int(unit))).sum_to_size(ctx.shapes[0])
+        return gA, gB.sum_to_size(ctx.shapes[1]), None, None
 
 
 def solve_triangular(A, B, upper, left=True, unitriangular=False):
-    """``linalg.solve_triangular``: the rows of ``T`` (and ``B``) scaled by ``1 / diag(T)`` make ``T`` unit triangular
-    (its strict triangle scaled, its diagonal exactly 1); its interleaved embedding is then a real unit triangle,
-    solved by one real substitution. The scaling is one pass over ``[T | B]``."""
-    if not left:  # X T = B  <=>  T^T X^T = B^T
+    """``linalg.solve_triangular`` (``left=False``: ``X A = B`` as ``A^T X^T = B^T``, the other triangle)."""
+    if not left:
         return solve_triangular(A.mT, B.mT, not upper, True, unitriangular).mT
-    n = A.shape[-1]
-    ar, ai = _pair(A)
-    br, bi = _pair(B)
-    batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
-    tr, ti = _triangle(ar, upper, 1), _triangle(ai, upper, 1)
-    cr = torch.cat([tr.expand(*batch, n, n), br.expand(*batch, *B.shape[-2:])], -1)
-    ci = torch.cat([ti.expand(*batch, n, n), bi.expand(*batch, *B.shape[-2:])], -1)
-    if not unitriangular:
-        xr, xi = _reciprocal(torch.diagonal(ar, 0, -2, -1).unsqueeze(-1), torch.diagonal(ai, 0, -2, -1).unsqueeze(-1))
-        cr, ci = cr * xr - ci * xi, cr * xi + ci * xr
-    E = _interleaved(cr, ci)  # (..., 2n, 2(n + k)): the triangle, then v(B') in the even columns
-    X = torch.linalg.solve_triangular(E[..., :2 * n], E[..., 2 * n::2].contiguous(), upper=upper, unitriangular=True)
-    return _from_interleaved_rhs(X)
+    if torch.is_grad_enabled() and (A.requires_grad or B.requires_grad):
+        return _SolveTriangular.apply(A, B, upper, unitriangular)
+    return _tri_left_forward(A, B, upper, unitriangular)
 
 
 def _cmatmul(a, b):
@@ -319,30 +379,52 @@ def _ctril(z, diagonal=0):
     return _complex(re.tril(diagonal), im.tril(diagonal))
 
 
-def _cholesky_solve_forward(B, L, upper):
-    if upper:
-        Y = solve_triangular(L.mH, B, upper=False)
-        return solve_triangular(L, Y, upper=True)
-    Y = solve_triangular(L, B, upper=False)
-    return solve_triangular(L.mH, Y, upper=True)
+def _factor_embedding(L, upper):
+    """The interleaved embedding of a triangular factor with the same ``L L^H`` (``U^H U``) and a real positive
+    diagonal, for Habana's real kernels (which read one triangle only): ``L' = L diag(conj(phi))`` (``U' =
+    diag(conj(phi)) U``), ``phi = diag / |diag|``, so ``L' L'^H = L L^H`` and ``diag(L') = |diag|``, the rotation
+    ``solve_triangular`` does by rows. A complex diagonal is thus right (torch's ``cholesky_solve`` uses it); the
+    rotation is ``hypot``, one division and one complex scaling, no host read."""
+    v = torch.view_as_real(L.resolve_conj().resolve_neg().contiguous())
+    lr, li = v[..., 0], v[..., 1]
+    d = torch.diagonal(v, 0, -3, -2)  # (..., 2, n)
+    p = d / torch.hypot(d[..., :1, :], d[..., 1:, :])  # (re, im) of phi (a zero diagonal: NaN, singular anyway)
+    ur, ui = (p[..., 0, :, None], p[..., 1, :, None]) if upper else (p[..., 0, None, :], p[..., 1, None, :])
+    rr, ri = lr * ur + li * ui, li * ur - lr * ui  # times conj(phi): rows (upper) or columns (lower)
+    return _interleaved(rr, ri.triu(1) if upper else ri.tril(-1))  # the diagonal's residue of im: 0
+
+
+def _from_interleaved(X):
+    """The complex (..., n, m) matrix of its interleaved embedding: column 2j holds (re, im) of column j."""
+    return _complex(X[..., 0::2, 0::2], X[..., 1::2, 0::2])
+
+
+def _cholesky_inverse_real(L, upper):
+    """``E(H^-1)`` for ``H = L L^H`` (``U^H U``): Habana's ``cholesky_inverse`` on the interleaved factor, which is the
+    real Cholesky factor of ``E(H)``."""
+    return torch.cholesky_inverse(_factor_embedding(L, upper), upper=upper)
 
 
 class _CholeskySolve(torch.autograd.Function):
     """torch's ``cholesky_solve_backward``: ``gB = cholesky_solve(g, L)``, ``gL = -(C L)`` (``-(L C)`` if upper) with
-    ``C = gB X^H + X gB^H`` (not masked to the triangle, as torch)."""
+    ``C = gB X^H + X gB^H`` (not masked to the triangle, as torch). ``gB`` reuses the forward's ``E(H^-1)``."""
 
     @staticmethod
     def forward(ctx, B, L, upper):
-        X = _cholesky_solve_forward(B, L, upper)
-        ctx.save_for_backward(L, X)
+        Einv = _cholesky_inverse_real(L, upper)
+        X = _apply_interleaved(Einv, B)
+        ctx.save_for_backward(L, X, Einv)
         ctx.upper = upper
         ctx.shapes = (B.shape, L.shape)
         return X
 
     @staticmethod
     def backward(ctx, g):
-        L, X = ctx.saved_tensors
-        gB = _CholeskySolve.apply(g, L, ctx.upper)
+        L, X, Einv = ctx.saved_tensors
+        if torch.is_grad_enabled():  # create_graph: differentiable in L
+            gB = _CholeskySolve.apply(g, L, ctx.upper)
+        else:
+            gB = _apply_interleaved(Einv, g)
         gL = None
         if ctx.needs_input_grad[1]:
             common = _cmatmul(gB, X.mH)
@@ -352,11 +434,46 @@ class _CholeskySolve(torch.autograd.Function):
         return gB.sum_to_size(ctx.shapes[0]), gL, None
 
 
+def _apply_interleaved(E, B):
+    """``M B`` for complex B (..., n, k) and the interleaved embedding ``E = E(M)``: one real GEMM on ``v(B)``."""
+    br, bi = _pair(B)
+    return _from_interleaved_rhs(E @ _interleaved_rhs(br, bi))
+
+
 def cholesky_solve(B, L, upper=False):
-    """``cholesky_solve``: ``L L^H X = B`` (``U^H U X = B`` if ``upper``) as two triangular solves."""
+    """``cholesky_solve``: ``X = H^-1 B`` with ``E(H^-1)`` from Habana's ``cholesky_inverse`` of the interleaved
+    factor, then one real GEMM (an inverse-based solve: forward error of order cond(H) eps, as two substitutions)."""
     if torch.is_grad_enabled() and (B.requires_grad or L.requires_grad):
         return _CholeskySolve.apply(B, L, upper)
-    return _cholesky_solve_forward(B, L, upper)
+    return _apply_interleaved(_cholesky_inverse_real(L, upper), B)
+
+
+class _CholeskyInverse(torch.autograd.Function):
+    """torch's ``cholesky_inverse_backward``: ``C = Inv (g + g^H) Inv``, ``gL = -(C L)`` (``-(L C)`` if upper)."""
+
+    @staticmethod
+    def forward(ctx, L, upper):
+        inv = _from_interleaved(_cholesky_inverse_real(L, upper))
+        ctx.save_for_backward(L, inv)
+        ctx.upper = upper
+        return inv
+
+    @staticmethod
+    def backward(ctx, g):
+        L, inv = ctx.saved_tensors
+        common = _cmatmul(inv, _cmatmul(g + g.mH, inv))
+        return (-_cmatmul(L, common) if ctx.upper else -_cmatmul(common, L)), None
+
+
+def cholesky_inverse(L, upper=False):
+    """``cholesky_inverse``: ``(L L^H)^-1`` (``(U^H U)^-1``) from Habana's real ``cholesky_inverse`` of the interleaved
+    factor (rotated to a real positive diagonal, see ``_factor_embedding``). Equal to torch's for a real diagonal of
+    either sign. For a diagonal that is not real this is ``(L L^H)^-1``; torch's LAPACK result there (``potri``, whose
+    ``lauum`` reads only the real part of the inverted diagonal) is neither that nor Hermitian (measured, 0.045 off),
+    so the two differ there."""
+    if torch.is_grad_enabled() and L.requires_grad:
+        return _CholeskyInverse.apply(L, upper)
+    return _from_interleaved(_cholesky_inverse_real(L, upper))
 
 
 class _Cholesky(torch.autograd.Function):
@@ -387,11 +504,11 @@ class _Cholesky(torch.autograd.Function):
         xr, xi = _cmm(lr.mT, -li.mT, gr, gi)  # L^H gL
         xr, xi = xr.tril(), xi.tril()
         pr, pi = 0.5 * (xr + xr.tril(-1).mT), 0.5 * (xi - xi.tril(-1).mT)  # Phi
-        Y = torch.linalg.solve_triangular(E.mT, _interleaved_rhs(pr, pi), upper=True)  # v(L^-H Phi)
+        Y = _real_tri(E.mT, _interleaved_rhs(pr, pi), True, False)  # v(L^-H Phi)
         n = L.shape[-1]
         Y = Y.unflatten(-2, (n, 2))  # [..., i, a, j]
         Yt = torch.stack([Y[..., 0, :], -Y[..., 1, :]], -1).flatten(-2)  # rows [yr_0, -yi_0, ...]
-        X = torch.linalg.solve_triangular(E, Yt, upper=False, left=False).unflatten(-1, (n, 2))
+        X = _real_tri(E.mT, Yt.mT, True, False).mT.unflatten(-1, (n, 2))  # X~ E(L) = Y~  <=>  E(L)^T X~^T = Y~^T
         gA = _complex(X[..., 0], -X[..., 1])
         return gA, None
 
@@ -406,28 +523,127 @@ def cholesky_ex(A, upper=False, check_errors=False):
     return L, info
 
 
-def _cholesky_ex(A, upper=False, keep_real=False):
-    """``linalg_cholesky_ex``: the real Cholesky factor of the interleaved ``E(H)`` is ``E(L)``."""
+def _hermitian_lower_embedding(A, upper):
+    """The interleaved embedding of the Hermitian matrix held in one triangle of ``A``, right in its lower triangle
+    (the only one Habana's cholesky reads; measured): the imaginary part of the diagonal is masked, and for ``upper``
+    the lower triangle of ``H`` is ``conj(U)^T``."""
     ar, ai = _pair(A)
-    if upper:  # the upper triangle holds H: H = U^H U, the lower triangle of H is conj(U)^T
-        ar, ai = ar.mT, -ai.mT
-    lr, li = ar.tril(), ai.tril(-1)
-    hr = lr + lr.tril(-1).mT
-    hi = li - li.mT  # Hermitian: the imaginary part is antisymmetric; diag(H) is real (its imaginary part ignored)
-    E = _interleaved(hr, hi)
+    if upper:
+        return _embed(ar.mT, ai.mT.tril(-1), True, conj=True)
+    return _interleaved(ar, ai.tril(-1))
+
+
+def _real_cholesky(E, with_info=False):
+    """Habana's real Cholesky factor of ``E`` (..., n2, n2). It returns NaN (info 0) when the dim before the matrix
+    equals its order (bridge 1.21.4: every (..., n2, n2, n2) of the sweep in repro/habana_linalg_shape_sweep.py, eager
+    and lazy; any other batch is right); the same batch as (..., n2, 1, n2, n2) is right in every swept shape (a view,
+    no op). Its own ``info`` is a constant 0 and is not read."""
     n2 = E.shape[-1]
     if E.dim() >= 3 and E.shape[-3] == n2:
-        # Habana's float32 cholesky returns NaN (info 0) when the dim before the matrix equals its order (bridge
-        # 1.21.4, repro/habana_cholesky_nan.py); the same batch as (..., b, 1, n, n) is right.
         Lreal, info = torch.linalg.cholesky_ex(E.unsqueeze(-3))
         Lreal, info = Lreal.squeeze(-3), info.squeeze(-1)
     else:
         Lreal, info = torch.linalg.cholesky_ex(E)
-    blocks = Lreal.reshape(*Lreal.shape[:-2], n2 // 2, 2, n2 // 2, 2)
+    return (Lreal, info) if with_info else Lreal
+
+
+def _cholesky_info(Lreal, real_info):
+    """torch's ``info`` for the interleaved factor. Habana's kernel reports ``info = 0`` always and gives NaN from the
+    failing pivot on (measured: a non-positive pivot, a Schur-complement failure and an off-diagonal NaN alike), so
+    the first real diagonal entry r (0-based) that is not positive (NaN included, LAPACK's test) is the failing real
+    pivot, of complex pivot r // 2: info = r // 2 + 1. Each real position holds its complex info (1, 1, 2, 2, ...,
+    cached), the good ones n + 1; the least, modulo n + 1, is that info. A LAPACK factor (the CPU stand-in) is not
+    read this way: Accelerate leaves the original diagonal from the failing pivot on, so the diagonal can look good;
+    its own real info is exact, mapped as (info + 1) // 2 and taken where nonzero. Float math, cast at the end.
+    (Measured on the card: ``amin`` over a (NaN, x) pair skips the NaN; strided views of the diagonal and int64
+    arithmetic on an ``argmax`` gave wrong indices on a lazy graph's first run; an ``argmax``-based rule took 2-6 ms
+    per call in lazy mode.)"""
+    n = Lreal.shape[-1] // 2
+    first = _info_positions(n, Lreal.device).expand(Lreal.shape[:-1]).masked_fill(
+        torch.diagonal(Lreal, 0, -2, -1) > 0, n + 1).amin(-1)
+    real = real_info.float()
+    info = torch.where(real > 0, torch.floor((real + 1) * 0.5), torch.remainder(first, n + 1))
+    return info.to(torch.int32)
+
+
+@functools.lru_cache(maxsize=None)
+def _info_positions(n, device):
+    """[1, 1, 2, 2, ..., n, n] (float32) on ``device``: the complex pivot (1-based) of each real diagonal position."""
+    return torch.arange(1, n + 1, dtype=torch.float32).repeat_interleave(2).to(device)
+
+
+def _cholesky_ex(A, upper=False, keep_real=False):
+    """``linalg_cholesky_ex``: the real Cholesky factor of the interleaved ``E(H)`` is ``E(L)``."""
+    n = A.shape[-1]
+    Lreal, real_info = _real_cholesky(_hermitian_lower_embedding(A, upper), with_info=True)
+    blocks = Lreal.reshape(*Lreal.shape[:-2], n, 2, n, 2)
     re, im = blocks[..., 0, :, 0], blocks[..., 1, :, 0].tril(-1)  # the diagonal is real (its rounding residue: 0)
-    info = _info_from_real(info)
+    info = _cholesky_info(Lreal, real_info)
     L = _complex(re.mT, -im.mT) if upper else _complex(re, im)
     return (L, info, Lreal) if keep_real else (L, info)
+
+
+# ---- Hermitian positive-definite slogdet / logdet -------------------------------------------------------------------
+
+
+def _hpd_logabsdet_forward(A):
+    Lreal, real_info = _real_cholesky(_hermitian_lower_embedding(A, False), with_info=True)
+    # each complex pivot appears twice on the real diagonal: sum log = 2 sum log l_jj = log det H; NaN unless every
+    # pivot is positive and the kernel reported no failure (an exactly singular matrix too, not -inf)
+    d = torch.diagonal(Lreal, 0, -2, -1)
+    ok = (d > 0).all(-1) & (real_info == 0)
+    return torch.where(ok, torch.log(d).sum(-1), float("nan")), Lreal
+
+
+class _HpdLogabsdet(torch.autograd.Function):
+    """``log det H`` of the HPD matrix in the lower triangle of ``A``, with torch's ``slogdet`` gradient at ``H``:
+    ``g A^-H = g H^-1`` (full, not masked to the triangle), ``H^-1`` from Habana's ``cholesky_inverse`` of the factor
+    the forward computed. With ``create_graph`` the same ``g A^-H`` through differentiable ops on ``A``
+    (``linalg.inv`` of H: the block-embedding route), so second derivatives are torch's slogdet's at H."""
+
+    @staticmethod
+    def forward(ctx, A):
+        logabsdet, Lreal = _hpd_logabsdet_forward(A)
+        ctx.save_for_backward(A, Lreal)
+        return logabsdet
+
+    @staticmethod
+    def backward(ctx, g):
+        A, Lreal = ctx.saved_tensors
+        if torch.is_grad_enabled():  # H from the lower triangle, its gradient passed through as for the full matrix
+            return g[..., None, None] * torch.linalg.inv(_HermitianFromLower.apply(A)).mH
+        inv = torch.cholesky_inverse(Lreal)
+        return _from_interleaved(g[..., None, None] * inv)
+
+
+def hpd_slogdet(A):
+    """``torch.linalg.slogdet`` of a Hermitian positive-definite complex ``A`` (its lower triangle read, as
+    ``linalg.cholesky``): sign 1, ``logabsdet = 2 sum log diag(L)`` from one real Cholesky of the interleaved
+    embedding, on the card. An explicit API, not a route of ``torch.linalg.slogdet``: torch has no Hermitian flag, and
+    testing for one would read the matrix on the host. A matrix that is not positive definite, an exactly singular
+    one included, gives NaN ``logabsdet`` (not -inf: ``torch.linalg.cholesky_ex`` reports which), on and off the card.
+    The general complex determinant is not here. Off the card (CPU, complex128) the same math runs through torch's
+    ops."""
+    if not _complex_on_card(A):
+        L, info = torch.linalg.cholesky_ex(A)
+        d = torch.diagonal(L, 0, -2, -1).real
+        logabsdet = torch.where((info == 0) & (d > 0).all(-1), 2 * torch.log(d).sum(-1), float("nan"))
+        return torch.return_types.linalg_slogdet((torch.ones_like(logabsdet, dtype=A.dtype), logabsdet))
+    _count("hpd_slogdet")
+    if torch.is_grad_enabled() and A.requires_grad:
+        logabsdet = _HpdLogabsdet.apply(A)
+    else:
+        logabsdet = _hpd_logabsdet_forward(A)[0]
+    sign = _complex(torch.ones_like(logabsdet), torch.zeros_like(logabsdet))
+    return torch.return_types.linalg_slogdet((sign, logabsdet))
+
+
+def hpd_logdet(A):
+    """``torch.logdet`` of a Hermitian positive-definite complex ``A`` (complex, imaginary part 0), see
+    ``hpd_slogdet``."""
+    logabsdet = hpd_slogdet(A).logabsdet
+    return _complex(logabsdet, torch.zeros_like(logabsdet)) if logabsdet.device.type == "hpu" else \
+        logabsdet.to(A.dtype)
 
 
 # ---- matrix_exp ------------------------------------------------------------------------------------------------------
@@ -583,11 +799,115 @@ def eigh(A, UPLO="L", compute_v=True):
     """``_linalg_eigh`` -> (eigenvalues, eigenvectors); without ``compute_v`` the eigenvectors are empty."""
     upper = UPLO.upper() == "U"
     if not compute_v:
-        L, _ = _eigh_forward(A, upper, False)
-        return L, torch.empty(0, dtype=C64, device=A.device)
+        return eigvalsh(A, UPLO), torch.empty(0, dtype=C64, device=A.device)
     if torch.is_grad_enabled() and A.requires_grad:
         return _Eigh.apply(A, upper)
     return _eigh_forward(A, upper, True)
+
+
+class _HermitianEmbedding(torch.autograd.Function):
+    """The interleaved embedding of the Hermitian matrix in one triangle of ``A``, right in that triangle (the real
+    eigh reads only it; the imaginary part of the diagonal is masked). Backward: the complex matrix of the real
+    gradient, ``gA = (g[2i, 2j] + g[2i+1, 2j+1]) + i (g[2i+1, 2j] - g[2i, 2j+1])``, not masked to the triangle: for
+    torch's eigvalsh gradient ``V diag(gL) V^H`` the real one is ``U diag(gw) U^T = E(V diag(gL) V^H) / 2`` with
+    ``gw = gL / 2`` on each pair, and the map gives it back in full."""
+
+    @staticmethod
+    def forward(ctx, A, upper):
+        ar, ai = _pair(A)
+        return _interleaved(ar, ai.triu(1) if upper else ai.tril(-1))
+
+    @staticmethod
+    def backward(ctx, g):
+        return _complex(g[..., 0::2, 0::2] + g[..., 1::2, 1::2], g[..., 1::2, 0::2] - g[..., 0::2, 1::2]), None
+
+
+def eigvalsh(A, UPLO="L"):
+    """``linalg.eigvalsh``: the sorted real eigenvalues of the interleaved embedding (hpu-ops' Jacobi kernel) come in
+    equal pairs, each the complex eigenvalue; their mean is it (exact also for clusters). The gradient is torch's,
+    through the real eigvalsh's backward."""
+    upper = UPLO.upper() == "U"
+    E = _HermitianEmbedding.apply(A, upper) if torch.is_grad_enabled() and A.requires_grad else \
+        _HermitianEmbedding.forward(None, A, upper)
+    w = torch.linalg.eigvalsh(E, UPLO="U" if upper else "L")
+    return 0.5 * (w[..., 0::2] + w[..., 1::2])
+
+
+# ---- qr ---------------------------------------------------------------------------------------------------------------
+
+
+def _qr_forward(A, want_q):
+    """Habana's real QR of the interleaved ``E(A)`` (2m x 2n, m >= n). For ``A = Q R`` with ``diag(R) > 0``,
+    ``E(A) = E(Q) E(R)``, ``E(R)`` upper triangular with the diagonal pairs ``(r_kk, r_kk)`` and ``E(Q)`` with orthonormal
+    columns; the real QR with a positive diagonal is unique (full column rank), so the real factors re-signed to a
+    positive diagonal are ``E(Q)``, ``E(R)``, and column 2j holds (re, im) of column j. R has a real positive
+    diagonal: LAPACK's (and torch's) is real too, with the sign ``-sign(Re)`` of each Householder head; both are QR
+    decompositions (torch documents the signs as not unique), and ``Q`` differs from torch's by those column signs.
+    A rank-deficient ``A`` (a zero column, dependent columns) gives NaN: Habana's qr returns NaN for it, and ``W``
+    does not change the rank (torch returns a QR with a zero on R's diagonal)."""
+    ar, ai = _pair(A)
+    E = _interleaved(ar, ai)
+    W = _mixing(E.shape[-2], E.device)
+    # Habana's qr returns NaN when a Householder column has a zero tail (an identity, a diagonal or triangular
+    # matrix, any A whose first column is a real multiple of e_0; repro/habana_qr_nan.py). The QR of W E, W a fixed
+    # dense orthogonal matrix, is (W Q) R: the same R, and Q = W^T (W Q), with columns of W E generic.
+    Qe, Re = torch.linalg.qr(W @ E)
+    s = torch.where(torch.diagonal(Re, 0, -2, -1) < 0, -1.0, 1.0)  # (..., 2n)
+    R = _from_interleaved(Re * s.unsqueeze(-1))
+    Q = _from_interleaved(W.mT @ (Qe * s.unsqueeze(-2))) if want_q else None
+    return Q, R
+
+
+@functools.lru_cache(maxsize=None)
+def _mixing(m, device):
+    """A fixed dense m x m orthogonal float32 matrix on ``device`` (QR of a seeded Gaussian, float64 on the host,
+    once per size)."""
+    g = torch.Generator().manual_seed(m)
+    W, _ = torch.linalg.qr(torch.randn(m, m, dtype=torch.float64, generator=g))
+    return W.to(torch.float32).to(device)
+
+
+class _QR(torch.autograd.Function):
+    """torch's ``linalg_qr_backward`` for m >= n: ``M = gR R^H - Q^H gQ``, ``gA = (Q syminvadj(triu(M)) + gQ) R^-H`` with
+    ``syminvadj(X) = X + X^H`` and its diagonal's real part halved; the solve with R^H is this module's triangular
+    solve."""
+
+    @staticmethod
+    def forward(ctx, A):
+        Q, R = _qr_forward(A, True)
+        ctx.save_for_backward(Q, R)
+        return Q, R
+
+    @staticmethod
+    def backward(ctx, gQ, gR):
+        Q, R = ctx.saved_tensors
+        if gR is not None:
+            M = _cmatmul(gR, R.mH)
+            M = M - _cmatmul(Q.mH, gQ) if gQ is not None else M
+        else:
+            M = -_cmatmul(Q.mH, gQ)
+        mr, mi = _pair(M)
+        mr, mi = mr.triu(), mi.triu()
+        sr, si = mr + mr.mT, mi - mi.mT  # X + X^H; its diagonal: 2 Re (imaginary part 0)
+        eye = torch.eye(sr.shape[-1], dtype=sr.dtype, device=sr.device)
+        sr = sr - 0.5 * sr * eye
+        gA = _cmatmul(Q, _complex(sr, si))
+        if gQ is not None:
+            gA = gA + gQ
+        return solve_triangular(R.mH, gA, upper=False, left=False)
+
+
+def qr(A, mode="reduced"):
+    """``linalg.qr`` for m >= n (modes ``reduced``, ``r``, and ``complete`` when m == n)."""
+    if mode == "r":
+        if torch.is_grad_enabled() and A.requires_grad:
+            raise RuntimeError("The derivative of linalg.qr depends on Q, which is not computed when mode='r'. "
+                               "Please use linalg.qr(A, mode='reduced') if you are going to differentiate through "
+                               "linalg.qr.")
+        return torch.empty(0, dtype=A.dtype, device=A.device), _qr_forward(A, False)[1]
+    if torch.is_grad_enabled() and A.requires_grad:
+        return _QR.apply(A)
+    return _qr_forward(A, True)
 
 
 # ---- pinv, lstsq ------------------------------------------------------------------------------------------------------
@@ -653,24 +973,36 @@ def lstsq(A, B, rcond=None, driver=None):
 
 
 def _decline(op, args, kwargs):
+    """torch's own kernel: the Autograd one, or for a CompositeImplicitAutograd op (``linalg_eigvalsh``, which has no
+    Autograd kernel: the alias would come back here) its decomposition."""
+    if torch._C._dispatch_has_kernel_for_dispatch_key(op.name(), "CompositeImplicitAutograd"):
+        return op._op_dk(DispatchKey.CompositeImplicitAutograd, *args, **kwargs)
     return op._op_dk(DispatchKey.Autograd, *args, **kwargs)
 
 
-# Where each op is taken by default: the modes where it measured not slower than the CPU route, forward and forward +
-# backward, batch 32, n = 16..32 (clinalg_card_check.py, Gaudi2, bridge 1.21.4; tables in TEAM_REPORT.md).
+# Where each op is taken by default, from the measured speed against the CPU route (forward and forward + backward,
+# batch 32, n = 4..32; clinalg_card_check.py, Gaudi2, bridge 1.21.4; tables in TEAM_REPORT.md). Keeping the work on
+# the card comes first: an op is routed where it measured at about parity or faster in that mode, even if some
+# sizes or variants were slower (noted per op; e.g. eager cholesky_solve(upper) 0.78x and cholesky_inverse 0.90x
+# forward at n = 16); it is gated to "with grad" or a mode only where it was clearly slower otherwise.
 # HPU_COMPLEX_LINALG=all takes every op in both modes (nothing on the CPU, at that speed); =0 none.
 ROUTES = {
     "solve": ("eager", "lazy"),
     "solve_left_false": ("lazy",),  # eager: forward + backward 0.79-1.0x
     "inv": ("eager", "lazy"),
-    "cholesky": ("eager", "lazy"),
+    "cholesky": ("eager", "lazy"),  # with torch's info computed: forward 0.8-1.1x eager, 0.8-1.2x lazy (parity, the
+    # info's ops and the error check's wait); forward + backward 1.0-1.3x eager, 1.6-2.1x lazy
     "matrix_exp": ("eager", "lazy"),  # n <= 16: hpu-ops' kernel on E(A)
     "matrix_exp_composite": ("lazy",),  # n > 16: eager 0.2-0.4x, lazy 1.0-4x
     "pinv": ("eager", "lazy"),
     "householder_product": ("eager:grad", "lazy:grad"),  # forward alone 0.2-0.5x, with backward 2-28x
     "lstsq": ("eager:grad", "lazy:grad"),  # forward alone 0.7-0.9x, with backward 1.6-3.2x
-    "solve_triangular": (),  # 0.3-0.96x forward in both modes
-    "cholesky_solve": (),  # 0.25-0.4x forward
+    "solve_triangular": ("lazy:grad",),  # forward 0.45-0.83x eager, 0.38-0.78x lazy; forward + backward 0.88-1.01x
+    # eager, 1.05-1.32x lazy (n = 4..32)
+    "cholesky_solve": ("eager", "lazy"),  # forward 0.8-3.0x eager, 0.4-1.9x lazy; with backward 1.0-1.2x / 1.1-1.9x
+    "cholesky_inverse": ("eager", "lazy"),  # forward 0.75-3.5x / 0.8-2.5x; with backward 0.9-1.2x / 1.2-2.1x
+    "qr": (),  # Habana's real qr: eager 0.45-0.85x forward, 0.7-0.9x with backward; lazy 90 ms-4.4 s per call
+    "eigvalsh": ("lazy:grad",),  # forward 0.16-0.28x eager, 0.67-0.69x lazy; with backward 0.7-0.9x / 1.05-1.67x
     "eigh": (),  # eager 0.2x, lazy 0.3x forward (n <= 16, the real kernel's limit)
 }
 
@@ -745,7 +1077,23 @@ def _takes_tri(A, B, *, upper, left=True, unitriangular=False):
 def _takes_cholesky_solve(B, L, upper=False):
     if not (isinstance(L, torch.Tensor) and _complex_on_card(B, L) and _square(L) and B.dim() >= 2):
         return False
-    return B.shape[-2] == L.shape[-1] and _real_on_card("tri", 2 * L.shape[-1])
+    return B.shape[-2] == L.shape[-1] and _real_on_card("cholesky_inverse", 2 * L.shape[-1])
+
+
+def _takes_cholesky_inverse(L, upper=False):
+    return _complex_on_card(L) and _square(L) and _real_on_card("cholesky_inverse", 2 * L.shape[-1])
+
+
+def _takes_qr(A, mode="reduced"):
+    if not (_complex_on_card(A) and A.dim() >= 2 and A.shape[-2] >= A.shape[-1]):
+        return False
+    if mode not in ("reduced", "r") and not (mode == "complete" and A.shape[-2] == A.shape[-1]):
+        return False  # complete with m > n: the extra columns of Q need not keep the pair structure; torch's route
+    return _real_on_card("qr", 2 * A.shape[-2])
+
+
+def _takes_eigvalsh(A, UPLO="L"):
+    return _complex_on_card(A) and _square(A) and _real_on_card("eigh", 2 * A.shape[-1])
 
 
 def _takes_cholesky(A, upper=False, check_errors=False):
@@ -798,6 +1146,9 @@ def _entries():
          lambda A, B, *, upper, left=True, unitriangular=False: solve_triangular(A, B, upper, left, unitriangular)),
         (aten.cholesky_solve.default, "cholesky_solve", _takes_cholesky_solve, cholesky_solve),
         (aten.linalg_cholesky_ex.default, "cholesky", _takes_cholesky, cholesky_ex),
+        (aten.cholesky_inverse.default, "cholesky_inverse", _takes_cholesky_inverse, cholesky_inverse),
+        (aten.linalg_qr.default, "qr", _takes_qr, lambda A, mode="reduced": qr(A, mode)),
+        (aten.linalg_eigvalsh.default, "eigvalsh", _takes_eigvalsh, eigvalsh),
         (aten.linalg_matrix_exp.default, "matrix_exp", _takes_matrix_exp, matrix_exp),
         (aten.linalg_householder_product.default, "householder_product", _takes_householder, householder_product),
         (aten.linalg_pinv.atol_rtol_tensor, "pinv", _takes_pinv, pinv),
@@ -843,4 +1194,4 @@ def uninstall():
 
 
 __all__ = ["install", "uninstall", "CALLS", "solve_ex", "inv_ex", "solve_triangular", "cholesky_solve", "cholesky_ex",
-           "matrix_exp", "householder_product"]
+           "matrix_exp", "householder_product", "cholesky_inverse", "qr", "eigvalsh", "hpd_slogdet", "hpd_logdet"]
