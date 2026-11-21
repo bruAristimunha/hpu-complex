@@ -12,6 +12,7 @@ import torch
 import torch.autograd.forward_ad as fwAD
 
 from hpu_complex.tests.test_complex128_cpu import HPU, extension, tagged  # noqa: F401
+from hpu_complex.tests.test_pair_kernels_formula_cpu import check_c99_cexp
 from hpu_complex.tests.test_review_fixes_cpu import bits_equal, h
 
 C64, C128 = torch.complex64, torch.complex128
@@ -151,21 +152,17 @@ EDGE = torch.tensor([0j, complex(-0.0, 0.0), complex(0.0, -0.0), 1 + 2j, -3.5 + 
 
 
 def test_exp_kernel_matches_torch_at_edges():
-    """NaN and inf exactly where torch has them, an exact-zero imaginary part (signed) kept, finite values within 2 ulp
-    (e^a is computed as two halves, one rounding more than torch's e^a cos b)."""
-    got = torch.view_as_real(h(EDGE.tolist()).exp().cpu())
-    ref = torch.view_as_real(EDGE.exp()).clone()
-    # torch 2.6's x86 kernel gives exp(inf + 0j) = inf + nan j; C99, torch's arm64 build and later x86 builds give
-    # inf + 0j, as the kernel does: the reference takes C99's value there and only there
-    x86_inf = ref[:, 1].isnan() & (EDGE.real == INF) & (EDGE.imag == 0)
-    ref[x86_inf, 1] = EDGE.imag[x86_inf]
-    assert torch.equal(got.isnan(), ref.isnan()) and torch.equal(got.isinf(), ref.isinf()), (got, ref)
-    assert torch.equal(got[ref.isinf()], ref[ref.isinf()])
+    """The special values against the C99 Annex G table (signs bit-exact where C99 fixes them), as torch's own exp is
+    not the same on every platform there; finite inputs within 2 ulp of torch (e^a is computed as two halves, one
+    rounding more than torch's e^a cos b), an exactly zero imaginary part kept with its sign."""
+    check_c99_cexp(lambda z: h(z.tolist()).exp().cpu())
+    fin = EDGE[EDGE.real.isfinite() & EDGE.imag.isfinite()]
+    got = torch.view_as_real(h(fin.tolist()).exp().cpu())
+    ref = torch.view_as_real(fin.exp())
+    assert torch.equal(got.isfinite(), ref.isfinite()), (got, ref)
     zero = ref == 0
     assert torch.equal(got[zero].view(torch.int32), ref[zero].view(torch.int32)), (got, ref)
-    fin = ref.isfinite()
-    torch.testing.assert_close(got[fin], ref[fin], rtol=2.5e-7, atol=0)
-
+    torch.testing.assert_close(got, ref, rtol=2.5e-7, atol=0)
 
 def test_neg_kernel_with_conjugate_views():
     z = torch.randn(3, 4, dtype=C64, generator=torch.Generator().manual_seed(1))
