@@ -671,6 +671,12 @@ def _batch(*tensors):
 
 
 def _takes_solve(A, B, left=True, check_errors=False):
+    # Only with grad mode on: the LU and pivots returned here are placeholders, which only torch's own derivative
+    # reads. With grad on, the derivative recorded is this module's (autograd through the real solve); a compiled
+    # graph's forward runs with grad off and its traced backward reads the LU (NaN gradients under
+    # torch.compile(backend="hpu_backend"), measured), so such calls, and torch.no_grad() ones, keep torch's route.
+    if not torch.is_grad_enabled():
+        return False
     if not (isinstance(B, torch.Tensor) and _complex_on_card(A, B) and _square(A)):
         return False
     if _is_vector_rhs(A, B) and not left:

@@ -457,10 +457,14 @@ def test_non_finite_inputs_give_non_finite_outputs(card_linalg):
 def test_inference_mode_and_no_grad(card_linalg):
     A, B = rand(3, 3, seed=1).to(C64), rand(3, 2, seed=2).to(C64)
     ref = torch.linalg.solve(A.to(C128), B.to(C128))
-    with torch.no_grad():
+    with torch.no_grad(), warnings.catch_warnings():  # solve: torch's route (its LU would be read by a traced backward)
+        warnings.simplefilter("ignore")
         calls = taken(card_linalg, "solve")
         X = torch.linalg.solve(A.to(HPU), B.to(HPU))
-        assert taken(card_linalg, "solve") > calls and not X.requires_grad
+        assert taken(card_linalg, "solve") == calls and not X.requires_grad
+        calls = taken(card_linalg, "inv")
+        torch.linalg.inv(A.to(HPU))
+        assert taken(card_linalg, "inv") > calls
     with torch.inference_mode(), warnings.catch_warnings():  # below autograd: torch's route (the CPU fallback)
         warnings.simplefilter("ignore")
         Y = torch.linalg.solve(A.to(HPU), B.to(HPU))

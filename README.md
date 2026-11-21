@@ -251,8 +251,11 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   (table below; `HPU_COMPLEX_LINALG=all` takes every op the module has, `=0` none). Still on the CPU (warned): `svd`,
   `qr`, `eig`, `det`, `slogdet`, `eigh` (the module's `eigh`, n <= 16, is 3-5x slower than the CPU route and off by
   default), `solve_triangular` and `cholesky_solve` (on the card only with `HPU_COMPLEX_LINALG=all`: 0.3-0.96x),
-  sizes past hpu-ops' kernels (n > 32; `pinv`/`lstsq` n > 16), `torch.inference_mode`, and traced graphs
-  (`torch.compile` keeps torch's route). Habana's own CPU fallback computes `linalg.eig`/`eigvals` of a float32
+  sizes past hpu-ops' kernels (n > 32; `pinv`/`lstsq` n > 16), `torch.inference_mode`, `solve` under
+  `torch.no_grad()` (a compiled graph's forward runs with grad off, and its traced backward reads the LU factors, which
+  the card route does not compute: NaN gradients before this rule, measured), and traced calls (`torch.compile`
+  keeps torch's route; compiled `solve`/`inv`/`cholesky`/`matrix_exp` gradients match eager to 1.4e-06,
+  `tests/clinalg_compile_probe.py`). Habana's own CPU fallback computes `linalg.eig`/`eigvals` of a float32
   input (one op per call in the bridge metric).
 - Ops outside the registered set run on the CPU
   (warned), among them the fills of complex `randn`/`rand`
