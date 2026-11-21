@@ -319,6 +319,19 @@ def compiled():
 check("torch.compile(hpu_backend): eigvals(float64) and complex128 ops", compiled)
 
 
+def compiled_real_outputs():
+    # Float64 results of complex128 ops are host memory: their nodes must not enter a Synapse graph (a segfault before
+    # the fix, review round 2b). A real reduction of eigvals, and a complex128 input reduced to a real result.
+    torch._dynamo.reset()
+    f = torch.compile(lambda x: torch.linalg.eigvals(x).abs().sum(-1) * 2, backend="hpu_backend")
+    g = torch.compile(lambda t: (t * t.conj()).real.sum(-1) + t.abs().sum(-1) * 2, backend="hpu_backend")
+    return ((f(X64h), g(Ah)),
+            (torch.linalg.eigvals(X64_held).abs().sum(-1) * 2, (A * A.conj()).real.sum(-1) + A.abs().sum(-1) * 2))
+
+
+check("torch.compile(hpu_backend): real results of complex128", compiled_real_outputs)
+
+
 def timed(fn, n=20):
     outs = [fn() for _ in range(3)]
     sync()

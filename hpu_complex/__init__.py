@@ -12,6 +12,7 @@ hpu_complex.rfft/irfft/fft/stft (the _core module) are a separate,
 device-agnostic float API on [..., 2] pairs.
 """
 import importlib.util
+import math
 import warnings
 
 from . import _core as core
@@ -20,17 +21,82 @@ from ._core import fft, irfft, magnitude, rfft, stft, stft_magnitude
 _MODE_ENTERED = False
 
 
-def _touches_complex(node):
-    """An FX node with a complex output or a complex input."""
+def _node_dtypes(n):
     import torch
     from torch.utils._pytree import tree_leaves
 
-    def complex_dtypes(n):
-        dtypes = list(n.meta.get("output_dtypes") or ())
-        dtypes += [v.dtype for v in tree_leaves(n.meta.get("val")) if isinstance(v, torch.Tensor)]
-        return any(isinstance(d, torch.dtype) and d.is_complex for d in dtypes)
+    dtypes = list(n.meta.get("output_dtypes") or ())
+    dtypes += [v.dtype for v in tree_leaves(n.meta.get("val")) if isinstance(v, torch.Tensor)]
+    return [d for d in dtypes if isinstance(d, torch.dtype)]
 
-    return complex_dtypes(node) or any(complex_dtypes(n) for n in node.all_input_nodes)
+
+def _float64_may_be_host_backed(graph):
+    """Whether float64 values of this graph may live in host memory: it has a complex128 value, or the process has
+    allocated a complex128 HPU tensor already (a float64 graph input may then be a view or a result of one)."""
+    import torch
+
+    cached = getattr(graph, "_hpu_complex_f64_host", None)
+    if cached is None:
+        cached = (torch.ops.hpu_complex.host_in_use()
+                  or any(torch.complex128 in _node_dtypes(n) for n in graph.nodes))
+        graph._hpu_complex_f64_host = cached
+    return cached
+
+
+def _touches_complex(node):
+    """An FX node with a complex output or a complex input, or a float64 one when float64 may be host-backed.
+
+    Host-backed tensors (complex128 and its float64 views and results) are host memory reporting the HPU device: a
+    Synapse graph would read that pointer as device memory (a segfault). Their nodes run eagerly instead.
+    """
+    import torch
+
+    def touched(n):
+        dtypes = _node_dtypes(n)
+        return (any(d.is_complex for d in dtypes)
+                or (torch.float64 in dtypes and _float64_may_be_host_backed(node.graph)))
+
+    return touched(node) or any(touched(n) for n in node.all_input_nodes)
+
+
+def _holds_host_values(gm):
+    """A Dynamo graph whose values may be host-backed: a complex128 value, or float64 once complex128 was allocated."""
+    import torch
+
+    host_in_use = torch.ops.hpu_complex.host_in_use()
+    for node in gm.graph.nodes:
+        dtypes = {getattr(v, "dtype", None) for v in (node.meta.get("example_value"), node.meta.get("val"))}
+        if torch.complex128 in dtypes or (host_in_use and torch.float64 in dtypes):
+            return True
+    return False
+
+
+def _complex128_graphs_run_eagerly():
+    """torch.compile(backend="hpu_backend") of a graph holding complex128 values: the graph runs eagerly, whole.
+
+    Its complex128 ops compute on the CPU either way. Measured (fix round 2, Gaudi2, bridge 1.21.4): with every node
+    of such a graph placed eagerly, hpu_backend still returned a wrong gradient through eig (max error 1.6; aot_eager
+    with the same nodes was exact), and before that fix float64 nodes in Synapse graphs read host memory (a segfault).
+    """
+    import functools
+
+    from torch._dynamo.backends import registry
+
+    try:
+        original = registry.lookup_backend("hpu_backend")
+    except Exception:  # noqa: BLE001 (InvalidBackend: Habana's backend is not registered)
+        return
+    if getattr(original, "hpu_complex", False):
+        return
+
+    @functools.wraps(original)
+    def hpu_backend(gm, example_inputs, **kwargs):
+        if _holds_host_values(gm):
+            return gm.forward
+        return original(gm, example_inputs, **kwargs)
+
+    hpu_backend.hpu_complex = True
+    registry._COMPILER_FNS["hpu_backend"] = hpu_backend
 
 
 def _complex_nodes_run_eagerly():
@@ -74,6 +140,8 @@ def _complex_nodes_run_eagerly():
 
         passes.pass_mark_placement = pass_mark_placement
 
+    _complex128_graphs_run_eagerly()
+
     try:  # private, and absent before 1.20: its absence must not cost the patches above
         from habana_frameworks.torch.dynamo.compile_backend._passes import batch_as_strided
     except ImportError:
@@ -107,12 +175,38 @@ def _pickle_complex128_through_the_cpu():
 
     def _reduce_ex_internal(self, proto):
         if _host_backed(self):
-            return (torch._utils._rebuild_device_tensor_from_cpu_tensor,
-                    (self.detach().cpu(), self.dtype, str(self.device), self.requires_grad))
+            # Its bytes as a latin-1 str, not a CPU tensor: torch.load(map_location="hpu") would restore a tensor's
+            # storage on the card, at float32 precision for float64; and weights_only=True accepts a str, not bytes.
+            values = self.detach().cpu().resolve_conj().resolve_neg().contiguous()
+            return (_rebuild_host_backed_from_cpu,
+                    (values.numpy().tobytes().decode("latin-1"), self.dtype, str(self.device), self.requires_grad, tuple(values.shape)))
         return original(self, proto)
 
     _reduce_ex_internal.hpu_complex = True
     torch.Tensor._reduce_ex_internal = _reduce_ex_internal
+    torch.serialization.add_safe_globals([_rebuild_host_backed_from_cpu])  # torch.load's default weights_only=True
+
+
+def _rebuild_host_backed_from_cpu(data, dtype, device, requires_grad, size=None):
+    """torch.load of a tensor _pickle_complex128_through_the_cpu saved: back into host memory on the HPU (exact).
+
+    torch's own _rebuild_device_tensor_from_cpu_tensor would rebuild a float64 view or result of a complex128 tensor
+    with .to(device): an ordinary Habana float64 tensor, at float32 precision. map_location is honored; anywhere but the
+    HPU it is that .to(device).
+    """
+    import torch
+
+    if isinstance(data, str):
+        n = math.prod(size)
+        data = (torch.frombuffer(bytearray(data.encode("latin-1")), dtype=dtype, count=n) if n else torch.empty(0, dtype=dtype)).reshape(size)
+    device = torch.device(torch._utils._get_restore_location(device))
+    if device.type == "hpu" and dtype in (torch.float64, torch.complex128) and hasattr(torch.ops.hpu_complex,
+                                                                                     "host_from_cpu"):
+        tensor = torch.ops.hpu_complex.host_from_cpu(data.to(dtype), device)
+    else:
+        tensor = data.to(dtype=dtype, device=device)
+    tensor.requires_grad = requires_grad
+    return tensor
 
 
 def _deepcopy_complex128_in_host_memory():

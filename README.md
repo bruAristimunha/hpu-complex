@@ -135,7 +135,13 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   float32 precision; the raw storage of a complex128 HPU tensor is host memory, so `untyped_storage()`-level
   copies (`z.untyped_storage().cpu()`) are not supported (`torch.save` and `copy.deepcopy` are); and `torch.save`
   writes each complex128 HPU tensor as its own copy of its values, so tensors saved together that were views of one
-  another (`{"z": z, "re": z.real}`) load as independent tensors (`copy.deepcopy` keeps them linked, as torch does).
+  another (`{"z": z, "re": z.real}`) load as independent tensors (`copy.deepcopy` keeps them linked, as torch does);
+  float64 results of complex128 ops load back into host memory, exact. An `out=` that partly overlaps an input in a
+  layout torch's alias check cannot settle (`torch.add(z[:, :-1], 1, out=z[:, 1:])`, no error on the CPU either) is
+  computed from the inputs before the write, so its values can differ from the CPU's in-place order. Under
+  `torch.compile(backend="hpu_backend")`, a graph that holds a complex128 value (or, once the process has allocated
+  one, a float64 value) runs eagerly as a whole: its complex128 ops compute on the CPU either way, Synapse graphs
+  cannot read host memory, and Habana's graph passes gave a wrong gradient through `eig` even with every node eager.
 
 - The dispatch mode is opt-in and scoped
   (`with hpu_complex.complex_mode():`), not global: `enable()` never
