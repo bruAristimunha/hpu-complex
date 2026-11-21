@@ -688,6 +688,28 @@ def _compiled_matmul_err():
 
 
 check("compiled (t @ t.mH).abs() fwd+bwd (rel)", _compiled_matmul_err, 1e-5)
+
+
+# Compiled linalg backward (hpu_backend): eigenvector strides traced by the fake tensors (contiguous) differ from the
+# real ones (column-major), and the qr backward reads a strided float view of complex storage in a fused graph; both
+# gave wrong gradients with no error before hpu_complex patched the two passes.
+def _compiled_grad_err(f, x):
+    torch._dynamo.reset()
+    return grad_err(torch.compile(f, backend="hpu_backend"), x, relative=True, reference=f)
+
+
+_eig_real = torch.randn(3, 5, 5, generator=torch.Generator().manual_seed(8))
+_eig_cplx = cplx(3, 5, 5)
+for label, f, x in (
+    ("eigvals(real).abs()", lambda t: torch.linalg.eigvals(t).abs(), _eig_real),
+    ("eigvals(complex).abs()", lambda t: torch.linalg.eigvals(t).abs(), _eig_cplx),
+    ("eig(real) w.abs()", lambda t: torch.linalg.eig(t)[0].abs(), _eig_real),
+    ("eigvals(complex) (w * w.conj()).real", lambda t: (lambda w: (w * w.conj()).real)(torch.linalg.eigvals(t)),
+     _eig_cplx),
+    ("qr(complex) Q.abs()", lambda t: torch.linalg.qr(t)[0].abs(), _eig_cplx),
+    ("qr(complex) R.abs()", lambda t: torch.linalg.qr(t)[1].abs(), _eig_cplx),
+):
+    check(f"compiled {label} fwd+bwd (rel)", lambda f=f, x=x: _compiled_grad_err(f, x), 1e-4)
 _Big = _mc(64, 22, 300)
 check("complex X Xᴴ above the threshold (card route, 64x22x300x22) (rel)",
       lambda: err(_Big.to(hpu) @ _Big.to(hpu).mH, _Big @ _Big.mH) / (_Big @ _Big.mH).abs().max().item(), 1e-5)

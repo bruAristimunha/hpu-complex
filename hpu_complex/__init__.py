@@ -52,8 +52,17 @@ def _complex_nodes_run_eagerly():
     if getattr(original, "hpu_complex", False):
         return
 
+    import torch
+
+    aten = torch.ops.aten
+    float_views = {aten.view_as_real.default, aten.view.dtype, aten.real.default, aten.imag.default}
+
     def is_eager_fallback_required(node, is_dynamic=False):
-        return _touches_complex(node) or original(node, is_dynamic=is_dynamic)
+        # A node that reads a float view of complex storage runs eagerly too: the view can be strided (view_as_real
+        # of a diagonal in the qr backward), and a fused graph misreads it (compiled qr gradient 0.3-0.7 off with
+        # no error, Gaudi2, bridge 1.21.4). Fresh float results of complex nodes (abs, angle) stay fusable.
+        return (_touches_complex(node) or any(n.target in float_views for n in node.all_input_nodes)
+                or original(node, is_dynamic=is_dynamic))
 
     is_eager_fallback_required.hpu_complex = True
     passes.is_eager_fallback_required = is_eager_fallback_required
@@ -74,6 +83,20 @@ def _complex_nodes_run_eagerly():
             return changed
 
         passes.pass_mark_placement = pass_mark_placement
+
+    # pass_fuse_view_chains replaces a chain of views by one as_strided with the strides traced by the fake
+    # tensors. For complex linalg outputs those differ from the real ones (torch's meta of linalg_eig gives
+    # contiguous eigenvectors, the CPU kernel column-major ones), so the baked as_strided reads the matrix
+    # transposed: compiled eig/eigvals gradients were wrong with no error. Complex views are left as they are.
+    fuse_view_chains = getattr(passes, "pass_fuse_view_chains", None)
+    if fuse_view_chains is not None:
+        def pass_fuse_view_chains(ctx):
+            for node in ctx.graph_module.graph.nodes:
+                if node.op == "call_function" and _touches_complex(node):
+                    node.meta["visited"] = True  # the pass starts no chain at a visited node
+            return fuse_view_chains(ctx)
+
+        passes.pass_fuse_view_chains = pass_fuse_view_chains
 
     try:  # private, and absent before 1.20: its absence must not cost the patches above
         from habana_frameworks.torch.dynamo.compile_backend._passes import batch_as_strided
