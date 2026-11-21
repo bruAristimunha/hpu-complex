@@ -62,15 +62,22 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   reduced mod n in integers, so float32 bases stay accurate at any n.
   Under autocast, the GEMMs and the complex arithmetic stay float32, as
   complex64 does on other backends.
-- `torch.compile(backend="hpu_backend")`: complex nodes run eagerly on
-  these kernels, the float nodes around them stay in Synapse graphs.
+- `torch.compile(backend="hpu_backend")`: complex nodes, and nodes that
+  read a float view of complex storage (`view_as_real`, `.real`, `.imag`,
+  `view(dtype)`; a fused graph misreads a strided one), run eagerly on these
+  kernels; the other float nodes, fresh results such as `abs()` included,
+  stay in Synapse graphs. Habana's view-chain fusion skips complex
+  views: it bakes the strides traced by the fake tensors into one
+  `as_strided`, and torch's meta of `linalg_eig` gives contiguous
+  eigenvectors where the kernel returns column-major ones. Without these two
+  patches the compiled `eig`/`eigvals`/`qr` gradients were wrong with no error.
 - Optional: a fused TPC kernel (`hpu_complex.tpc.enable_tpc_fft()`,
   needs the kernel lib from `hpu_complex/tpc_kernel/build.sh` on
   `GC_KERNEL_PATH`). Correct, currently slower than the GEMM path.
 
 ## Verified on Gaudi2 (habana 1.21.4 / torch 2.6.0)
 
-`hpu_complex/tests/pu1_check.py` passes 161/161 checks against torch on the CPU. Errors are max abs unless noted:
+`hpu_complex/tests/pu1_check.py` passes 178/178 checks against torch on the CPU. Errors are max abs unless noted:
 
 | case | error |
 |---|---|
@@ -85,7 +92,10 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
 | compiled `rfft().abs()` with gradients, static and `dynamic=True` (3 batch shapes, one graph); compiled `stft().abs()` | ≤ 2.2e-05 |
 | compiled `rfft(dim=0)` raises the eager kernel's error | raises |
 | complex `mm`/`bmm`/`@` on both routes (card GEMM, CPU below the threshold): conjugate, strided, broadcast, n = 1, empty operands; `X Xᴴ` with gradients, compiled, and one above the threshold (64×22×300×22, relative); a float32 operand, or a float32 `out=` for `mm`/`bmm`, raises as on the CPU | ≤ 1.0e-06 |
-| inf / NaN through the card GEMM: the same entries non-finite as on the CPU (overflowing sums: ±inf on the card where the CPU gives NaN) | finite ≤ 8.3e-07 rel |
+| inf / NaN through the card GEMM: the same entries non-finite as on the CPU (overflowing sums: ±inf on the card where the CPU gives NaN; subnormal products flush to zero on the card, e.g. `1e-20 * 1e-20` is 0, where the CPU keeps 1e-40: Habana's float32 GEMM, not fixable here) | finite ≤ 8.3e-07 rel |
+| `mm`/`bmm` of an HPU and a CPU complex operand raise "Expected all tensors to be on the same device", both routes | raises |
+| rank-6 real HPU operands with permuted strides that are a Habana op's result (`x.permute(...) * 1`, `> 0`) in complex `*`, `+`, `/`, `where`, `copy_`, `torch.complex`, `.to(complex64)` (Habana's own `contiguous()` misreads them, also without hpu_complex) | exact (`/` 1.2e-07) |
+| compiled (`hpu_backend`) `eigvals`/`eig` of real and complex input and complex `qr`, forward + backward (relative) | ≤ 1e-04 |
 | complex64 `linalg.eigh`, `svd`, `qr`, `eig`, `matrix_exp`, `householder_product` forward + backward (relative), products on either route | ≤ 1.0e-06 |
 | float32 `linalg.eig`/`eigvals` (complex output) forward + backward, incl. `.mT` and sliced inputs (relative) | ≤ 2.8e-06 |
 | spd_learn `Green` train step (22 channels, batch 32): gradients vs a CPU float64 run, next to the CPU's own float32 error (the card is about 7x float32's error, worst `spd_layers.0.shrinkage_logit`) | 1.1e-03 / 1.5e-04 |
@@ -152,6 +162,12 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   not run through `rfft`/`stft`: their backward is a C++ autograd
   Function. Writes through the imaginary part of a conjugate view
   (`z.conj().imag[...] = v`) do not reach `z`.
+- Copies between a plain CPU tensor and a plain HPU tensor never reach
+  these kernels (neither carries the complex key), so Habana's `copy_`
+  decides: `complex_cpu.copy_(real_hpu)` raises "Unsupported pytorch type
+  ComplexFloat", and `real_hpu.copy_(complex_cpu)` raises "Could not run
+  'aten::_copy_from' ... CPU backend" where torch keeps the real part. Use
+  `real_hpu.to(torch.complex64).cpu()` and `real_hpu.copy_(complex_cpu.real)`.
 - `torch.compile` with dynamic shapes (`dynamic=True`, or automatic
   dynamic after a shape change): torch 2.6's fake tensors reject symbolic
   shapes for `aten._fft_r2c`/`_fft_c2r` (their meta strides are wrong), so
@@ -173,7 +189,8 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
 
 ```bash
 python -m pytest hpu_complex/tests/ -q            # CPU (the HPU tests skip without habana_frameworks)
-# The CPU suite checks the complex GEMM's formula and block layout in pure torch (test_cmatmul_formula_cpu.py).
+# The CPU suite checks the complex GEMM's formula and block layout in pure torch (test_cmatmul_formula_cpu.py),
+# and the hpu_backend pass patches on stub passes plus the rank-6 permute-block rule (test_compile_patches_cpu.py).
 # The C++ kernels themselves (mm/bmm and its CPU threshold, copy_pu1 staging, complex_view, the lazy guard)
 # need a Gaudi to run: they are covered only by pu1_check.py, run_on_hpu.py and lazy_check.py below.
 python hpu_complex/tests/pu1_check.py            # Gaudi: eager + compiled vs CPU
