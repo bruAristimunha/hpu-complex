@@ -68,6 +68,30 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   non-finite inputs and computes e^a in two halves, so `exp(88.75 + i pi/4) = 2.47e38 (1 + i)` fits (torch's
   complex64 kernel: inf + inf i; within 2 ulp of torch elsewhere). Complex division is Smith's algorithm, as
   torch's (`1 / 1e20j` is `-1e-20j`, not 0). complex64 with a float64 HPU tensor is complex128, in host memory.
+- complex64 linalg from real ops (`hpu_complex/linalg.py`, at `AutogradPrivateUse1`). The block embedding
+  `E(A) = [[Ar, -Ai], [Ai, Ar]]` keeps products, inverses, adjoints, `exp` and `pinv` (`E(A^-1) = E(A)^-1`, ...), and
+  `|x| = |[xr; xi]|`, so `solve`, `inv`, `pinv`, `lstsq` and `matrix_exp` are the real op on `E(A)` (hpu-ops' TPC
+  Gauss-Jordan, SVD and Pade kernels; `matrix_exp` past n = 16 is a degree-12 Taylor composite with scaling and
+  squaring). With rows and columns interleaved (re, im per index), `E(L)` of a triangle with a real diagonal is
+  triangular, and the real Cholesky factor of `E(H)` is `E(L)` (unique), so `cholesky` is one real Cholesky
+  (Habana's). `householder_product` is the compact WY form `I - V T V^H`, `T = (I + diag(tau) striu(V^H V))^-1
+  diag(tau)` (no division: `tau = 0` needs no special case). Gradients: autograd through the real ops, or torch's
+  formulas (`cholesky`, `cholesky_solve`); `info` is nonzero exactly when torch's is, its index may differ.
+  Batch 32, Gaudi2, bridge 1.21.4, median of 3 alternating rounds of 20 synced calls, speed-up over the CPU route
+  (forward / forward + backward; `tests/clinalg_card_check.py`), errors within 10x of CPU complex64's:
+
+  | op (n = 16 / 22 / 32) | eager | lazy |
+  |---|---|---|
+  | `solve` (`left=False`: lazy only, eager 0.8-1.0x with backward) | 1.5-1.8x / 1.05-1.6x | 1.3-1.5x / 1.2-1.5x |
+  | `inv` | 1.3-1.8x / 0.98-1.2x | 1.2-1.4x / 1.3-1.6x |
+  | `cholesky` | 1.1-1.3x / 1.2-1.3x | 1.1-1.5x / 1.7-2.1x |
+  | `pinv` (n = 16) | 4.0x / 1.4x | 2.4x / 3.6x |
+  | `matrix_exp` | 1.0x / 1.3x (n = 16; composite 0.2-0.4x, off) | 1.0-2.1x / 1.7-4.0x |
+  | `householder_product` (with grad only) | 0.2-0.3x / 10-19x | 0.35-0.54x / 13-28x |
+  | `lstsq` (with grad only, n = 16) | 0.9x / 2.0x | 0.7x / 3.0x |
+
+  Habana's float32 `cholesky` returns NaN with `info = 0` when the dim before the matrix equals its order (a batch
+  of 32 matrices of order 32): `repro/habana_cholesky_nan.py`; the module views such a batch as `(b, 1, n, n)`.
 - Complex `mm`/`bmm` (so `@`, `matmul`, `einsum` products) are one real GEMM on the card:
   `[ar | ai] @ [[br, bi], [-bi, br]] = [cr | ci]`, conjugate operands included (they reach `mm`/`bmm`
   unresolved). Products below 2²² multiply-adds (batch·m·k·n) go to the CPU instead, one copy each way, where
@@ -232,10 +256,18 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   rounds differently from the CPU (`x.bfloat16().float()` is 1.9e-3 off, without any complex op). Without
   hpu_complex, a real HPU tensor times a Python complex scalar still aborts the process in lazy mode, inside
   Habana's float `mul`/`add` (`repro/lazy_complex_scalar.py`, the `no-ext` rows).
-- The complex linear-algebra kernels themselves run on the CPU (warned): `eigh`, `svd`, `qr`, `eig`,
-  `matrix_exp`, `householder_product`, `solve`, `solve_triangular`, `triu`/`tril`; Habana's own CPU fallback
-  computes `linalg.eig`/`eigvals` of a float32 input (one op per call in the bridge metric). Their gradients
-  match the CPU (above), the rest of the backward stays on the card.
+- complex64 linear algebra on the card (`hpu_complex/linalg.py`, needs `hpu_ops.enable()` for its TPC kernels):
+  `solve`, `inv`, `cholesky`, `pinv`, `matrix_exp` (and `householder_product`, `lstsq` when a gradient is
+  computed) run as the real problem on float pairs, eager and lazy, where measured not slower than the CPU route
+  (table below; `HPU_COMPLEX_LINALG=all` takes every op the module has, `=0` none). Still on the CPU (warned): `svd`,
+  `qr`, `eig`, `det`, `slogdet`, `eigh` (the module's `eigh`, n <= 16, is 3-5x slower than the CPU route and off by
+  default), `solve_triangular` and `cholesky_solve` (on the card only with `HPU_COMPLEX_LINALG=all`: 0.3-0.96x),
+  sizes past hpu-ops' kernels (n > 32; `pinv`/`lstsq` n > 16), `torch.inference_mode`, `solve` under
+  `torch.no_grad()` (a compiled graph's forward runs with grad off, and its traced backward reads the LU factors, which
+  the card route does not compute: NaN gradients before this rule, measured), and traced calls (`torch.compile`
+  keeps torch's route; compiled `solve`/`inv`/`cholesky`/`matrix_exp` gradients match eager to 1.4e-06,
+  `tests/clinalg_compile_probe.py`). Habana's own CPU fallback computes `linalg.eig`/`eigvals` of a float32
+  input (one op per call in the bridge metric).
 - Ops outside the registered set run on the CPU
   (warned), among them the fills of complex `randn`/`rand`
   (`normal_`/`uniform_`). `torch.func` transforms and forward-mode AD do
