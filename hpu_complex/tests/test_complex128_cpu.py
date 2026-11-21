@@ -235,3 +235,40 @@ def test_inplace_restride_keeps_storage(op):
     ref.mul_(2)
     assert_hpu_exact(r, rr)  # the old .real view sees the write
     assert_hpu_exact(z, ref)
+
+
+def test_mm_bmm_take_the_float64_host_path():
+    # main's complex mm/bmm kernels (one real float32 GEMM on the card) must not grab complex128: threshold 0 sends
+    # every complex64 product to that GEMM, so only the host branch keeps complex128 off it.
+    torch.ops.hpu_complex.set_matmul_cpu_threshold(0)
+    try:
+        _check_mm_bmm_host()
+    finally:
+        torch.ops.hpu_complex.set_matmul_cpu_threshold(1 << 22)
+
+
+def _check_mm_bmm_host():
+    a, b = c128(5, 3, seed=1), c128(3, 4, seed=2)
+    assert_hpu_exact(torch.mm(a.to(HPU), b.to(HPU)), torch.mm(a, b))
+    assert_hpu_exact(a.to(HPU).conj() @ b.to(HPU), a.conj() @ b)
+    A, B = c128(2, 5, 3, seed=3), c128(2, 3, 4, seed=4)
+    assert_hpu_exact(torch.bmm(A.to(HPU), B.to(HPU)), torch.bmm(A, B))
+    out = torch.empty(5, 4, dtype=torch.complex128, device=HPU)
+    torch.mm(a.to(HPU), b.to(HPU), out=out)
+    assert_hpu_exact(out, torch.mm(a, b))
+    with pytest.raises(RuntimeError, match="same dtype"):  # complex128 @ a host float64 (.real), as torch raises
+        torch.mm(a.to(HPU), b.to(HPU).real.contiguous())
+
+
+def test_lazy_guard_allows_complex128():
+    torch.ops.hpu_complex.set_lazy_mode(True)
+    try:
+        x = c128(3, 4)
+        z = x.to(HPU)
+        assert_hpu_exact(z * z, x * x)
+        assert_hpu_exact(torch.zeros(2, dtype=torch.complex128, device=HPU), torch.zeros(2, dtype=torch.complex128))
+        assert_hpu_exact(torch.view_as_complex(torch.view_as_real(z)), x)
+        with pytest.raises(RuntimeError, match="lazy mode"):
+            torch.zeros(2, dtype=torch.complex64, device=HPU)
+    finally:
+        torch.ops.hpu_complex.set_lazy_mode(False)

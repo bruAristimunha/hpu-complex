@@ -236,6 +236,23 @@ check("float32 eigvals still complex64", lambda: (torch.linalg.eigvals(X32h), to
       atol=1e-3, c64=True)
 
 
+def mm_bmm_with_card_gemm_threshold_0():
+    # origin/main runs complex64 mm/bmm as one float32 GEMM on the card (all sizes at threshold 0); complex128 must
+    # stay on its float64 host path. Large enough (64x96x80) that float32 would miss atol 1e-12 by far.
+    big_a, big_b = c128(2, 64, 96), c128(2, 96, 80)
+    out = torch.empty(64, 80, dtype=torch.complex128, device=hpu)
+    torch.ops.hpu_complex.set_matmul_cpu_threshold(0)
+    try:
+        ah, bh = big_a.to(hpu), big_b.to(hpu)
+        got = (torch.bmm(ah, bh), torch.mm(ah[0], bh[0], out=out), ah[1].conj() @ bh[1], ah @ bh)
+    finally:
+        torch.ops.hpu_complex.set_matmul_cpu_threshold(1 << 22)
+    return got, (torch.bmm(big_a, big_b), torch.mm(big_a[0], big_b[0]), big_a[1].conj() @ big_b[1], big_a @ big_b)
+
+
+check("mm / bmm / mm.out / conj @ at card-GEMM threshold 0", mm_bmm_with_card_gemm_threshold_0)
+
+
 # adversarial edges: odd shapes, strided/offset views, extreme values, repeated calls, serialization, compile
 check("n=1, batch 1: eig / inv / matmul", lambda: (
     (torch.linalg.eigvals(Ah[:1, :1, :1]), torch.linalg.inv(Ah[:1, :1, :1]), Ah[:1, :1, :1] @ Ah[:1, :1, :1]),
