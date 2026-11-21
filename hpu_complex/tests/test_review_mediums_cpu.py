@@ -154,7 +154,11 @@ def test_exp_kernel_matches_torch_at_edges():
     """NaN and inf exactly where torch has them, an exact-zero imaginary part (signed) kept, finite values within 2 ulp
     (e^a is computed as two halves, one rounding more than torch's e^a cos b)."""
     got = torch.view_as_real(h(EDGE.tolist()).exp().cpu())
-    ref = torch.view_as_real(EDGE.exp())
+    ref = torch.view_as_real(EDGE.exp()).clone()
+    # torch 2.6's x86 kernel gives exp(inf + 0j) = inf + nan j; C99, torch's arm64 build and later x86 builds give
+    # inf + 0j, as the kernel does: the reference takes C99's value there and only there
+    x86_inf = ref[:, 1].isnan() & (EDGE.real == INF) & (EDGE.imag == 0)
+    ref[x86_inf, 1] = EDGE.imag[x86_inf]
     assert torch.equal(got.isnan(), ref.isnan()) and torch.equal(got.isinf(), ref.isinf()), (got, ref)
     assert torch.equal(got[ref.isinf()], ref[ref.isinf()])
     zero = ref == 0
