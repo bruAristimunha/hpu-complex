@@ -267,11 +267,13 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   hpu_complex, a real HPU tensor times a Python complex scalar still aborts the process in lazy mode, inside
   Habana's float `mul`/`add` (`repro/lazy_complex_scalar.py`, the `no-ext` rows).
 - complex64 linear algebra on the card (`hpu_complex/linalg.py`, needs `hpu_ops.enable()` for its TPC kernels):
-  `solve`, `inv`, `cholesky`, `pinv`, `matrix_exp` (and `householder_product`, `lstsq` when a gradient is
-  computed) run as the real problem on float pairs, eager and lazy, where measured not slower than the CPU route
-  (table below; `HPU_COMPLEX_LINALG=all` takes every op the module has, `=0` none). Still on the CPU (warned): `svd`,
-  `qr`, `eig`, `det`, `slogdet`, `eigh` (the module's `eigh`, n <= 16, is 3-5x slower than the CPU route and off by
-  default), `solve_triangular` and `cholesky_solve` (on the card only with `HPU_COMPLEX_LINALG=all`: 0.3-0.96x),
+  `solve`, `inv`, `cholesky`, `cholesky_solve`, `cholesky_inverse`, `pinv`, `matrix_exp` (and `householder_product`,
+  `lstsq` when a gradient is computed; `solve_triangular` and `eigvalsh` in lazy mode when a gradient is computed) run
+  as the real problem on float pairs, eager and lazy, where measured not slower than the CPU route (table below;
+  `HPU_COMPLEX_LINALG=all` takes every op the module has, `=0` none); `hpu_complex.linalg.hpd_slogdet` / `hpd_logdet`
+  for HPD input (1.5-4.8x). Still on the CPU (warned): `svd`, `eig`, `det`, `slogdet`, `qr` (the module's, through
+  Habana's real qr, is 0.45-0.85x eager and 0.1-4 s per call lazy: off by default), `eigh` (the module's `eigh`,
+  n <= 16, is 3-5x slower than the CPU route and off by default), `solve_triangular` forward alone (0.4-0.8x),
   sizes past hpu-ops' kernels (n > 32; `pinv`/`lstsq` n > 16), `torch.inference_mode`, `solve` under
   `torch.no_grad()` (a compiled graph's forward runs with grad off, and its traced backward reads the LU factors, which
   the card route does not compute: NaN gradients before this rule, measured), and traced calls (`torch.compile`
