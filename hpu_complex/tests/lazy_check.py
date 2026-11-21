@@ -186,6 +186,61 @@ def check_green_ops():
     assert not failed, failed
 
 
+def check_lazy_aliasing():
+    """A lazy complex tensor keeps its own alias of the Habana tensor; resize keeps the storage; overlap is checked."""
+    import io
+    hpu = torch.device("hpu")
+    # 1. the caller's tensor can be retargeted without retargeting z, and z keeps aliasing the storage
+    r = torch.randn(4, 2, device=hpu)
+    z = torch.view_as_complex(r)
+    ref = z.cpu().clone()
+    r.data = torch.zeros(4, 2, device=hpu)
+    htcore.mark_step()
+    assert torch.equal(z.cpu(), ref), "r.data = ... retargeted z"
+    r2 = torch.randn(4, 2, device=hpu)
+    z2 = torch.view_as_complex(r2)
+    ref2 = z2.cpu().clone()
+    r2.resize_(16)
+    htcore.mark_step()
+    assert torch.equal(z2.cpu(), ref2), "r.resize_ retargeted z"
+    # 2. writes reach the other side through Habana's views
+    r3 = torch.zeros(4, 2, device=hpu)
+    z3 = torch.view_as_complex(r3)
+    z3.add_(1j)
+    r3.add_(1)
+    htcore.mark_step()
+    assert torch.equal(z3.cpu(), torch.full((4,), 1 + 2j)) and torch.equal(r3.cpu()[:, 1], torch.full((4,), 2.0))
+    # 3. an out= resize keeps the StorageImpl: a view taken before sees the result, as in eager mode
+    out = torch.zeros(2, dtype=torch.complex64, device=hpu)
+    alias = out.view(-1)
+    torch.mul(torch.ones(6, device=hpu), 2j, out=out)
+    htcore.mark_step()
+    assert out.shape == (6,) and out.untyped_storage is not None
+    assert alias.data_ptr() == out.data_ptr(), "out= resize detached a view"
+    # 4. two view_as_complex of one tensor: torch's partial-overlap check still fires
+    r4 = torch.randn(5, 2, device=hpu)
+    a, b = torch.view_as_complex(r4), torch.view_as_complex(r4)
+    try:
+        a[1:].copy_(b[:-1])
+    except RuntimeError as exc:
+        assert "single memory location" in str(exc), str(exc)
+    else:
+        raise AssertionError("partial overlap of two view_as_complex views did not raise")
+    # 5. torch.save works; untyped_storage().cpu() raises (Habana: not in lazy flow), no crash
+    zs = torch.fft.rfft(torch.randn(8, device=hpu))
+    buf = io.BytesIO()
+    torch.save(zs, buf)
+    buf.seek(0)
+    assert _err(torch.load(buf), zs.cpu()) == 0
+    try:
+        zs.untyped_storage().cpu()
+    except RuntimeError as exc:
+        print(f"lazy_check untyped_storage().cpu() raises: {str(exc).splitlines()[0][:100]}")
+    else:
+        raise AssertionError("untyped_storage().cpu() of a lazy complex tensor did not raise")
+    print("lazy_check aliasing (r.data=, resize_, writes both ways, out= resize, overlap, save): OK")
+
+
 def check_lazy_storages_drain():
     """Each lazy complex64 storage holds its Habana tensor; they are released with the complex tensors."""
     x = torch.randn(4, 64, device="hpu")
@@ -212,6 +267,7 @@ def main():
     check_lazy_complex64_runs()
     check_lazy_complex_guards()
     check_green_ops()
+    check_lazy_aliasing()
     check_lazy_storages_drain()
     print("LAZY_CHECK_ALL_OK")
 

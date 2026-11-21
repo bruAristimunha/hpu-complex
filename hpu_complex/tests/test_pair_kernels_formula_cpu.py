@@ -35,7 +35,9 @@ def exp_pairs(z):
     p = pair(z)
     a, b = p[..., 0], p[..., 1]
     ea = a.exp()
-    return as_complex(torch.stack([ea * b.cos(), torch.where(b == 0, b, ea * b.sin())], -1))
+    re, im = ea * b.cos(), torch.where(b != 0, ea * b.sin(), b)
+    special = a.isinf() & ~b.isfinite()
+    return as_complex(torch.stack([torch.where(special, ea, re), torch.where(special, ea - ea, im)], -1))
 
 
 def neg_pairs(z):
@@ -46,7 +48,7 @@ def masked_fill_pairs(z, mask, value):
     m = mask.expand(z.shape)
     c = complex(value)
     p = pair(z)
-    if c == 0:
+    if c == 0 and not math.copysign(1, c.real) < 0 and not math.copysign(1, c.imag) < 0:
         filled = p.masked_fill(m.unsqueeze(-1), 0.0)
     else:
         filled = torch.stack([p[..., 0].masked_fill(m, c.real), p[..., 1].masked_fill(m, c.imag)], -1)
@@ -68,7 +70,25 @@ def vector_norm_pairs(z, ord=2, dim=None, keepdim=False):
             dims = []
         out = torch.linalg.vector_norm(p, 2, dims + [p.dim() - 1], keepdim=True).squeeze(-1)
         return out if keepdim or not dims else out.squeeze(dims)
-    return torch.linalg.vector_norm(torch.linalg.vector_norm(p, 2, -1), ord, dim, keepdim)
+    return torch.linalg.vector_norm(modulus_pairs(p), ord, dim, keepdim)
+
+
+def modulus_pairs(p):
+    """modulus(): hypot scaled by max(|re|, |im|), inf if either part is infinite."""
+    mag = p.abs()
+    m = mag.max(-1, keepdim=True).values
+    r = m * torch.linalg.vector_norm(p / torch.where(m > 0, m, torch.ones_like(m)), 2, -1, keepdim=True)
+    return torch.where((mag == INF).any(-1, keepdim=True), INF, r).squeeze(-1)
+
+
+def test_modulus_is_torch_abs_at_extremes():
+    """Unscaled sqrt(re^2 + im^2) in float gives inf for 3e19 + 3e19j and 0 for 1e-30 (the card's vector_norm did)."""
+    got, ref = modulus_pairs(pair(EDGE)), EDGE.abs()
+    assert torch.equal(got.isnan(), ref.isnan())
+    same(got, ref, rtol=1e-6)
+    t = torch.tensor([1e-30, 3e19 + 3e19j, 1e-25j], dtype=torch.complex64)
+    for ord in (0, 1, INF, -INF, 0.5):
+        same(vector_norm_pairs(t, ord), torch.linalg.vector_norm(t, ord), rtol=1e-6)
 
 
 def promoted(x, scalar):
@@ -85,7 +105,9 @@ def cplx(*shape, seed=0):
 
 
 EDGE = torch.tensor([0j, -0.0 + 0j, 1 + 0j, -2.5 - 0j, 3j, -1 - 1j, 88 + 0.5j, -104 + 2j, complex(INF, 0),
-                     complex(-INF, 0), complex(-INF, 1), complex(INF, 1), complex(NAN, 0), complex(1, NAN)],
+                     complex(-INF, 0), complex(-INF, 1), complex(INF, 1), complex(NAN, 0), complex(1, NAN),
+                     complex(-INF, INF), complex(INF, INF), complex(-INF, NAN), complex(INF, NAN), complex(NAN, NAN),
+                     complex(0, INF), complex(3e19, 3e19), complex(1e-30, 0), complex(0, -1e-25)],
                     dtype=torch.complex64)
 
 
@@ -103,10 +125,22 @@ def test_exp_matches_torch(shape):
 def test_exp_edge_values_like_c99():
     """C99 cexp (cmath): torch 2.6's own CPU kernel gives exp(inf + 0j) = inf + nan j on the Gaudi image's x86 build
     and the C99 inf + 0j on an ARM Mac build (both measured), so cmath is the reference."""
-    import cmath
+    def c99(v):  # C99 Annex G cexp (cmath raises at these points instead)
+        x, y = v.real, v.imag
+        if y == 0:
+            return complex(math.exp(x) if x < 89 else INF, y) if not math.isnan(x) else complex(NAN, y)
+        if math.isinf(x) and not math.isfinite(y):
+            return 0j if x < 0 else complex(INF, NAN)
+        if not math.isfinite(y) or math.isnan(x):
+            return complex(NAN, NAN)
+        e = math.exp(x) if x < 89 else INF
+        return complex(e * math.cos(y), e * math.sin(y))
     got = exp_pairs(EDGE)
-    ref = torch.tensor([cmath.exp(complex(v)) for v in EDGE.tolist()], dtype=torch.complex64)
-    same(got, ref, rtol=1e-5)
+    ref = torch.tensor([c99(v) for v in EDGE.tolist()], dtype=torch.complex64)
+    # C99 leaves the signs of 0 and of nan's companions unspecified in these cases; values and NaN placement checked
+    gp, rp = torch.view_as_real(got), torch.view_as_real(ref)
+    assert torch.equal(gp.isnan(), rp.isnan()), (got, ref)
+    same(got.nan_to_num(), ref.nan_to_num(), rtol=1e-5)
     # a real-valued input keeps an exactly zero (signed) imaginary part, as C99 cexp
     real = EDGE[EDGE.imag == 0]
     assert torch.equal(torch.signbit(exp_pairs(real).imag), torch.signbit(torch.exp(real).imag))
@@ -124,12 +158,14 @@ def test_neg_matches_torch_with_conjugate_inputs():
     same(neg_pairs(EDGE), -EDGE, 0, 0)
 
 
-@pytest.mark.parametrize("value", [0, 0.0, 2.5, -1j, 1 + 2j, INF, complex(NAN, 1)])
+@pytest.mark.parametrize("value", [0, 0.0, -0.0, complex(0, -0.0), 2.5, -1j, 1 + 2j, INF, complex(NAN, 1)])
 @pytest.mark.parametrize("mask_shape", [(3, 4), (4,), (1, 4), (3, 1), ()])
 def test_masked_fill_broadcasts_the_mask_like_torch(value, mask_shape):
     z = cplx(3, 4)
     mask = torch.rand(mask_shape, generator=torch.Generator().manual_seed(1)) > 0.5
-    same(masked_fill_pairs(z, mask, value), z.clone().masked_fill_(mask, value), 0, 0)
+    got, ref = masked_fill_pairs(z, mask, value), z.clone().masked_fill_(mask, value)
+    same(got, ref, 0, 0)
+    assert torch.equal(torch.view_as_real(got).signbit(), torch.view_as_real(ref).signbit())  # -0.0 fills -0.0
 
 
 def test_masked_fill_mask_must_broadcast_to_self():
@@ -240,10 +276,11 @@ def bits(z):
 
 @pytest.mark.parametrize("c", SCALARS)
 def test_fast_mul_is_bitwise_torch(c):
-    assert torch.equal(bits(fast_mul(X_EDGE, c)).ne(bits(X_EDGE * c)) & ~torch.view_as_real(X_EDGE * c).isnan(),
-                       torch.zeros(len(X_EDGE), 2, dtype=torch.bool))
-    assert torch.equal(bits(fast_mul(X_EDGE, c)).ne(bits(c * X_EDGE)) & ~torch.view_as_real(c * X_EDGE).isnan(),
-                       torch.zeros(len(X_EDGE), 2, dtype=torch.bool))
+    for ref in (X_EDGE * c, c * X_EDGE):
+        got = fast_mul(X_EDGE, c)
+        nan = torch.view_as_real(ref).isnan()
+        assert torch.equal(torch.view_as_real(got).isnan(), nan), (got, ref)  # NaN exactly where torch has NaN
+        assert torch.equal(bits(got)[~nan], bits(ref)[~nan]), (got, ref)
 
 
 @pytest.mark.parametrize("c", SCALARS)

@@ -138,9 +138,15 @@ void lazy_owner_free(void* ctx) {
   lazy_owners_alive.fetch_sub(1);
 }
 
-c10::Storage lazy_storage(const at::Tensor& owner) {
-  auto* ctx = new LazyOwner{owner};
+// The owner is a detached alias of the Habana tensor (its own TensorImpl, same Habana storage): r.set_(), r.data = ...
+// or r.resize_() on the caller's tensor cannot retarget the complex tensor, and r's autograd graph is not kept alive.
+LazyOwner* lazy_owner(const at::Tensor& owner) {
   lazy_owners_alive.fetch_add(1);
+  return new LazyOwner{owner.detach()};
+}
+
+c10::Storage lazy_storage(const at::Tensor& owner) {
+  auto* ctx = lazy_owner(owner);
   return c10::Storage(c10::Storage::use_byte_size_t(), owner.storage().nbytes(),
                       c10::DataPtr(ctx, ctx, &lazy_owner_free, owner.device()), /*allocator=*/nullptr,
                       /*resizable=*/false);
@@ -944,9 +950,17 @@ at::Tensor sub_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& a
   return add_pu1(a, b, -alpha.toDouble());
 }
 
-// |z| as one kernel: complex nodes run eagerly, so every op is a launch over the whole spectrum.
+// |z| = hypot(re, im), scaled by m = max(|re|, |im|) as C's hypot: Habana's own vector_norm and hypot square in float
+// (|3e19 + 3e19j| = inf, |1e-30| = 0 on Gaudi2, bridge 1.21.4, where torch gives 4.2e19 and 1e-30). m = 0 gives 0;
+// an infinite part gives inf even next to a NaN (hypot(inf, nan) = inf, as torch's abs).
 at::Tensor modulus(const at::Tensor& pair, bool keepdim) {
-  return at::linalg_vector_norm(pair, 2, at::IntArrayRef{-1}, keepdim);
+  auto mag = pair.abs();
+  auto m = std::get<0>(mag.max(-1, /*keepdim=*/true));
+  auto scale = at::where(m > 0, m, at::ones_like(m));
+  auto r = m * at::linalg_vector_norm(pair / scale, 2, at::IntArrayRef{-1}, /*keepdim=*/true);
+  const auto inf = std::numeric_limits<float>::infinity();
+  r = at::where((mag == inf).any(-1, /*keepdim=*/true), at::Scalar(inf), r);
+  return keepdim ? r : r.squeeze(-1);
 }
 
 at::Tensor abs_pu1(const at::Tensor& self) {
@@ -1223,6 +1237,9 @@ std::optional<at::Tensor> real_times_complex_scalar(const std::string& name, c10
     return std::nullopt;
   }
   const auto& other = args[1 - real_at];
+  if (other.isTensor() && other.toTensor().requires_grad()) {  // its gradient: the promoted op's autograd
+    return std::nullopt;
+  }
   const auto c64 = other.isTensor() ? other.toTensor().item().toComplexDouble() : other.toScalar().toComplexDouble();
   const c10::complex<float> c(static_cast<float>(c64.real()), static_cast<float>(c64.imag()));
   if (!std::isfinite(c.real()) || !std::isfinite(c.imag())) {
@@ -1270,10 +1287,17 @@ void complex_scalar_autograd_hpu(const c10::OperatorHandle& op, DispatchKeySet k
     const auto* alias = schema.arguments()[i].alias_info();
     writes |= alias != nullptr && alias->isWrite();
   }
+  const auto* self_alias = schema.arguments()[0].alias_info();
+  const bool inplace = self_alias != nullptr && self_alias->isWrite();
+  // torch's check, before Habana's float add/sub sees a complex alpha (two real HPU tensors)
+  if ((schema.name() == "aten::add" || schema.name() == "aten::sub") && n >= 3 && args[2].isScalar() &&
+      args[2].toScalar().isComplex() && real_hpu(args[0]) && args[1].isTensor() && !args[1].toTensor().is_complex()) {
+    TORCH_CHECK(false, "For non-complex input tensors, argument alpha must not be a complex number.");
+  }
   int64_t real_at = -1;
   if (real_hpu(args[0]) && complex_cpu_scalar(args[1])) {
     real_at = 0;
-  } else if (!writes && args[0].isTensor() && complex_cpu_scalar(args[0]) && real_hpu(args[1])) {
+  } else if (!inplace && args[0].isTensor() && complex_cpu_scalar(args[0]) && real_hpu(args[1])) {
     real_at = 1;
   }
   const auto& real = real_at >= 0 ? args[real_at].toTensor() : at::Tensor();
@@ -1310,11 +1334,28 @@ void complex_scalar_autograd_hpu(const c10::OperatorHandle& op, DispatchKeySet k
 
 // ---- copies and fills (PrivateUse1) ------------------------------------------------------
 
+// Lazy mode: two complex tensors made separately over one Habana storage (two view_as_complex of the same r) have
+// different lazy storages, so torch's overlap check sees two storages. Their offsets and strides are both in the
+// Habana storage's coordinates: self is described over src's storage, and checked against src.
+void check_lazy_partial_overlap(const at::Tensor& self, const at::Tensor& src) {
+  if (!tagged(self) || !tagged(src) || self.storage().is_alias_of(src.storage())) {
+    return;
+  }
+  const auto a = lazy_base(self), b = lazy_base(src);
+  if (!a.defined() || !b.defined() || a.storage().unsafeGetStorageImpl() != b.storage().unsafeGetStorageImpl() ||
+      self.dtype() != src.dtype()) {
+    return;
+  }
+  at::assert_no_partial_overlap(
+      view_of(src, src.key_set(), self.dtype(), self.sizes(), self.strides(), self.storage_offset()), src);
+}
+
 at::Tensor& copy_pu1(at::Tensor& self, const at::Tensor& src, bool non_blocking) {
   // torch's copy_ checks (TensorIterator): self has no internal overlap, and src covers self's memory fully or not
   // at all; a partial overlap would read values already overwritten.
   at::assert_no_internal_overlap(self);
   at::assert_no_partial_overlap(self, src);
+  check_lazy_partial_overlap(self, src);
   if (host_backed(self)) {  // CPU copy semantics: casts, broadcasts, conjugate and negative bits of both sides
     return host_inplace(self, [&](at::Tensor& s) { s.copy_(cpu_operand(src)); });
   }
@@ -1400,12 +1441,13 @@ void resize_complex(at::Tensor& t, c10::IntArrayRef sizes) {
     if (host_backed(t)) {  // host memory has no allocator: a new host block in the same StorageImpl
       void* data = c10::alloc_cpu(needed);
       storage.set_data_ptr_noswap(c10::DataPtr(data, data, &host_free, hpu_index(t.device())));
-    } else if (is_lazy_mode()) {  // a new Habana tensor behind a new storage (views of the old one keep it)
+    } else if (lazy_base(t).defined()) {
+      // Lazy mode: a new Habana tensor in the same StorageImpl (the old LazyOwner is released), so every view of the
+      // storage sees it, as eager growth does; the old contents are not kept.
       auto flat = at::empty({static_cast<int64_t>((needed + sizeof(float) - 1) / sizeof(float))},
                             at::TensorOptions().dtype(at::kFloat).device(t.device()));
-      t.unsafeGetTensorImpl()->set_storage_keep_dtype(lazy_storage(flat));
-      t.unsafeGetTensorImpl()->set_sizes_and_strides(sizes, strides);
-      return;
+      auto* ctx = lazy_owner(flat);
+      storage.set_data_ptr_noswap(c10::DataPtr(ctx, ctx, &lazy_owner_free, t.device()));
     } else {
       auto* allocator = storage.allocator();
       TORCH_CHECK(allocator != nullptr && storage.resizable(), "Trying to resize storage that is not resizable");
@@ -1545,7 +1587,14 @@ at::Tensor exp_pu1(const at::Tensor& self) {
   // where(b != 0, ...), not where(b == 0, b, ...): the same values, and 6x faster on Gaudi2 eager (bridge 1.21.4:
   // 0.26 against 1.5 ms for this exp of a (10, 125) tensor, measured; the == form was slower than the CPU fallback).
   auto im = at::where(b != 0, ea * b.sin(), b);
-  return complex_result(at::stack({ea * b.cos(), im}, -1));
+  auto re = ea * b.cos();
+  // C99 cexp at an infinite real part and a non-finite imaginary part: exp(-inf + i inf/nan) = 0 + 0i,
+  // exp(+inf + i inf/nan) = inf + nan i (e^a * cos(b) would be NaN for both). ea is 0 or inf there, and ea - ea gives
+  // the imaginary part (0 - 0 = 0, inf - inf = nan).
+  auto special = a.isinf().logical_and(b.isfinite().logical_not());
+  re = at::where(special, ea, re);
+  im = at::where(special, ea - ea, im);
+  return complex_result(at::stack({re, im}, -1));
 }
 
 at::Tensor& neg_out_pu1(const at::Tensor& self, at::Tensor& out) {
@@ -1568,10 +1617,19 @@ at::Tensor& masked_fill_pu1(at::Tensor& self, const at::Tensor& mask, const at::
   auto m = (mask.dim() >= 5 ? dense_copy(mask) : mask).to(self.device()).expand(self.sizes());
   const auto c = value.toComplexDouble();
   auto pair = values_pair(self);
-  auto filled = c.imag() == 0.0 && c.real() == 0.0
-                    ? pair.masked_fill(m.unsqueeze(-1), 0.0)
-                    : at::stack({pair.select(-1, 0).masked_fill(m, c.real()), pair.select(-1, 1).masked_fill(m, c.imag())},
-                                -1);
+  const bool plus_zero = c.real() == 0.0 && c.imag() == 0.0 && !std::signbit(c.real()) && !std::signbit(c.imag());
+  const bool signed_zero = (c.real() == 0.0 && std::signbit(c.real())) || (c.imag() == 0.0 && std::signbit(c.imag()));
+  at::Tensor filled;
+  if (plus_zero) {
+    filled = pair.masked_fill(m.unsqueeze(-1), 0.0);
+  } else if (signed_zero) {
+    // A -0.0 part goes in as a tensor, not a scalar: Habana's lazy graph merges the constants -0.0 and 0.0 (the two
+    // parts' fills came out with each other's zero sign; Gaudi2, bridge 1.21.4).
+    auto value = at::tensor({static_cast<float>(c.real()), static_cast<float>(c.imag())}).to(self.device());
+    filled = at::where(m.unsqueeze(-1), value, pair);
+  } else {
+    filled = at::stack({pair.select(-1, 0).masked_fill(m, c.real()), pair.select(-1, 1).masked_fill(m, c.imag())}, -1);
+  }
   copy_pu1(self, complex_result(filled), false);
   return self;
 }
@@ -1955,7 +2013,8 @@ TORCH_LIBRARY_IMPL(aten, AutogradHPU, m) {
   for (const char* name : {"mul.Tensor", "mul.Scalar", "mul_.Tensor", "mul_.Scalar", "mul.out",
                            "add.Tensor", "add.Scalar", "add_.Tensor", "add_.Scalar", "add.out",
                            "sub.Tensor", "sub.Scalar", "sub_.Tensor", "sub_.Scalar", "sub.out",
-                           "rsub.Tensor", "rsub.Scalar",
+                           "rsub.Tensor", "rsub.Scalar", "mul.Scalar_out", "add.Scalar_out", "sub.Scalar_out",
+                           "div.Scalar_out", "div.Scalar_mode_out", "rsub.Tensor_out", "rsub.Scalar_out",
                            "div.Tensor", "div.Scalar", "div_.Tensor", "div_.Scalar", "div.out",
                            "div.Tensor_mode", "div.Scalar_mode", "div_.Tensor_mode", "div_.Scalar_mode",
                            "div.out_mode"}) {

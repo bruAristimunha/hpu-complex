@@ -3,7 +3,6 @@ complex scalar, and complex cat / exp / neg / masked_fill_ / linalg.vector_norm 
 the CPU, gradients included. ``add_checks(check, err, grad_err, worst, sync)`` registers one row per case through the
 caller's ``check``; every case also fails if hpu_complex warns that an op ran on the CPU.
 """
-import cmath
 import math
 import warnings
 
@@ -30,6 +29,29 @@ def _raises(fn, match):
         assert match in str(e), str(e)[:200]
         return 0.0
     raise AssertionError("no error")
+
+
+def _c99_exp(v):
+    """C99 Annex G cexp (cmath raises at the non-finite points instead)."""
+    x, y = v.real, v.imag
+    if y == 0:
+        return complex(math.exp(x) if x < 89 else math.inf, y) if not math.isnan(x) else complex(math.nan, y)
+    if math.isinf(x) and not math.isfinite(y):
+        return 0j if x < 0 else complex(math.inf, math.nan)
+    if not math.isfinite(y) or math.isnan(x):
+        return complex(math.nan, math.nan)
+    e = math.exp(x) if x < 89 else math.inf
+    return complex(e * math.cos(y), e * math.sin(y))
+
+
+def _nan_bits_err(got, ref, signed_zeros=True):
+    """0 if NaN sits exactly where torch has it and every other value is equal (signed zeros included unless
+    signed_zeros=False), else 1."""
+    g, r = torch.view_as_real(got.cpu()).contiguous(), torch.view_as_real(ref).contiguous()
+    nan = r.isnan()
+    same = (torch.equal(g.view(torch.int32)[~nan], r.view(torch.int32)[~nan]) if signed_zeros
+            else torch.equal(g[~nan], r[~nan]))
+    return float(not (torch.equal(g.isnan(), nan) and same))
 
 
 def add_checks(check, err, grad_err, worst, sync=lambda: None):
@@ -86,15 +108,17 @@ def add_checks(check, err, grad_err, worst, sync=lambda: None):
         lambda: grad_err(lambda fq: gabor(fq, tt.to(fq.device)), f, relative=True)), 1e-5)
 
     z = torch.randn(3, 4, 5, dtype=torch.complex64)
-    edge = torch.tensor([0j, -0.0 + 0j, 1 + 0j, 3j, -1 - 1j, 80 + 0.5j, -100 + 2j, complex(math.inf, 0),
-                         complex(-math.inf, 0), complex(-math.inf, 1), complex(math.nan, 0)], dtype=torch.complex64)
+    inf, nan = math.inf, math.nan
+    edge = torch.tensor([0j, -0.0 + 0j, 1 + 0j, 3j, -1 - 1j, 80 + 0.5j, -100 + 2j, complex(inf, 0),
+                         complex(-inf, 0), complex(-inf, 1), complex(nan, 0), complex(-inf, inf), complex(inf, inf),
+                         complex(-inf, nan), complex(inf, nan), complex(nan, nan), complex(0, inf), complex(1, nan)],
+                        dtype=torch.complex64)
     def exp_edges():
         # Reference: C99 cexp (Python's cmath), elementwise. torch's CPU kernel is not one reference here: torch 2.6
         # gives exp(inf + 0j) = inf + nan j and exp(nan + 0j) = nan + nan j on the Gaudi image's x86 build, and the
         # C99 inf + 0j and nan + 0j on an ARM Mac build (both measured).
         got = torch.view_as_real(torch.exp(edge.to(hpu))).cpu().double()
-        ref = torch.view_as_real(torch.tensor([cmath.exp(complex(v)) for v in edge.tolist()],
-                                              dtype=torch.complex128))
+        ref = torch.view_as_real(torch.tensor([_c99_exp(v) for v in edge.tolist()], dtype=torch.complex128))
         assert torch.equal(got.isnan(), ref.isnan()) and torch.equal(got.isinf(), ref.isinf()), (got, ref)
         assert torch.equal(got[got.isinf()], ref[ref.isinf()]), (got, ref)
         fin = got.isfinite()
@@ -148,3 +172,65 @@ def add_checks(check, err, grad_err, worst, sync=lambda: None):
     check("complex linalg.vector_norm fwd+grad (ord 2, 1, inf; relative)", _no_cpu_fallback(lambda: worst(
         *[grad_err(lambda t, o=o: torch.linalg.vector_norm(torch.complex(t, t.flip(-1)), o, -1), xr, relative=True)
           for o in (2, 1, math.inf)])), 1e-5)
+
+
+    # ---- revision round: an independent review's cases ----------------------------------------------------------
+    xe = torch.tensor([0.0, -0.0, 1.5, -2.0, inf, -inf, nan, 3e38])
+    # Zero signs are not compared: Habana's own float x * 0.0 gives +0 for a negative x (torch -0), without complex.
+    # The formula's signed zeros are checked bit for bit on the CPU (test_pair_kernels_formula_cpu.py).
+    check("real x complex scalar at 0, -0, inf, nan: NaN where torch, values equal elsewhere", lambda: worst(
+        *[_nan_bits_err(fn(xe.to(hpu)), fn(xe), signed_zeros=False) for fn in (
+            lambda x: x * 2j, lambda x: (1 - 2j) * x, lambda x: x * (-0.0 - 0j), lambda x: x + 1j,
+            lambda x: torch.add(x, -1j, alpha=-2), lambda x: x - (2 + 0j))]), 0)
+
+    def scalar_tensor_grad(first):
+        grads = []
+        for dev in (hpu, "cpu"):
+            w = torch.tensor(1 + 1j, requires_grad=True)
+            x = xr.to(dev)
+            ((w * x) if first else (x * w)).abs().sum().backward()
+            grads.append(w.grad)
+        assert grads[0] is not None, "w.grad lost"
+        return err(grads[0], grads[1]) / grads[1].abs().item()
+
+    check("gradient of a complex 0-d CPU tensor operand (x * w, w * x; relative)", lambda: worst(
+        scalar_tensor_grad(False), scalar_tensor_grad(True)), 1e-6)
+    zc = lambda: torch.empty(4, 6, dtype=torch.complex64, device=hpu)
+    check("out= forms: tensor(1j) * x out=, mul/add/sub/div Scalar_out, rsub Scalar_out/Tensor_out, Scalar_mode_out",
+          lambda: worst(
+              err(torch.mul(torch.tensor(1j), xr.to(hpu), out=zc()), torch.tensor(1j) * xr),
+              err(torch.ops.aten.mul.Scalar_out(xr.to(hpu), 2j, out=zc()), xr * 2j),
+              err(torch.ops.aten.add.Scalar_out(xr.to(hpu), 2j, alpha=3, out=zc()), torch.add(xr, 2j, alpha=3)),
+              err(torch.ops.aten.sub.Scalar_out(xr.to(hpu), 2j, alpha=1, out=zc()), xr - 2j),
+              err(torch.ops.aten.div.Scalar_out(xr.to(hpu), 2j, out=zc()), xr / 2j),
+              err(torch.ops.aten.rsub.Scalar_out(xr.to(hpu), 2j, alpha=1, out=zc()), 2j - xr),
+              err(torch.ops.aten.rsub.Tensor_out(xr.to(hpu), torch.tensor(2j), alpha=1, out=zc()), 2j - xr)), 1e-6)
+    check("add(x, y, alpha=1j) of two real HPU tensors raises like torch", lambda: _raises(
+        lambda: torch.add(xr.to(hpu), xr.to(hpu), alpha=1j), "alpha must not be a complex number"), 0)
+
+    zm = torch.tensor([1e-30, 3e19 + 3e19j, 1e-25j, complex(inf, nan), complex(nan, 1), -0.0 - 0j],
+                      dtype=torch.complex64)
+    check("complex abs at extremes (hypot: 1e-30, 3e19+3e19j, inf+nan j, nan, -0)", lambda: _nan_bits_err(
+        torch.complex(zm.to(hpu).abs(), torch.zeros(6, device=hpu)), torch.complex(zm.abs(), torch.zeros(6))), 0)
+    check("complex vector_norm at extremes: ord 0, 1, inf, -inf, 0.5 (relative)", lambda: worst(
+        *[cmp(lambda t, o=o: torch.linalg.vector_norm(t, o), zm[:3]) / torch.linalg.vector_norm(zm[:3], o).item()
+          for o in (0, 1, inf, -inf, 0.5)]), 1e-6)
+
+    def norm_grad_at_zero():
+        errs = []
+        for o in (2, 1, 0.5, 3, inf):
+            g = []
+            for dev in (hpu, "cpu"):
+                t = torch.zeros(3, 4, dtype=torch.complex64, device=dev).requires_grad_()
+                torch.linalg.vector_norm(t, o, -1).sum().backward()
+                g.append(t.grad)
+            errs.append(err(g[0], g[1]))
+        return worst(*errs)
+
+    check("complex vector_norm gradient at z = 0 (ord 2, 1, 0.5, 3, inf)", norm_grad_at_zero, 0)
+    check("complex vector_norm fwd+grad, fractional ord 0.5 / 1.5 / -1 (relative)", lambda: worst(
+        *[grad_err(lambda t, o=o: torch.linalg.vector_norm(torch.complex(t, 1 - t), o, -1), xr, relative=True)
+          for o in (0.5, 1.5, -1)]), 1e-5)
+    check("complex masked_fill_ with -0.0 and -0j: signed zeros kept", lambda: worst(
+        *[_nan_bits_err(z.to(hpu).masked_fill(mask.to(hpu), v), z.masked_fill(mask, v))
+          for v in (-0.0, complex(-0.0, -0.0), complex(0.0, -0.0))]), 0)

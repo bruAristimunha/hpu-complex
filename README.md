@@ -55,10 +55,14 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
 - A real HPU tensor and a Python complex scalar (`x * 2j`, `2j * x`, `x + 1j`, `x - 1j`, `1j - x`, `x / 2j`, and
   the same with a 0-d complex CPU tensor) is taken at `AutogradHPU`, before Habana's float kernels (lazy mode
   aborted the process there): `x * c` and `x ± alpha c` are `torch.complex` of one or two float ops on `x`
-  (torch's complex64 arithmetic on `x + 0i`, signed zeros included), the others promote `x` to torch's result type
+  (torch's complex64 arithmetic on `x + 0i`; on the card the sign of a zero result can differ, as Habana's own float
+  `x * 0.0` gives `+0` for a negative `x`), the others (and a 0-d complex tensor that requires grad) promote `x` to torch's result type
   (complex64; complex128 for float64) and run on the complex kernels. Gradients are torch's own formulas.
-  In-place and `out=` forms with a real `self`/`out` raise torch's "can't be cast" error; every other call goes
-  on to torch's autograd kernel unchanged.
+  In-place and `out=` forms (`.out`, `.Scalar_out`, `rsub` and `div` mode outs) with a real `self`/`out` raise
+  torch's "can't be cast" error, and a complex `alpha` with two real tensors raises torch's message; every other
+  call (and torch.compile's fake tensors) goes on to torch's autograd kernel unchanged. `|z|` (`abs`, `sgn`,
+  `vector_norm` with `ord != 2`) is a hypot scaled by `max(|re|, |im|)`: Habana's float norm squares unscaled
+  (`|3e19 + 3e19j|` was inf, `|1e-30|` was 0). `exp` follows C99 cexp at non-finite inputs.
 - Complex `mm`/`bmm` (so `@`, `matmul`, `einsum` products) are one real GEMM on the card:
   `[ar | ai] @ [[br, bi], [-bi, br]] = [cr | ci]`, conjugate operands included (they reach `mm`/`bmm`
   unresolved). Products below 2²² multiply-adds (batch·m·k·n) go to the CPU instead, one copy each way, where
@@ -99,7 +103,7 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
 
 ## Verified on Gaudi2 (habana 1.21.4 / torch 2.6.0)
 
-`hpu_complex/tests/pu1_check.py` passes 197/197 checks against torch on the CPU. Errors are max abs unless noted:
+`hpu_complex/tests/pu1_check.py` passes 206/206 checks against torch on the CPU. Errors are max abs unless noted:
 
 | case | error |
 |---|---|
@@ -200,7 +204,12 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   `torch.inference_mode` (Habana's views would be inference tensors, which autograd's view tracking of
   `view_as_real`/`.real` cannot take; `torch.no_grad()` works), and permuted complex64 tensors of rank 5 or more at
   storage offset 0 (Habana's lazy graphs read their permute block wrong: errors up to 12; the same layouts at an
-  offset read right). `torch.compile(backend="hpu_backend")` fails in lazy mode for float-only functions too
+  offset read right). Not caught: a real HPU tensor times a complex scalar under `torch.inference_mode` skips the
+  autograd keys where it is intercepted, so it still reaches Habana and aborts in lazy mode (use `torch.no_grad()`).
+  The complex tensor holds a detached alias of the Habana tensor (`r.data = ...`, `r.resize_()` on the tensor given
+  to `view_as_complex` do not retarget it; writes through either side reach the other); an `out=` resize keeps the
+  storage, so views taken before see the result, as in eager mode. `z.untyped_storage().cpu()` raises Habana's
+  "should not be called in lazy flow" (`torch.save`/`torch.load` work). `torch.compile(backend="hpu_backend")` fails in lazy mode for float-only functions too
   (`BackendCompilerFailed`; use eager mode for it). In lazy mode a float32 tensor cast to bfloat16 on the card
   rounds differently from the CPU (`x.bfloat16().float()` is 1.9e-3 off, without any complex op). Without
   hpu_complex, a real HPU tensor times a Python complex scalar still aborts the process in lazy mode, inside
