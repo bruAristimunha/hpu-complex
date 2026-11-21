@@ -181,3 +181,187 @@ def test_lazy_mode_defaults_to_lazy_without_the_bridge_query(monkeypatch):
     assert hpu_complex._bridge_is_lazy() is False
     monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
     assert hpu_complex._bridge_is_lazy() is True
+
+
+# ---- complex Python scalars in AOT backward graphs (compiled Green's wavelet gradient) -------------------------
+
+
+def _green_wavelet_rows(foi, tt):
+    """Green's Gabor rows, reduced: three selected frequencies, each a 0-d real tensor times a Python complex."""
+    f = 2 ** foi
+    return torch.view_as_real(torch.stack([(2j * torch.pi * a) * tt for a in f[:3]])).sum()
+
+
+def _aot_graphs(fn, *args):
+    from functorch.compile import aot_function
+
+    graphs = {}
+
+    def capture(tag):
+        def compiler(gm, example_inputs):
+            graphs[tag] = (gm, list(example_inputs))
+            return gm.forward  # run the traced graph as is
+        return compiler
+
+    compiled = aot_function(fn, fw_compiler=capture("fw"), bw_compiler=capture("bw"))
+    return compiled, graphs
+
+
+def _vals(gm):
+    return [n.meta.get("val") for n in gm.graph.nodes if isinstance(n.meta.get("val"), torch.Tensor)]
+
+
+def test_backward_of_a_python_complex_scalar_traces_to_complex128():
+    """The captured pattern: mul(grad, _conj(<Python complex>)), a complex128 constant in the backward graph."""
+    foi = torch.tensor([1.0, 2.0, 3.0, 4.0], requires_grad=True)
+    tt = torch.linspace(-0.25, 0.25, 8)
+    compiled, graphs = _aot_graphs(_green_wavelet_rows, foi, tt)
+    compiled(foi, tt).backward()
+    gm, _ = graphs["bw"]
+    conj = [n for n in gm.graph.nodes if n.op == "call_function" and n.target == torch.ops.aten._conj.default]
+    assert conj and all(isinstance(n.args[0], complex) for n in conj)
+    assert any(v.dtype == torch.complex128 for v in _vals(gm))
+
+
+def test_fold_conj_of_python_scalars_keeps_the_backward_complex64_and_exact():
+    foi = torch.tensor([1.0, 2.0, 3.0, 4.0], requires_grad=True)
+    tt = torch.linspace(-0.25, 0.25, 8)
+    _green_wavelet_rows(foi, tt).backward()
+    ref = foi.grad.clone()
+
+    folded = {}
+
+    def bw_compiler(gm, example_inputs):
+        folded["changed"] = hpu_complex._fold_conj_of_python_scalars(gm)
+        folded["dtypes"] = {v.dtype for v in _vals(gm)}
+        folded["conj"] = [n for n in gm.graph.nodes if n.op == "call_function"
+                          and n.target == torch.ops.aten._conj.default]
+        return gm.forward
+
+    from functorch.compile import aot_function
+
+    run = aot_function(_green_wavelet_rows, fw_compiler=lambda gm, ex: gm.forward, bw_compiler=bw_compiler)
+    foi.grad = None
+    run(foi, tt).backward()
+    assert folded["changed"] and not folded["conj"]
+    assert torch.complex128 not in folded["dtypes"] and torch.float64 not in folded["dtypes"]
+    assert torch.complex64 in folded["dtypes"]  # the metadata was recomputed: the products stay complex64
+    torch.testing.assert_close(foi.grad, ref)
+
+
+def test_fold_conj_of_python_scalars_leaves_other_graphs_alone():
+    z = torch.randn(4, dtype=torch.complex64)
+    gm = make_fx(lambda t: torch.view_as_real(t.conj() * 2j).sum())(z)
+    before = str(gm.graph)
+    assert not hpu_complex._fold_conj_of_python_scalars(gm)
+    assert str(gm.graph) == before
+
+
+@pytest.fixture
+def stub_backends(monkeypatch):
+    """Stand-ins for compile_backend.backends (its compilers record the partitioner they ran under) and .config."""
+    import contextlib
+
+    backends = types.ModuleType("backends")
+    config = types.ModuleType("config")
+    config.use_cpp_partitioner = True
+
+    @contextlib.contextmanager
+    def patch(**changes):
+        saved = {k: getattr(config, k) for k in changes}
+        for k, v in changes.items():
+            setattr(config, k, v)
+        try:
+            yield
+        finally:
+            for k, v in saved.items():
+                setattr(config, k, v)
+
+    config.patch = patch
+    seen = []
+
+    def compiler(tag):
+        def compile_graph(gm, example_inputs, **kwargs):
+            seen.append((tag, config.use_cpp_partitioner))
+            return gm.forward
+        return compile_graph
+
+    backends.hpu_training_compiler_fw = compiler("fw")
+    backends.hpu_training_compiler_bw = compiler("bw")
+    backends.hpu_inference_compiler = compiler("inf")
+    names = ["habana_frameworks", "habana_frameworks.torch", "habana_frameworks.torch.dynamo",
+             "habana_frameworks.torch.dynamo.compile_backend"]
+    for name in names:
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    package = sys.modules["habana_frameworks.torch.dynamo.compile_backend"]
+    package.backends, package.config = backends, config
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch.dynamo.compile_backend.backends", backends)
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch.dynamo.compile_backend.config", config)
+    monkeypatch.setattr(torch.ops.hpu_complex, "host_in_use", lambda: False, raising=False)
+    hpu_complex._aot_graphs_keep_complex64_scalars()
+    return backends, config, seen
+
+
+def test_aot_compilers_are_wrapped_once(stub_backends):
+    backends, _, seen = stub_backends
+    fw = backends.hpu_training_compiler_fw
+    hpu_complex._aot_graphs_keep_complex64_scalars()
+    assert backends.hpu_training_compiler_fw is fw
+    gm = make_fx(lambda t: t * 2)(torch.randn(3))
+    backends.hpu_inference_compiler(gm, [torch.randn(3)], dyn_graph_module=None)
+    backends.hpu_training_compiler_bw(gm, [torch.randn(3)])
+    assert seen == [("inf", True), ("bw", True)]  # a float graph keeps the C++ partitioner
+
+
+def test_graphs_with_eager_complex_nodes_use_the_python_partitioner(stub_backends):
+    """The captured pattern: eager 0-d float results of complex nodes (the gradients of selected frequencies) read by
+    one fused graph; the C++ partitioner's fused graph doubled one of them on Gaudi2."""
+    backends, config, seen = stub_backends
+    foi = torch.tensor([1.0, 2.0, 3.0, 4.0], requires_grad=True)
+    tt = torch.linspace(-0.25, 0.25, 8)
+    graphs = {}
+
+    def capture(tag):
+        def compile_graph(gm, example_inputs):
+            graphs[tag] = gm
+            return gm.forward
+        return compile_graph
+
+    from functorch.compile import aot_function
+
+    aot_function(_green_wavelet_rows, fw_compiler=capture("fw"), bw_compiler=capture("bw"))(foi, tt).backward()
+    backends.hpu_training_compiler_bw(graphs["bw"], [])
+    backends.hpu_training_compiler_fw(graphs["fw"], [])
+    assert seen == [("bw", False), ("fw", False)] and config.use_cpp_partitioner is True
+
+
+def test_bmm_view_pass_skips_complex_bmm(monkeypatch):
+    """Habana's pass_remove_unnecessary_bmm_view hands a bmm the 4-D tensors before its views; the extension's complex
+    bmm takes 3-D only (compiled z @ z.mT.conj() raised). It still sees float bmm nodes."""
+    passes = types.ModuleType("passes")
+    passes.is_eager_fallback_required = lambda node, is_dynamic=False: False
+    seen = []
+
+    def pass_remove_unnecessary_bmm_view(ctx):
+        seen.extend(n.name for n in ctx.graph_module.graph.nodes if n.target == torch.ops.aten.bmm.default)
+        return False
+
+    passes.pass_remove_unnecessary_bmm_view = pass_remove_unnecessary_bmm_view
+    names = ["habana_frameworks", "habana_frameworks.torch", "habana_frameworks.torch.dynamo",
+             "habana_frameworks.torch.dynamo.compile_backend"]
+    for name in names:
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    sys.modules["habana_frameworks.torch.dynamo.compile_backend"].passes = passes
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch.dynamo.compile_backend.passes", passes)
+    hpu_complex._complex_nodes_run_eagerly()
+    z = torch.randn(2, 3, 4, 5, dtype=torch.complex64)
+    x = torch.randn(2, 3, 4, 5)
+    gm = make_fx(lambda a, b: ((a @ a.mT.conj()).abs() + b @ b.mT))(z, x)
+    ctx = types.SimpleNamespace(graph_module=gm)
+    bmms = [n for n in gm.graph.nodes if n.target == torch.ops.aten.bmm.default]
+    assert len(bmms) == 2
+    passes.pass_remove_unnecessary_bmm_view(ctx)
+    float_bmm = [n.name for n in bmms if not n.meta["val"].is_complex()]
+    assert seen == float_bmm
+    assert all(n.target == torch.ops.aten.bmm.default for n in bmms)  # restored
+    torch.testing.assert_close(gm(z, x), (z @ z.mT.conj()).abs() + x @ x.mT)

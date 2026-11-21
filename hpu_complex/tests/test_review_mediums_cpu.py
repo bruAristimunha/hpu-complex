@@ -129,9 +129,11 @@ def test_neg_of_a_real_tensor_into_a_complex_out_raises():
 
 
 def test_complex_result_into_a_real_out_raises():
+    """Elementwise ops only: a reduction casts its input to out's dtype first (sum(complex, out=float) is the sum of the
+    real parts, test_review2_cpu.py)."""
     for fn in (lambda o: torch.exp(h([1j]), out=o), lambda o: torch.mul(h([1j]), 2, out=o),
-               lambda o: torch.neg(h([1j]), out=o), lambda o: torch.sum(h([1j]), 0, out=o)):
-        with pytest.raises(RuntimeError, match="can't be cast"):
+               lambda o: torch.neg(h([1j]), out=o)):
+        with pytest.raises(RuntimeError, match="can't be cast|Found dtype Float but expected ComplexFloat"):  # torch's
             fn(torch.empty(1, device=HPU))
 
 
@@ -205,9 +207,7 @@ def test_real_tensor_and_complex_scalar_bitwise(c, op):
     x = torch.tensor([1.5, -2.0, 0.0, -0.0, 1e-30, 3e38])
     f = {"mul": lambda t: t * c, "rmul": lambda t: c * t, "add": lambda t: t + c, "sub": lambda t: t - c,
          "rsub": lambda t: c - t, "div": lambda t: t / c}[op]
-    if op == "div" and c == complex(0, -0.0):
-        pytest.skip("division by zero: NaN payloads differ")
-    bits_equal(f(x.to(HPU)), f(x))
+    bits_equal(f(x.to(HPU)), f(x))  # bits_equal masks NaN payloads: division by a zero c is checked too
 
 
 def test_vector_norm_kernel_gradient_like_torch():
@@ -218,3 +218,93 @@ def test_vector_norm_kernel_gradient_like_torch():
         torch.linalg.vector_norm(a, ord, dim=1).sum().backward()
         torch.linalg.vector_norm(b, ord, dim=1).sum().backward()
         torch.testing.assert_close(b.grad.cpu(), a.grad, rtol=2e-6, atol=1e-7)
+
+
+# ---- the complex-scalar interception when the call skips the autograd keys --------------------------------
+
+SCALAR_OPS = {"mul": lambda t: t * 2j, "rmul": lambda t: (1 - 2j) * t, "add": lambda t: t + 1j,
+              "sub": lambda t: t - 1j, "rsub": lambda t: 1j - t, "div": lambda t: t / 2j,
+              "exp_mul": lambda t: torch.exp(t * 2j), "0d_tensor": lambda t: t * torch.tensor(2j)}
+
+
+@pytest.mark.parametrize("op", list(SCALAR_OPS))
+def test_real_tensor_and_complex_scalar_under_inference_mode(op):
+    """torch.inference_mode excludes the autograd keys: the call is taken at BackendSelect (main: it reached Habana's
+    float kernel, which aborts the process in lazy mode; here the stub's CPU kernel gave an untagged complex result)."""
+    x = torch.tensor([1.5, -2.0, 0.0, -0.0, 3e38])
+    with torch.inference_mode():
+        got = SCALAR_OPS[op](x.to(HPU))
+        assert got.is_inference()
+    assert tagged(got) and got.dtype == C64
+    bits_equal(got, SCALAR_OPS[op](x))
+
+
+def test_inference_tensor_and_complex_scalar_outside_inference_mode():
+    """An inference tensor has no autograd keys, so outside inference mode too its call skips AutogradHPU."""
+    with torch.inference_mode():
+        x = torch.tensor([1.5, -2.0]).to(HPU)
+    got = x * 2j
+    assert tagged(got) and not got.requires_grad
+    bits_equal(got, torch.tensor([1.5, -2.0]) * 2j)
+
+
+def test_inference_mode_keeps_torch_errors_and_other_calls():
+    x = torch.tensor([1.0, 2.0]).to(HPU)
+    with torch.inference_mode():
+        with pytest.raises(RuntimeError, match="can't be cast to the desired output type"):
+            x.clone().mul_(2j)
+        with pytest.raises(RuntimeError, match="alpha must not be a complex number"):
+            torch.add(x, x, alpha=1j)
+        with pytest.raises(RuntimeError, match="Subtraction, the `-` operator, with a bool tensor"):
+            torch.sub(torch.tensor([True]).to(HPU), 1j)
+        bits_equal(x * 2, torch.tensor([2.0, 4.0]))  # not complex: Habana's kernel, unchanged
+        z = h([1 + 1j, 2])
+        bits_equal(z * 2j, torch.tensor([1 + 1j, 2]) * 2j)  # a complex tensor: the PrivateUse1 kernels
+
+
+def test_no_grad_and_grad_paths_unchanged():
+    """With autograd keys the AutogradHPU kernel promotes first; BackendSelect then sees a complex operand."""
+    x = torch.tensor([1.5, -2.0]).to(HPU).requires_grad_()
+    y = x * 2j
+    assert tagged(y) and y.requires_grad
+    (y * (1 - 1j)).real.sum().backward()
+    torch.testing.assert_close(x.grad.cpu(), torch.tensor([2.0, 2.0]))
+
+
+def test_complex64_made_under_inference_mode_is_an_inference_tensor():
+    """As torch: complex64 results and allocations under inference_mode, and their views, are inference tensors;
+    a normal tensor used there stays normal (main: every complex64 kept the autograd keys)."""
+    x = torch.tensor([1.0, 2.0]).to(HPU)
+    z0 = h([1 + 2j, 3])
+    with torch.inference_mode():
+        z = torch.complex(x, x)
+        e = torch.zeros(2, dtype=C64, device=HPU)
+        r, v = z.real, torch.view_as_real(z)
+        n = z0[:1]
+    assert all(t.is_inference() for t in (z, e, r, v)) and not n.is_inference() and not z0.is_inference()
+    assert tagged(z) and tagged(e) and not tagged(r)
+    bits_equal(z * 2, torch.tensor([2 + 2j, 4 + 4j]))  # an inference tensor in a normal op outside: allowed
+    with pytest.raises(RuntimeError, match="[Ii]nference"):
+        z.add_(1)
+    with pytest.raises(RuntimeError, match="[Ii]nference"):
+        torch.view_as_real(z).fill_(0)
+
+
+@pytest.mark.parametrize("device", ["cpu", HPU])
+def test_backend_select_kernels_return_like_torch(device):
+    """The BackendSelect kernels (unboxed for the common overloads) return self for in-place forms and out for out=,
+    on CPU tensors (handed on at once) and HPU ones, in and out of inference mode."""
+    for inference in (False, True):
+        with torch.inference_mode(inference):
+            x = torch.tensor([1.0, 2.0]).to(device)
+            y = torch.tensor([3.0, 4.0]).to(device)
+            assert x.add_(y) is x and x.mul_(2) is x and x.sub_(y, alpha=2) is x and x.div_(2.0) is x
+            assert torch.equal(x.cpu(), torch.tensor([1.0, 2.0]))
+            out = torch.empty(2).to(device)
+            assert torch.add(x, y, alpha=3, out=out) is out and torch.mul(x, y, out=out) is out
+            assert torch.div(x, y, out=out) is out and torch.equal(out.cpu(), torch.tensor([1 / 3, 0.5]))
+            zc = torch.empty(2, dtype=C64).to(device)
+            assert torch.mul(x, 2j, out=zc) is zc  # real x, complex scalar, complex out
+            bits_equal(zc, torch.tensor([1.0, 2.0]) * 2j)
+            bits_equal(torch.div(x, y, rounding_mode="floor"), torch.tensor([0.0, 0.0]))
+            bits_equal(torch.rsub(x, 1j), 1j - torch.tensor([1.0, 2.0]))
