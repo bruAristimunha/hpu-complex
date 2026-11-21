@@ -91,6 +91,14 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   `as_strided`, and torch's meta of `linalg_eig` gives contiguous
   eigenvectors where the kernel returns column-major ones. Without these two
   patches the compiled `eig`/`eigvals`/`qr` gradients were wrong with no error.
+  Three more, after AOT autograd (spd_learn's `Green`, compiled in eager mode, trained with wavelet gradients
+  up to 9x off before them, with no error): a graph with nodes that run eagerly here is partitioned by Habana's
+  Python partitioner, not its C++ one (with the same partitions, the C++ one's fused graph took three eager 0-d
+  gradients in another order and returned one doubled; `repro/compiled_green_bisect.py`); the backward of
+  `x * 2j` (`mul(grad, _conj(2j))`, a complex128 constant once traced) gets the conjugated Python scalar back,
+  so it stays complex64 on the card as in eager mode instead of going through complex128 host memory (and a
+  backward graph that still holds complex128 runs eagerly as a whole); and Habana's pass that drops the views
+  around a `bmm` leaves complex `bmm` nodes alone (they run on this 3-D kernel).
 - `complex128` (e.g. `torch.linalg.eig`/`eigvals` of a float64 matrix):
   Gaudi2 holds float64 at float32 precision (`1 + 1e-12` copied to the
   card and back is `1`), so a complex128 in Habana storage could not keep
@@ -131,6 +139,7 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
 | float32 `linalg.eig`/`eigvals` (complex output) forward + backward, incl. `.mT` and sliced inputs (relative) | ≤ 2.8e-06 |
 | spd_learn `Green` train step (22 channels, batch 32): gradients vs a CPU float64 run, next to the CPU's own float32 error (the card is about 7x float32's error, worst `spd_layers.0.shrinkage_logit`) | 1.1e-03 / 1.5e-04 |
 | spd_learn `Green` train step in lazy mode (`PT_HPU_LAZY_MODE=1`), same comparison; 53-80 ms/step, no hpu_complex CPU op | 1.2e-03 / 1.5e-04 |
+| spd_learn `Green` under `torch.compile(backend="hpu_backend")`, eager mode: loss and gradients vs the same model run eagerly on the card (`repro/compiled_green.py`; 9.4 on main) | 1.0e-04 |
 | real HPU tensor and a Python complex scalar (`*`, `+`, `-`, `/`, rsub, alpha, 0-d, strided; bf16/int/bool → complex64, float64 → complex128), eager and lazy (relative); in-place / `out=` into a real tensor raise as torch | ≤ 7.4e-08 |
 | complex `exp` (C99 edges: `exp(inf + 0j) = inf + 0j`), `neg`, `masked_fill_`, `cat` (real operands, conj, legacy empties), `linalg.vector_norm` (ord, dim, keepdim), with gradients, eager and lazy | ≤ 4.8e-07 |
 
