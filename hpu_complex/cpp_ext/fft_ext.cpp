@@ -175,6 +175,10 @@ c10::Storage lazy_storage(const at::Tensor& owner) {
   auto it = storages.of.find(key);
   if (it != storages.of.end()) {
     if (auto alive = it->second.second.lock()) {
+      // The Habana storage may have grown since (r.resize_() on the real tensor): the lazy storage reports its size.
+      if (alive->nbytes() < owner.storage().nbytes()) {
+        alive->set_nbytes(owner.storage().nbytes());
+      }
       return c10::Storage(std::move(alive));
     }
   }
@@ -479,15 +483,17 @@ void check_host_devices(std::initializer_list<const at::Tensor*> operands) {
 // engine casts that gradient back to complex64 anyway. Those stay complex64 on the card, as before (README Limits).
 // A ComplexHalf (complex32) result type (a 0-d complex64 with a float16 tensor) raises: there is no complex32 on the
 // HPU, and the pair kernels would return complex64.
+void check_not_complex32(const at::Tensor& a, const at::Tensor& b) {
+  TORCH_CHECK(at::native::result_type(a, b) != at::kComplexHalf, "hpu_complex: the result type of ", a.scalar_type(),
+              " and ", b.scalar_type(), " is ComplexHalf (complex32), which is not supported on HPU: cast to complex64 "
+              "first");
+}
+
+// Called first by every binary kernel (before its host path too: a 0-d complex128 with a float16 vector is complex32).
 bool promotes_to_complex128(const at::Tensor& a, const at::Tensor& b) {
+  check_not_complex32(a, b);
   const auto cpu_scalar = [](const at::Tensor& t) { return t.defined() && t.is_cpu() && t.dim() == 0; };
-  if (cpu_scalar(a) || cpu_scalar(b)) {
-    return false;
-  }
-  const auto result = at::native::result_type(a, b);  // no dispatch
-  TORCH_CHECK(result != at::kComplexHalf, "hpu_complex: the result type of ", a.scalar_type(), " and ",
-              b.scalar_type(), " is ComplexHalf (complex32), which is not supported on HPU: cast to complex64 first");
-  return result == at::kComplexDouble;
+  return !cpu_scalar(a) && !cpu_scalar(b) && at::native::result_type(a, b) == at::kComplexDouble;  // no dispatch
 }
 
 // TensorIterator's check on a written argument: the result dtype must cast to it (a complex result into a real
@@ -965,7 +971,7 @@ bool both_real(const std::optional<at::Tensor>& pa, const std::optional<at::Tens
 
 at::Tensor mul_pu1(const at::Tensor& a, const at::Tensor& b) {
   check_host_devices({&a, &b});
-  if (any_host(a, b) || promotes_to_complex128(a, b)) {
+  if (promotes_to_complex128(a, b) || any_host(a, b)) {
     return from_cpu(at::mul(cpu_operand(a), cpu_operand(b)), device_of(a, b));
   }
   HPU_COMPLEX_NO_AUTOCAST;
@@ -1013,7 +1019,7 @@ at::Tensor real_div(const at::Tensor& pair, const at::Tensor& c) {
 
 at::Tensor div_pu1(const at::Tensor& a, const at::Tensor& b) {
   check_host_devices({&a, &b});
-  if (any_host(a, b) || promotes_to_complex128(a, b)) {
+  if (promotes_to_complex128(a, b) || any_host(a, b)) {
     return from_cpu(at::div(cpu_operand(a), cpu_operand(b)), device_of(a, b));
   }
   HPU_COMPLEX_NO_AUTOCAST;
@@ -1048,7 +1054,7 @@ at::Tensor add_pairs(const at::Tensor& a, const at::Tensor& b, const at::Scalar&
 
 at::Tensor add_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha) {
   check_host_devices({&a, &b});
-  if (any_host(a, b) || promotes_to_complex128(a, b)) {
+  if (promotes_to_complex128(a, b) || any_host(a, b)) {
     return from_cpu(at::add(cpu_operand(a), cpu_operand(b), alpha), device_of(a, b));
   }
   return add_pairs(a, b, alpha);
@@ -1102,7 +1108,7 @@ at::Tensor add_pairs(const at::Tensor& a, const at::Tensor& b, const at::Scalar&
 
 at::Tensor sub_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha) {
   check_host_devices({&a, &b});
-  if (any_host(a, b) || promotes_to_complex128(a, b)) {
+  if (promotes_to_complex128(a, b) || any_host(a, b)) {
     return from_cpu(at::sub(cpu_operand(a), cpu_operand(b), alpha), device_of(a, b));
   }
   if (a.is_complex() || b.is_complex()) {
@@ -1168,7 +1174,7 @@ at::Tensor where_pu1(const at::Tensor& cond, const at::Tensor& a, const at::Tens
       dev = t->device();
     }
   }
-  if (any_host(a, b) || promotes_to_complex128(a, b)) {
+  if (promotes_to_complex128(a, b) || any_host(a, b)) {
     check_host_devices({&a, &b});
     return from_cpu(at::where(cpu_operand(cond), cpu_operand(a), cpu_operand(b)), device_of(a, b));
   }
@@ -2189,7 +2195,12 @@ at::Tensor vector_norm_pu1(const at::Tensor& self, const at::Scalar& ord, at::Op
                           : ratio.isinf().logical_and(mod.isfinite());
   terms = at::where(lost, ((mod.log() - scale.log()) * p).exp(), terms);
   auto sum = at::linalg_vector_norm(terms, 1, dim, keepdim, std::nullopt);  // the terms are >= 0 (or NaN)
-  return with_nan(sum.pow(1.0 / p) * scale.view(sum.sizes()));
+  // sum^(1 / ord) overflows float32 before the rescale (3 x 1e-30 at ord 0.01: 3^100 = 5e47): exp(log(sum) / ord +
+  // log(scale)) instead. A zero sum keeps the power (no log(0) in the gradient: torch's zero gradient at z = 0).
+  const auto positive = sum > 0;
+  const auto safe = at::where(positive, sum, at::ones_like(sum));
+  const auto s = scale.view(sum.sizes());
+  return with_nan(at::where(positive, (safe.log() / p + s.log()).exp(), sum.pow(1.0 / p) * s));
 }
 
 at::Tensor& vector_norm_out_pu1(const at::Tensor& self, const at::Scalar& ord, at::OptionalIntArrayRef dim,

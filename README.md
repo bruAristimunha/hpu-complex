@@ -65,7 +65,7 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   (`|3e19 + 3e19j|` was inf, `|1e-30|` was 0). `vector_norm` scales every order too (by the largest modulus over
   `dim`, the smallest for a negative order), so a norm that fits in float32 is not lost (torch's own complex64
   kernel gives inf for `[1e-30, 3e19, 1+1j]` and 0 for `[1e-25 + 1e-25j, 2e-25j]`); for `|ord| < 1` a term whose
-  ratio to the scale under- or overflows comes from logarithms (`‖[1e20, 1e-30]‖₀.₀₁ = 8.57e31`, not 1e20). A NaN
+  ratio to the scale under- or overflows, and the final power, come from logarithms (`‖[1e20, 1e-30]‖₀.₀₁ = 8.57e31`, not 1e20). A NaN
   modulus anywhere makes the norm NaN, an infinite part makes its element's modulus inf (`hypot(inf, nan)`), as
   torch. `exp` follows C99 cexp at
   non-finite inputs and computes e^a in two halves, so `exp(88.75 + i pi/4) = 2.47e38 (1 + i)` fits (torch's
@@ -73,7 +73,7 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   torch's (`1 / 1e20j` is `-1e-20j`, not 0), also by a real tensor (`(inf + 1j) / 2` is `inf + nan j`, as torch; zero signs, a zero divisor next to an infinite
   part and torch's own `1 / c` overflow are left as the per-part quotient gives them, kept for speed: README Limits).
   complex64 with a float64 HPU tensor is complex128, in host memory; a float64 `self` of `add_`/`mul_` with a
-  complex operand raises torch's cast error, and a complex32 result type (a 0-d complex64 with float16) raises.
+  complex operand raises torch's cast error, and a complex32 result type (a 0-d complex64 or complex128 with float16) raises.
 - Complex `mm`/`bmm` (so `@`, `matmul`, `einsum` products) are one real GEMM on the card:
   `[ar | ai] @ [[br, bi], [-bi, br]] = [cr | ci]`, conjugate operands included (they reach `mm`/`bmm`
   unresolved). Products below 2²² multiply-adds (batch·m·k·n) go to the CPU instead, one copy each way, where
@@ -258,7 +258,9 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   (`inf + 0i` gives `inf + nan i`), and exact-zero signs can differ (the exact form cost 25 ms of a 75 ms lazy step;
   a Python scalar, a real operand and a complex `alpha`, `1 + 0j` included, keep torch's form). A complex64 tensor
   divided by a real one is the per-part quotient plus torch's NaN cross terms (2 ops; the exact Smith form cost lazy
-  Green 18 ms a step): NaN placement as torch, zero signs and the last ulp can differ. A complex64 HPU tensor with a 0-d CPU
+  Green 18 ms a step): NaN placement as torch, zero signs and the last ulp can differ, and so does a division by `-0.0`: the
+  quotient gives `(1 + 1j) / -0.0 = -inf - inf j`, torch's own result there depends on its build (`-inf + inf j` on an
+  ARM Mac, `inf + inf j` where `std::abs(-0.0)` is `+0`). A complex64 HPU tensor with a 0-d CPU
   complex128 or float64 tensor stays complex64 on the card, where torch gives complex128: autograd hands saved
   Python scalars to the backward as such tensors, and complex128 would route every such gradient through host
   memory and a device sync (+12 ms a lazy step); torch's engine casts the gradient back to complex64 anyway. A real

@@ -224,8 +224,11 @@ def test_compiled_card_graph_is_not_reused_for_a_host_backed_input():
         card, host = h([1, 2]), h([7], C128).view(C64)
         assert card.shape == host.shape and card.stride() == host.stride()
         assert torch.equal(f(card).cpu(), card.cpu().view(torch.float32) + 1)
+        assert calls == [[False]], calls  # the card call reached the compiled graph
         assert torch.equal(f(host).cpu(), host.cpu().view(torch.float32) + 1)
-        assert all(not any(flags) for flags in calls), calls  # main: [[False], [True]], the host input in the graph
+        assert calls == [[False]], calls  # main: [[False], [True]], the host input in the graph
+        assert torch.equal(f(card).cpu(), card.cpu().view(torch.float32) + 1)
+        assert calls == [[False], [False]], calls  # and card calls still do afterwards
     finally:
         torch._dynamo.reset()
         for table, entry in zip((registry._COMPILER_FNS, registry._BACKENDS), saved):
@@ -448,3 +451,58 @@ def test_complex_scalar_out_forms_compute_on_the_hpu_side(call):
     call(x.to(HPU), got)
     call(x, ref)
     bits_equal(got, ref)
+
+
+# ---- final round of PR #15's review --------------------------------------------------------------------------
+
+
+def test_lazy_storage_follows_the_owners_growth():
+    """A complex tensor made over a Habana storage that grew since an earlier one (r.resize_) gets the cached lazy
+    storage at the new size: main reported 16 bytes over a 32-byte owner (set_ raised, storage().cpu() truncated)."""
+    with lazy_flag():
+        r = h([0.0] * 4, torch.float32)
+        a = torch.view_as_complex(r.view(2, 2))
+        r.resize_(8)
+        c = torch.view_as_complex(r.view(4, 2))
+        assert c.untyped_storage().nbytes() == a.untyped_storage().nbytes() == 32
+        t = torch.empty(0, dtype=C64, device=HPU).set_(c.untyped_storage(), 0, (4,))
+        assert t.shape == (4,)
+
+
+def test_lazy_cat_out_over_an_untagged_real_view_raises():
+    """Lazy mode: z.view(float32) is Habana's own view of the storage's Habana tensor, untagged and over the Habana
+    storage, not z's lazy storage: check_lazy_overlap's untagged-source branch."""
+    with lazy_flag():
+        z = h([1 + 2j, 3 + 4j])
+        v = z.view(torch.float32)
+        assert not tagged(v) and not v.untyped_storage()._cdata == z.untyped_storage()._cdata
+        with pytest.raises(RuntimeError, match="single memory location|refer to any of the output"):
+            torch.cat([v], out=z)
+        assert torch.equal(z.cpu(), torch.tensor([1 + 2j, 3 + 4j]))
+
+
+@pytest.mark.parametrize("call", [lambda a, b: torch.add(a, b), lambda a, b: torch.mul(a, b),
+                                  lambda a, b: torch.sub(a, b), lambda a, b: torch.div(a, b),
+                                  lambda a, b: torch.where(b > 0, a, b)])
+def test_complex32_result_raises_on_the_host_path_too(call):
+    """A 0-d complex128 HPU tensor with a float16 vector is complex32 (torch.result_type): raises like the card path
+    (main returned a complex32 HPU tensor from the host path)."""
+    with pytest.raises(RuntimeError, match="ComplexHalf"):
+        call(h(1j, C128), h([1, 2], torch.float16))
+
+
+@pytest.mark.parametrize("values,ord", [([1e-30] * 3, 0.01), ([1e30] * 3, -0.01), ([1e-30] * 10000, 0.1),
+                                        ([1e-20] * 3, 0.01), ([1.0] * 3, 0.01)])
+def test_vector_norm_small_orders_rescale_before_overflow(values, ord):
+    """sum^(1 / ord) overflowed float32 before the rescale (inf for 3 x 1e-30 at ord 0.01, torch's exact 5.15e17)."""
+    z = torch.tensor(values, dtype=C64)
+    got = torch.linalg.vector_norm(z.to(HPU), ord).cpu()
+    ref = torch.linalg.vector_norm(z.to(C128), ord).float()
+    torch.testing.assert_close(got, ref, rtol=4e-6 / abs(ord), atol=0)
+
+
+def test_vector_norm_small_order_gradient_at_zero_stays_finite():
+    for o in (0.5, 0.01, -0.5):
+        b = h([0j, 0j]).requires_grad_()
+        torch.linalg.vector_norm(b, o).backward()
+        assert torch.equal(b.grad.cpu(), torch.zeros(2, dtype=C64)), (o, b.grad)
