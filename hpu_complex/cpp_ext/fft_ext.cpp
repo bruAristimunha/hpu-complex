@@ -2195,12 +2195,19 @@ at::Tensor vector_norm_pu1(const at::Tensor& self, const at::Scalar& ord, at::Op
                           : ratio.isinf().logical_and(mod.isfinite());
   terms = at::where(lost, ((mod.log() - scale.log()) * p).exp(), terms);
   auto sum = at::linalg_vector_norm(terms, 1, dim, keepdim, std::nullopt);  // the terms are >= 0 (or NaN)
-  // sum^(1 / ord) overflows float32 before the rescale (3 x 1e-30 at ord 0.01: 3^100 = 5e47): exp(log(sum) / ord +
-  // log(scale)) instead. A zero sum keeps the power (no log(0) in the gradient: torch's zero gradient at z = 0).
-  const auto positive = sum > 0;
-  const auto safe = at::where(positive, sum, at::ones_like(sum));
+  // sum^(1 / ord) can over- or underflow float32 before the rescale (3 x 1e-30 at ord 0.01: 3^100 = 5e47): there,
+  // and only there, exp(log(sum) / ord + log(scale)) (the log form costs ~|log| ulps, 2.7e-6 at ord 0.5 measured, so
+  // the direct power stays wherever it is a normal float). Each branch reads a safe input (1 where it is not taken),
+  // so neither puts log(0) or 0 * inf into the gradient (torch's zero gradient at z = 0).
+  const auto inv = 1.0 / p;
   const auto s = scale.view(sum.sizes());
-  return with_nan(at::where(positive, (safe.log() / p + s.log()).exp(), sum.pow(1.0 / p) * s));
+  const auto probe = sum.pow(inv);
+  const auto use_log = (sum > 0).logical_and(
+      probe.isfinite().logical_and(probe >= std::numeric_limits<float>::min()).logical_not());
+  const auto one = at::ones_like(sum);
+  const auto by_log = (at::where(use_log, sum, one).log() * inv + s.log()).exp();
+  const auto by_pow = at::where(use_log, one, sum).pow(inv) * s;
+  return with_nan(at::where(use_log, by_log, by_pow));
 }
 
 at::Tensor& vector_norm_out_pu1(const at::Tensor& self, const at::Scalar& ord, at::OptionalIntArrayRef dim,

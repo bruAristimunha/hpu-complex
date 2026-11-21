@@ -501,6 +501,15 @@ def test_vector_norm_small_orders_rescale_before_overflow(values, ord):
     torch.testing.assert_close(got, ref, rtol=4e-6 / abs(ord), atol=0)
 
 
+@pytest.mark.parametrize("ord", [0.5, 0.25, -0.5, 0.7])
+def test_vector_norm_small_orders_keep_float32_accuracy(ord):
+    """The direct power wherever it fits: the log form alone was 2.7e-6 off at ord 0.5 (pu1_check's 1e-6 row)."""
+    z = torch.tensor([1e-30, 3e19 + 3e19j, 1e-25j], dtype=C64)
+    got = torch.linalg.vector_norm(z.to(HPU), ord).cpu()
+    ref = torch.linalg.vector_norm(z.to(C128), ord).float()
+    torch.testing.assert_close(got, ref, rtol=1e-6, atol=0)
+
+
 def test_vector_norm_small_order_gradient_at_zero_stays_finite():
     for o in (0.5, 0.01, -0.5):
         b = h([0j, 0j]).requires_grad_()
