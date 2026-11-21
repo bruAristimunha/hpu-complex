@@ -342,11 +342,13 @@ def test_lazy_mode_guard_and_real_safety():
     assert spec.shape == (2, 33, 2) and stft.shape[0] == 2
 
     if not is_lazy():
-        # Verify the lazy-mode guard is wired and toggleable via set_lazy_mode.
+        # Verify the lazy-mode guard is wired and toggleable via set_lazy_mode: in lazy mode it refuses complex64
+        # under torch.inference_mode (complex64 itself runs there, on lazy views).
         torch.ops.hpu_complex.set_lazy_mode(True)
         try:
             try:
-                torch.zeros(2, 2, dtype=torch.complex64, device=hpu)
+                with torch.inference_mode():
+                    torch.zeros(2, 2, dtype=torch.complex64, device=hpu)
             except RuntimeError as exc:
                 assert "PT_HPU_LAZY_MODE=0" in str(exc)
             else:
@@ -373,10 +375,15 @@ def test_lazy_mode_guard_and_real_safety():
         ("torch.linalg.eig(f32)", lambda: torch.linalg.eig(real_mat)),
         ("torch.linalg.eigvals(f32)", lambda: torch.linalg.eigvals(real_mat)),
     ):
-        try:
-            fn()
-        except RuntimeError as exc:
-            assert "PT_HPU_LAZY_MODE=0" in str(exc), (name, str(exc))
-        else:
-            raise AssertionError(f"Expected RuntimeError for {name} in lazy mode")
-    print("lazy mode guard + real safety: OK")
+        out = fn()  # complex64 runs in lazy mode now (lazy_check.py compares the values with the CPU)
+        htcore.mark_step()
+        for t in out if isinstance(out, tuple) else (out,):
+            assert torch.isfinite(torch.view_as_real(t.cpu())).all(), name
+    try:
+        with torch.inference_mode():
+            torch.fft.rfft(real_sig)
+    except RuntimeError as exc:
+        assert "PT_HPU_LAZY_MODE=0" in str(exc), str(exc)
+    else:
+        raise AssertionError("Expected RuntimeError for complex64 under inference_mode in lazy mode")
+    print("lazy mode complex64 + guard + real safety: OK")

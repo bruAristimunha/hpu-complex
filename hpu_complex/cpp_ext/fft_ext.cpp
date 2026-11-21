@@ -44,6 +44,7 @@
 #include <ATen/ops/view_as_complex_native.h>
 #include <ATen/native/CPUFallback.h>
 #include <ATen/native/Resize.h>
+#include <ATen/native/TypeProperties.h>
 #include <c10/core/InferenceMode.h>
 #include <c10/core/impl/alloc_cpu.h>
 #include <c10/core/impl/LocalDispatchKeySet.h>
@@ -87,10 +88,106 @@ bool tagged(const at::Tensor& t) {
   return t.defined() && t.key_set().has(DispatchKey::PrivateUse1);
 }
 
+std::atomic<int>& lazy_mode_flag() {
+  static std::atomic<int> flag{-1};
+  return flag;
+}
+
+void set_lazy_mode(bool enabled) {
+  lazy_mode_flag().store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+bool is_lazy_mode() {
+  const int flag = lazy_mode_flag().load(std::memory_order_relaxed);
+  if (flag >= 0) {
+    return flag != 0;
+  }
+  const char* env = std::getenv("PT_HPU_LAZY_MODE");
+  return env != nullptr && std::string_view(env) != "0";
+}
+
+// The lazy-mode guard. complex64 runs in lazy mode on lazy_view (the storage's Habana tensor), with one exception
+// that it raises for, cleanly instead of deep inside autograd: torch.inference_mode. Habana's views of tensors made
+// under it are inference tensors, and autograd's view tracking (view_as_real, .real of a complex tensor) cannot set
+// their version counter ("Cannot set version_counter for inference tensor", measured on Gaudi2, bridge 1.21.4).
+// torch.no_grad() works. lazy_view itself raises for a complex storage without a Habana tensor behind it.
+void check_lazy_inference(const char* op) {
+  TORCH_CHECK(!c10::InferenceMode::is_enabled(), "hpu_complex: ", op, " under torch.inference_mode is not supported "
+              "in Habana lazy mode (PT_HPU_LAZY_MODE=1): Habana's views of its tensors would be inference tensors, "
+              "which complex views cannot track. Use torch.no_grad() instead, or eager mode (PT_HPU_LAZY_MODE=0).");
+}
+
+// ---- lazy mode: the Habana tensor behind a complex storage -------------------------------
+//
+// In lazy mode (PT_HPU_LAZY_MODE=1) Habana's kernels take only tensors its own ops made: a bare TensorImpl over the
+// same storage (view_of, the eager path of habana_view) raises "GetHbLazyTensor for a non lazy tensor". So a complex64
+// tensor made in lazy mode gets a storage of its own whose DataPtr context holds the Habana float tensor it lives in
+// (make_complex_empty's allocation, the result pair that complex_view tags, the real input of view_as_complex /
+// view(complex64)), and the float views the kernels compute on are Habana's own as_strided views of that tensor: the
+// lazy graph sees every read and write of a complex tensor as a view of one of its own tensors. That storage has the
+// Habana storage's size; its data pointer is the context's address (overlap checks compare addresses; nothing reads
+// through it), and it releases the Habana tensor when the last complex tensor over it goes.
+struct LazyOwner {
+  at::Tensor tensor;
+};
+
+std::atomic<int64_t> lazy_owners_alive{0};
+
+void lazy_owner_free(void* ctx) {
+  delete static_cast<LazyOwner*>(ctx);
+  lazy_owners_alive.fetch_sub(1);
+}
+
+c10::Storage lazy_storage(const at::Tensor& owner) {
+  auto* ctx = new LazyOwner{owner};
+  lazy_owners_alive.fetch_add(1);
+  return c10::Storage(c10::Storage::use_byte_size_t(), owner.storage().nbytes(),
+                      c10::DataPtr(ctx, ctx, &lazy_owner_free, owner.device()), /*allocator=*/nullptr,
+                      /*resizable=*/false);
+}
+
+at::Tensor lazy_base(const at::Tensor& t) {
+  const auto& dp = t.storage().data_ptr();
+  return dp.get_deleter() == &lazy_owner_free ? static_cast<LazyOwner*>(dp.get_context())->tensor : at::Tensor();
+}
+
+// The lazy-mode habana_view: a view of base's storage made by Habana's own ops on the storage's Habana tensor.
+at::Tensor lazy_view(const at::Tensor& base, caffe2::TypeMeta dtype, c10::IntArrayRef sizes, c10::IntArrayRef strides,
+                     int64_t storage_offset) {
+  check_lazy_inference("a complex64 HPU tensor");
+  // A plain Habana tensor (dense_copy, complex_result of a float result) is its own owner.
+  auto owner = tagged(base) ? lazy_base(base) : base;
+  TORCH_CHECK(owner.defined(), "hpu_complex: in Habana lazy mode (PT_HPU_LAZY_MODE=1) this complex64 HPU tensor has no "
+              "Habana tensor behind its storage (made in eager mode, or by set_ on a Habana storage): run in eager mode "
+              "(PT_HPU_LAZY_MODE=0)");
+  if (owner.dtype() != dtype) {
+    TORCH_CHECK(owner.dtype().itemsize() == dtype.itemsize(), "hpu_complex: lazy mode: no ", dtype.name(),
+                " view of a ", owner.dtype().name(), " storage");
+    owner = owner.view(dtype.toScalarType());
+  }
+  // Always a new view (never owner itself): view ops (view_as_real, .real) return it, and autograd makes its result
+  // a differentiable view, which a tensor with autograd metadata already (a user's input) cannot become.
+  return owner.as_strided(sizes, strides, storage_offset);
+}
+
 at::Tensor view_of(const at::Tensor& base, DispatchKeySet keys, caffe2::TypeMeta dtype, c10::IntArrayRef sizes,
                    c10::IntArrayRef strides, int64_t storage_offset) {
   auto result = at::detail::make_tensor<at::TensorImpl>(c10::TensorImpl::VIEW, c10::Storage(base.storage()), keys,
                                                         dtype);
+  auto* impl = result.unsafeGetTensorImpl();
+  impl->set_sizes_and_strides(sizes, strides);
+  impl->set_storage_offset(storage_offset);
+  return result;
+}
+
+// A complex64 view (tagged) of base's storage: base a tagged tensor (same storage), or a Habana float tensor (in lazy
+// mode over a lazy_storage that holds it).
+at::Tensor complex_of(const at::Tensor& base, c10::IntArrayRef sizes, c10::IntArrayRef strides, int64_t storage_offset) {
+  const auto dtype = caffe2::TypeMeta::Make<c10::complex<float>>();
+  if (!is_lazy_mode() || !base.is_hpu() || tagged(base)) {
+    return view_of(base, complex_keys(), dtype, sizes, strides, storage_offset);
+  }
+  auto result = at::detail::make_tensor<at::TensorImpl>(c10::TensorImpl::VIEW, lazy_storage(base), complex_keys(), dtype);
   auto* impl = result.unsafeGetTensorImpl();
   impl->set_sizes_and_strides(sizes, strides);
   impl->set_storage_offset(storage_offset);
@@ -105,16 +202,24 @@ at::Tensor view_of(const at::Tensor& base, DispatchKeySet keys, caffe2::TypeMeta
 // over the full storage.
 at::Tensor habana_view(const at::Tensor& base, caffe2::TypeMeta dtype, c10::IntArrayRef sizes, c10::IntArrayRef strides,
                        int64_t storage_offset) {
+  // Lazy mode: the same layouts, built from the storage's Habana tensor (lazy_view); view_of only describes them.
+  const bool lazy = is_lazy_mode() && base.is_hpu();
   auto view = view_of(base, hpu_float_keys(), dtype, sizes, strides, storage_offset);
   bool expanded = false;
   for (size_t i = 0; i < sizes.size(); ++i) {
     expanded |= sizes[i] > 1 && strides[i] == 0;
   }
-  if (storage_offset == 0 && view.is_contiguous() && !expanded) {
+  if (!lazy && storage_offset == 0 && view.is_contiguous() && !expanded) {
     return view;
   }
   const auto base_numel = static_cast<int64_t>(base.storage().nbytes() / dtype.itemsize());
   if (view.dim() >= 6 && !expanded && view.is_non_overlapping_and_dense()) {
+    // Lazy mode: Habana's lazy graphs read this permute block wrong when it starts at offset 0 (permuted 5-D complex:
+    // errors up to 12, Gaudi2, bridge 1.21.4; at an offset, behind a narrow, they read it right): raise instead.
+    TORCH_CHECK(!lazy || storage_offset != 0 || view.is_contiguous(), "hpu_complex: a permuted complex64 HPU tensor of rank 5 or more (a float "
+                "pair of rank ", view.dim(), ") is not supported in Habana lazy mode (PT_HPU_LAZY_MODE=1): its lazy "
+                "graph reads it wrong. Make it contiguous at rank 4 or less first, or run in eager mode "
+                "(PT_HPU_LAZY_MODE=0).");
     // The dims from the largest stride to the smallest, as a contiguous block, permuted back.
     const auto n = static_cast<int64_t>(sizes.size());
     std::vector<int64_t> order(n), block(n), block_strides(n, 1), dims(n);
@@ -127,15 +232,19 @@ at::Tensor habana_view(const at::Tensor& base, caffe2::TypeMeta dtype, c10::IntA
     for (int64_t k = n - 2; k >= 0; --k) {
       block_strides[k] = block_strides[k + 1] * block[k + 1];
     }
-    if (storage_offset == 0) {
+    if (storage_offset == 0 && !lazy) {
       return view_of(base, hpu_float_keys(), dtype, block, block_strides, 0).permute(dims);
     }
     const int64_t view_numel = view.numel();
     const int64_t off = view_numel == 0 ? std::min(storage_offset, base_numel) : storage_offset;
-    return view_of(base, hpu_float_keys(), dtype, {base_numel}, {1}, 0)
+    return (lazy ? lazy_view(base, dtype, {base_numel}, {1}, 0)
+                 : view_of(base, hpu_float_keys(), dtype, {base_numel}, {1}, 0))
         .narrow(0, off, view_numel)
         .view(block)
         .permute(dims);
+  }
+  if (lazy) {
+    return lazy_view(base, dtype, sizes, strides, storage_offset);
   }
   const int64_t inner = base_numel % 2 == 0 ? 2 : 1;
   return at::as_strided(view_of(base, hpu_float_keys(), dtype, {base_numel / inner, inner}, {inner, 1}, 0), sizes,
@@ -163,8 +272,7 @@ at::Tensor complex_view(const at::Tensor& pair) {
   auto sizes = pair.sizes().vec();
   sizes.pop_back();
   if (pair.numel() == 0) {  // no element to address: the strides are free, kept contiguous
-    return view_of(pair, complex_keys(), caffe2::TypeMeta::Make<c10::complex<float>>(), sizes,
-                   c10::contiguous_strides(sizes), 0);
+    return complex_of(pair, sizes, c10::contiguous_strides(sizes), 0);
   }
   auto strides = pair.strides().vec();
   strides.pop_back();
@@ -179,8 +287,7 @@ at::Tensor complex_view(const at::Tensor& pair) {
     strides[i] /= 2;
   }
   TORCH_CHECK(pair.storage_offset() % 2 == 0, "hpu_complex: odd storage offset");
-  return view_of(pair, complex_keys(), caffe2::TypeMeta::Make<c10::complex<float>>(), sizes, strides,
-                 pair.storage_offset() / 2);
+  return complex_of(pair, sizes, strides, pair.storage_offset() / 2);
 }
 
 // complex [...] -> float [..., 2] over the same storage, ignoring a conjugate bit: plain HPU keys for a tagged
@@ -220,7 +327,7 @@ at::Tensor make_complex_empty(c10::IntArrayRef size, c10::IntArrayRef stride, at
   // Storage for the strided layout, in floats (two per complex element); ATen's sizing checks rank and overflow.
   const auto floats = at::detail::computeStorageNbytes(size, stride, sizeof(c10::complex<float>)) / sizeof(float);
   auto flat = at::empty({static_cast<int64_t>(floats)}, at::TensorOptions().dtype(at::kFloat).device(device));
-  return view_of(flat, complex_keys(), caffe2::TypeMeta::Make<c10::complex<float>>(), size, stride, 0);
+  return complex_of(flat, size, stride, 0);
 }
 
 // ---- complex128: HPU tensors held in host memory, computed on the CPU in float64 ---------
@@ -425,33 +532,10 @@ bool complex128_on_hpu(std::optional<at::ScalarType> dtype, DispatchKeySet ks) {
   return dtype.has_value() && *dtype == at::kComplexDouble && ks.highestPriorityTypeId() == DispatchKey::HPU;
 }
 
-std::atomic<int>& lazy_mode_flag() {
-  static std::atomic<int> flag{-1};
-  return flag;
-}
-
-void set_lazy_mode(bool enabled) {
-  lazy_mode_flag().store(enabled ? 1 : 0, std::memory_order_relaxed);
-}
-
-bool is_lazy_mode() {
-  const int flag = lazy_mode_flag().load(std::memory_order_relaxed);
-  if (flag >= 0) {
-    return flag != 0;
-  }
-  const char* env = std::getenv("PT_HPU_LAZY_MODE");
-  return env != nullptr && std::string_view(env) != "0";
-}
-
 void check_not_lazy(const at::Device& device, const char* op) {
-  TORCH_CHECK(
-      !(device.is_hpu() && is_lazy_mode()),
-      "hpu_complex: ", op,
-      " is not supported in Habana lazy mode (PT_HPU_LAZY_MODE=1): "
-      "HbLazyTensor cannot wrap PrivateUse1 complex64 views. "
-      "Run in eager mode (PT_HPU_LAZY_MODE=0) -- optionally with "
-      "torch.compile(model, backend=\"hpu_backend\") for simple models -- "
-      "or use the float-pair API (hpu_complex.rfft / hpu_complex.stft).");
+  if (device.is_hpu() && is_lazy_mode()) {
+    check_lazy_inference(op);
+  }
 }
 
 at::Tensor empty_backend_select(c10::SymIntArrayRef size, std::optional<at::ScalarType> dtype,
@@ -496,6 +580,15 @@ at::Tensor scalar_tensor_backend_select(const at::Scalar& s, std::optional<at::S
   auto ks = factory_keys(dtype, layout, device);
   if (complex128_on_hpu(dtype, ks)) {
     return at::scalar_tensor(s, at::TensorOptions().dtype(at::kComplexDouble)).to(*device);
+  }
+  if (complex_on_hpu(dtype, ks)) {  // lazy mode: Habana's own scalar_tensor kernel would get the complex dtype
+    check_not_lazy(*device, "complex64 tensor creation on HPU");
+    auto t = make_complex_empty({}, {}, *device);
+    auto pair = pair_view(t);
+    const auto c = s.toComplexDouble();
+    pair.select(-1, 0).fill_(c.real());
+    pair.select(-1, 1).fill_(c.imag());
+    return t;
   }
   return at::_ops::scalar_tensor::redispatch(ks, s, dtype, layout, device, pin_memory);
 }
@@ -657,7 +750,7 @@ at::Tensor view_as_complex_hpu(const at::Tensor& self) {
   auto v = at::native::view_as_complex(self);
   TORCH_CHECK(self.scalar_type() == at::kFloat, "hpu_complex: view_as_complex on HPU supports float32 (complex64) "
               "only, got ", self.scalar_type());
-  return view_of(self, complex_keys(), v.dtype(), v.sizes(), v.strides(), v.storage_offset());
+  return complex_of(self, v.sizes(), v.strides(), v.storage_offset());
 }
 
 // x.view(torch.complex64) of a real HPU tensor: torch's view_dtype (CompositeExplicitAutograd) would keep the HPU
@@ -670,7 +763,7 @@ at::Tensor view_dtype_hpu(const at::Tensor& self, at::ScalarType dtype) {
   check_not_lazy(self.device(), "Tensor.view(complex dtype)");
   TORCH_CHECK(dtype == at::kComplexFloat, "hpu_complex: complex64 only on HPU, got ", dtype);
   auto v = at::native::view_dtype(self, dtype);
-  return view_of(self, complex_keys(), v.dtype(), v.sizes(), v.strides(), v.storage_offset());
+  return complex_of(self, v.sizes(), v.strides(), v.storage_offset());
 }
 
 // The complex128 view of a host-backed float64 [..., 2] tensor (view_as_real of a complex128 one, or a slice of it).
@@ -1074,6 +1167,147 @@ at::Tensor& add__pu1(at::Tensor& self, const at::Tensor& other, const at::Scalar
   return assign_inplace(self, add_pu1(self, other, alpha));
 }
 
+// ---- a real HPU tensor and a complex scalar (AutogradHPU) ---------------------------------
+//
+// x * 2j, 2j * x, x + 1j, x - 1j, 1j - x, x / 2j (spd_learn's Gabor wavelets: exp(2j * pi * f * t)) reach Habana's
+// float mul/add/sub/div with a complex CPU scalar. In lazy mode its kernels abort the process ("value cannot be
+// converted to type double without overflow", then a device critical error; also without hpu_complex:
+// repro/lazy_complex_scalar.py), in eager mode they allocate a complex result and call the out= op (mul_out_pu1).
+// These kernels sit at AutogradHPU, above Habana's: the real operand is promoted to the result type (torch's
+// result_type: complex64 for float32/bfloat16/int/bool, complex128 for float64), as a differentiable .to(), and the op
+// runs on the complex kernels with torch's own autograd formulas. In-place and out= forms with a real self/out raise
+// TensorIterator's message. Every other call goes on to torch's autograd kernel unchanged: through AutogradOther,
+// whose table entry is the same VariableType kernel (an AutogradHPU redispatch would come back here). Not covered: a
+// call that skips the autograd keys (torch.inference_mode, kernels below autograd) still reaches Habana.
+
+bool complex_cpu_scalar(const c10::IValue& v) {
+  if (v.isTensor()) {
+    const auto& t = v.toTensor();
+    return t.defined() && t.is_cpu() && t.dim() == 0 && t.is_complex();
+  }
+  return v.isScalar() && v.toScalar().isComplex();
+}
+
+bool real_hpu(const c10::IValue& v) {
+  if (!v.isTensor()) {
+    return false;
+  }
+  const auto& t = v.toTensor();
+  // Not a traced tensor: torch.compile's fake tensors (Python key) and functional wrappers keep torch's own path,
+  // which traced right before (compiled exp(x * 2j) failed in fake-tensor tracing through this kernel).
+  const auto ks = t.defined() ? t.key_set() : DispatchKeySet();
+  return t.defined() && t.is_hpu() && !t.is_complex() && !tagged(t) && !ks.has(DispatchKey::Python) &&
+         !ks.has(DispatchKey::Functionalize);
+}
+
+at::ScalarType promoted_type(const at::Tensor& self, const c10::IValue& other) {
+  return other.isTensor() ? at::result_type(self, other.toTensor()) : at::result_type(self, other.toScalar());
+}
+
+// x * c, c * x, x + alpha c, x - alpha c (x real, c a finite complex scalar, a complex64 result) without promoting x:
+// torch.complex of two real parts, each one or two float ops on x, differentiable through torch.complex's own
+// gradient. A promoted x costs a copy into a complex tensor and the complex product's ten-odd launches, forward and
+// backward (Green's Gabor wavelets: 2j * pi * f * t for every frequency). The parts are torch's complex64 arithmetic
+// with x + 0i, constants in float as torch casts the scalar: x c = (x cr - 0 ci) + i (x ci + 0 cr), and
+// x + alpha c = (x + (alpha cr - 0 ci)) + i (0 + (alpha ci + 0 cr)), so signed zeros match too. Anything else
+// (division, rsub, a complex first operand of add/sub, a non-finite c, a float64 x) is promoted.
+std::optional<at::Tensor> real_times_complex_scalar_1d(bool mul, bool sub, c10::ArrayRef<c10::IValue> args,
+                                                       c10::complex<float> c, const at::Tensor& x);
+
+std::optional<at::Tensor> real_times_complex_scalar(const std::string& name, c10::ArrayRef<c10::IValue> args,
+                                                    int64_t real_at, const at::Tensor& real) {
+  const bool mul = name == "aten::mul";
+  const bool add = name == "aten::add";
+  const bool sub = name == "aten::sub";
+  if (!(mul || ((add || sub) && real_at == 0))) {
+    return std::nullopt;
+  }
+  const auto& other = args[1 - real_at];
+  const auto c64 = other.isTensor() ? other.toTensor().item().toComplexDouble() : other.toScalar().toComplexDouble();
+  const c10::complex<float> c(static_cast<float>(c64.real()), static_cast<float>(c64.imag()));
+  if (!std::isfinite(c.real()) || !std::isfinite(c.imag())) {
+    return std::nullopt;
+  }
+  auto x = real.scalar_type() == at::kFloat ? real : real.to(at::kFloat);
+  if (x.dim() == 0) {  // lazy mode: Habana's graph compile fails on this 0-d stack (synStatus 26, Gaudi2, 1.21.4)
+    x = x.unsqueeze(0);
+    auto value = real_times_complex_scalar_1d(mul, sub, args, c, x);
+    return value ? std::optional<at::Tensor>(value->squeeze(0)) : std::nullopt;
+  }
+  return real_times_complex_scalar_1d(mul, sub, args, c, x);
+}
+
+std::optional<at::Tensor> real_times_complex_scalar_1d(bool mul, bool sub, c10::ArrayRef<c10::IValue> args,
+                                                       c10::complex<float> c, const at::Tensor& x) {
+  if (mul) {
+    auto re = x * static_cast<double>(c.real());
+    const float k_re = 0.0f * c.imag();  // re = x cr - 0 ci: subtracting +0 changes nothing
+    if (std::signbit(k_re)) {
+      re = re - static_cast<double>(k_re);
+    }
+    auto im = x * static_cast<double>(c.imag()) + static_cast<double>(0.0f * c.real());
+    return at::complex(re, im);
+  }
+  auto alpha = args[2].toScalar();
+  if (alpha.isComplex()) {
+    return std::nullopt;
+  }
+  const float a = static_cast<float>(sub ? -alpha.toDouble() : alpha.toDouble());
+  const float k_re = a * c.real() - 0.0f * c.imag();
+  const float k_im = 0.0f + (a * c.imag() + 0.0f * c.real());
+  auto re = x + static_cast<double>(k_re);
+  return at::complex(re, at::full_like(re, static_cast<double>(k_im)));
+}
+
+void complex_scalar_autograd_hpu(const c10::OperatorHandle& op, DispatchKeySet ks, torch::jit::Stack* stack) {
+  const auto& schema = op.schema();
+  const auto n = schema.arguments().size();
+  auto args = torch::jit::last(*stack, n);
+  // (real HPU self, complex scalar other), or (complex CPU 0-d self, real HPU other) for the Tensor overloads.
+  // In-place forms only promote other, never a written self.
+  bool writes = false;
+  for (size_t i = 0; i < n; ++i) {
+    const auto* alias = schema.arguments()[i].alias_info();
+    writes |= alias != nullptr && alias->isWrite();
+  }
+  int64_t real_at = -1;
+  if (real_hpu(args[0]) && complex_cpu_scalar(args[1])) {
+    real_at = 0;
+  } else if (!writes && args[0].isTensor() && complex_cpu_scalar(args[0]) && real_hpu(args[1])) {
+    real_at = 1;
+  }
+  const auto& real = real_at >= 0 ? args[real_at].toTensor() : at::Tensor();
+  const auto result = real_at < 0                 ? at::ScalarType::Undefined
+                      : real_at == 0              ? promoted_type(real, args[1])
+                                                  : at::result_type(args[0].toTensor(), real);
+  if (real_at < 0 || !c10::isComplexType(result)) {
+    op.redispatchBoxed((ks & DispatchKeySet(DispatchKeySet::FULL_AFTER, DispatchKey::AutogradFunctionality)) |
+                           DispatchKeySet(DispatchKey::AutogradOther),
+                       stack);
+    return;
+  }
+  // In-place (self written) and out= forms: a complex result cannot be cast to a real self or out.
+  for (size_t i = 0; i < n; ++i) {
+    const auto* alias = schema.arguments()[i].alias_info();
+    if (alias != nullptr && alias->isWrite() && args[i].isTensor()) {
+      const auto& written = args[i].toTensor();
+      TORCH_CHECK(at::canCast(result, written.scalar_type()), "result type ", result,
+                  " can't be cast to the desired output type ", written.scalar_type());
+    }
+  }
+  TORCH_CHECK(result == at::kComplexFloat || result == at::kComplexDouble, "hpu_complex: ", result,
+              " is not supported on HPU (complex64 and complex128 are)");
+  if (!writes && result == at::kComplexFloat) {
+    if (auto value = real_times_complex_scalar(schema.name(), args, real_at, real)) {
+      torch::jit::drop(*stack, n);
+      stack->emplace_back(std::move(*value));
+      return;
+    }
+  }
+  (*stack)[stack->size() - n + real_at] = real.to(result);
+  op.callBoxed(stack);
+}
+
 // ---- copies and fills (PrivateUse1) ------------------------------------------------------
 
 at::Tensor& copy_pu1(at::Tensor& self, const at::Tensor& src, bool non_blocking) {
@@ -1166,6 +1400,12 @@ void resize_complex(at::Tensor& t, c10::IntArrayRef sizes) {
     if (host_backed(t)) {  // host memory has no allocator: a new host block in the same StorageImpl
       void* data = c10::alloc_cpu(needed);
       storage.set_data_ptr_noswap(c10::DataPtr(data, data, &host_free, hpu_index(t.device())));
+    } else if (is_lazy_mode()) {  // a new Habana tensor behind a new storage (views of the old one keep it)
+      auto flat = at::empty({static_cast<int64_t>((needed + sizeof(float) - 1) / sizeof(float))},
+                            at::TensorOptions().dtype(at::kFloat).device(t.device()));
+      t.unsafeGetTensorImpl()->set_storage_keep_dtype(lazy_storage(flat));
+      t.unsafeGetTensorImpl()->set_sizes_and_strides(sizes, strides);
+      return;
     } else {
       auto* allocator = storage.allocator();
       TORCH_CHECK(allocator != nullptr && storage.resizable(), "Trying to resize storage that is not resizable");
@@ -1270,6 +1510,180 @@ at::Tensor& set_storage_pu1(at::Tensor& self, at::Storage source, int64_t storag
 // which set_storage_pu1 attaches in place). The fallback would compute it on a copy.
 at::Tensor& set_tensor_pu1(at::Tensor& self, const at::Tensor& source) {
   return at::native::set_tensor_(self, source);
+}
+
+// ---- elementwise and reductions on the pairs (PrivateUse1): neg, exp, masked_fill_, cat, vector_norm -------------
+//
+// spd_learn's Green ran these on the CPU every step (exp of its Gabor wavelets, cat of their real and imaginary parts,
+// linalg.norm, and in the backward neg and masked_fill_). Each is one or a few float ops on the [..., 2] pairs. Their
+// gradients are torch's own formulas (autograd sits above this key), which call only ops registered here.
+
+// The pair of c's values for reading. Most ops reach a kernel with a conjugate input resolved by the Conjugate
+// fallback; neg is not one of them (conj and neg commute), so resolve here.
+at::Tensor values_pair(const at::Tensor& c) {
+  return operand_pair(c.is_conj() ? c.resolve_conj() : c);
+}
+
+at::Tensor neg_pu1(const at::Tensor& self) {
+  if (host_backed(self)) {
+    return from_cpu(at::neg(host_cpu(self)), self.device());
+  }
+  HPU_COMPLEX_NO_AUTOCAST;
+  return complex_result(values_pair(self).neg());
+}
+
+// exp(a + ib) = e^a (cos b + i sin b). An imaginary part that is exactly 0 stays exactly 0 (signed), as C99 cexp and
+// torch's kernels give for a real-valued complex input (exp(inf + 0i) = inf + 0i, not inf * sin(0) = NaN).
+at::Tensor exp_pu1(const at::Tensor& self) {
+  if (host_backed(self)) {
+    return from_cpu(at::exp(host_cpu(self)), self.device());
+  }
+  HPU_COMPLEX_NO_AUTOCAST;
+  auto pair = values_pair(self);
+  auto a = pair.select(-1, 0), b = pair.select(-1, 1);
+  auto ea = a.exp();
+  // where(b != 0, ...), not where(b == 0, b, ...): the same values, and 6x faster on Gaudi2 eager (bridge 1.21.4:
+  // 0.26 against 1.5 ms for this exp of a (10, 125) tensor, measured; the == form was slower than the CPU fallback).
+  auto im = at::where(b != 0, ea * b.sin(), b);
+  return complex_result(at::stack({ea * b.cos(), im}, -1));
+}
+
+at::Tensor& neg_out_pu1(const at::Tensor& self, at::Tensor& out) {
+  return host_backed(self) ? host_out(out, neg_pu1(self), {&self}) : write_out(out, neg_pu1(self));
+}
+
+at::Tensor& exp_out_pu1(const at::Tensor& self, at::Tensor& out) {
+  return host_backed(self) ? host_out(out, exp_pu1(self), {&self}) : write_out(out, exp_pu1(self));
+}
+
+at::Tensor& masked_fill_pu1(at::Tensor& self, const at::Tensor& mask, const at::Scalar& value) {
+  TORCH_CHECK(mask.scalar_type() == at::kBool, "masked_fill_ only supports boolean masks, but got mask with dtype ",
+              mask.scalar_type());
+  if (host_backed(self)) {
+    return host_inplace(self, [&](at::Tensor& s) { s.masked_fill_(cpu_operand(mask), value); });
+  }
+  HPU_COMPLEX_NO_AUTOCAST;
+  at::assert_no_internal_overlap(self);
+  // torch's in-place rule: the mask broadcasts to self, never self to the mask.
+  auto m = (mask.dim() >= 5 ? dense_copy(mask) : mask).to(self.device()).expand(self.sizes());
+  const auto c = value.toComplexDouble();
+  auto pair = values_pair(self);
+  auto filled = c.imag() == 0.0 && c.real() == 0.0
+                    ? pair.masked_fill(m.unsqueeze(-1), 0.0)
+                    : at::stack({pair.select(-1, 0).masked_fill(m, c.real()), pair.select(-1, 1).masked_fill(m, c.imag())},
+                                -1);
+  copy_pu1(self, complex_result(filled), false);
+  return self;
+}
+
+at::Tensor& masked_fill_tensor_pu1(at::Tensor& self, const at::Tensor& mask, const at::Tensor& value) {
+  TORCH_CHECK(value.dim() == 0, "masked_fill_ only supports a 0-dimensional value tensor, but got tensor with ",
+              value.dim(), " dimension(s).");
+  return masked_fill_pu1(self, mask, value.item());
+}
+
+// cat: torch's result type over the inputs; complex64 is the cat of their pairs along the same dim (a real input gets
+// imaginary part 0). 1-D empty inputs are skipped as torch's legacy rule does; every input must be on the HPU.
+at::Tensor cat_pu1(const at::ITensorListRef& tensors, int64_t dim) {
+  std::vector<at::Tensor> all(tensors.begin(), tensors.end());
+  TORCH_CHECK(!all.empty(), "torch.cat(): expected a non-empty list of Tensors");
+  const auto result = at::native::result_type(at::ITensorListRef(all));
+  at::Device device = all[0].device();
+  bool host = false;
+  for (const auto& t : all) {
+    host |= host_backed(t);
+    if (tagged(t)) {
+      device = t.device();
+    }
+  }
+  for (const auto& t : all) {
+    TORCH_CHECK(t.device() == device, "Expected all tensors to be on the same device, but found at least two devices, ",
+                device, " and ", t.device(), "!");
+  }
+  if (host || result != at::kComplexFloat) {  // complex128 (or a real result into a complex out=): the CPU kernel
+    std::vector<at::Tensor> cpu;
+    for (const auto& t : all) {
+      cpu.push_back(cpu_operand(t));
+    }
+    auto value = at::cat(cpu, dim);
+    return host ? from_cpu(value, device) : value.to(device);
+  }
+  HPU_COMPLEX_NO_AUTOCAST;
+  std::vector<at::Tensor> pairs;
+  int64_t ndim = -1;
+  for (const auto& t : all) {
+    if (t.dim() == 1 && t.numel() == 0) {
+      continue;
+    }
+    ndim = t.dim();
+    pairs.push_back(as_pair(t.is_conj() ? t.resolve_conj() : t, device));
+  }
+  if (pairs.empty()) {  // only legacy empties: torch's own result (an empty tensor of the first one's shape)
+    return make_complex_empty(all[0].sizes(), c10::contiguous_strides(all[0].sizes()), device);
+  }
+  TORCH_CHECK(ndim > 0, "zero-dimensional tensor (at position 0) cannot be concatenated");
+  const auto d = c10::maybe_wrap_dim(dim, ndim);
+  // torch's shape check, here: Habana's lazy cat concatenates mismatched shapes without an error.
+  for (size_t i = 1; i < pairs.size(); ++i) {
+    TORCH_CHECK(pairs[i].dim() == pairs[0].dim(), "Tensors must have same number of dimensions: got ",
+                pairs[0].dim() - 1, " and ", pairs[i].dim() - 1);
+    for (int64_t k = 0; k < ndim; ++k) {
+      TORCH_CHECK(k == d || pairs[i].size(k) == pairs[0].size(k), "Sizes of tensors must match except in dimension ",
+                  d, ". Expected size ", pairs[0].size(k), " but got size ", pairs[i].size(k), " for tensor number ",
+                  i, " in the list.");
+    }
+  }
+  return complex_result(at::cat(pairs, d));
+}
+
+at::Tensor& cat_out_pu1(const at::ITensorListRef& tensors, int64_t dim, at::Tensor& out) {
+  return write_out(out, cat_pu1(tensors, dim));
+}
+
+// ||z||_ord over dim = the real vector norm of |z| (any ord, dim, keepdim: torch's own kernel on the moduli). ord 2
+// reduces the pairs directly: sqrt of the sum of squares over dim and the pair dim, one launch.
+at::Tensor vector_norm_pu1(const at::Tensor& self, const at::Scalar& ord, at::OptionalIntArrayRef dim, bool keepdim,
+                           std::optional<at::ScalarType> dtype) {
+  if (host_backed(self)) {
+    return from_cpu(at::linalg_vector_norm(host_cpu(self), ord, dim, keepdim, dtype), self.device());
+  }
+  if (dtype.has_value() && *dtype != at::kComplexFloat) {  // torch's dtype checks, then the computation in that dtype
+    TORCH_CHECK(c10::isComplexType(*dtype), "linalg.vector_norm: dtype should be complex for complex input, but got ",
+                *dtype);
+    return at::linalg_vector_norm(self.to(*dtype), ord, dim, keepdim, std::nullopt);
+  }
+  if (self.numel() == 0) {  // torch's empty-input rules and errors (Habana's lazy graph fails or skips them)
+    return at::linalg_vector_norm(self.cpu(), ord, dim, keepdim, std::nullopt).to(self.device());
+  }
+  HPU_COMPLEX_NO_AUTOCAST;
+  auto pair = values_pair(self);
+  if (!ord.isComplex() && ord.toDouble() == 2.0) {
+    std::vector<int64_t> dims;
+    if (dim.has_value() && !dim->empty()) {
+      for (auto d : *dim) {
+        dims.push_back(c10::maybe_wrap_dim(d, std::max<int64_t>(self.dim(), 1)));
+      }
+    } else {
+      for (int64_t d = 0; d < self.dim(); ++d) {
+        dims.push_back(d);
+      }
+    }
+    if (self.dim() == 0) {
+      dims.clear();
+    }
+    dims.push_back(pair.dim() - 1);
+    auto out = at::linalg_vector_norm(pair, 2, dims, /*keepdim=*/true);
+    out = out.squeeze(-1);
+    dims.pop_back();
+    return keepdim || dims.empty() ? out : out.squeeze(dims);
+  }
+  return at::linalg_vector_norm(modulus(pair, false), ord, dim, keepdim, std::nullopt);
+}
+
+at::Tensor& vector_norm_out_pu1(const at::Tensor& self, const at::Scalar& ord, at::OptionalIntArrayRef dim,
+                                bool keepdim, std::optional<at::ScalarType> dtype, at::Tensor& out) {
+  return host_backed(self) ? host_out(out, vector_norm_pu1(self, ord, dim, keepdim, dtype), {&self})
+                           : write_out(out, vector_norm_pu1(self, ord, dim, keepdim, dtype));
 }
 
 // ---- autograd of _fft_r2c on HPU: the onesided backward as one GEMM ----------------------
@@ -1536,6 +1950,19 @@ TORCH_LIBRARY_IMPL(aten, AutogradHPU, m) {
   m.impl("_fft_r2c", &fft_r2c_autograd);
 }
 
+TORCH_LIBRARY_IMPL(aten, AutogradHPU, m) {
+  // A real HPU tensor and a complex scalar: promoted before Habana's float kernels see it (lazy mode aborts there).
+  for (const char* name : {"mul.Tensor", "mul.Scalar", "mul_.Tensor", "mul_.Scalar", "mul.out",
+                           "add.Tensor", "add.Scalar", "add_.Tensor", "add_.Scalar", "add.out",
+                           "sub.Tensor", "sub.Scalar", "sub_.Tensor", "sub_.Scalar", "sub.out",
+                           "rsub.Tensor", "rsub.Scalar",
+                           "div.Tensor", "div.Scalar", "div_.Tensor", "div_.Scalar", "div.out",
+                           "div.Tensor_mode", "div.Scalar_mode", "div_.Tensor_mode", "div_.Scalar_mode",
+                           "div.out_mode"}) {
+    m.impl(name, torch::CppFunction::makeFromBoxedFunction<&complex_scalar_autograd_hpu>());
+  }
+}
+
 TORCH_LIBRARY_IMPL(aten, BackendSelect, m) {
   m.impl("empty.memory_format", &empty_backend_select);
   m.impl("empty_strided", &empty_strided_backend_select);
@@ -1587,6 +2014,16 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("sub.Tensor", &sub_pu1);
   m.impl("sub.out", &sub_out_pu1);
   m.impl("where.self", &where_pu1);
+  m.impl("neg", &neg_pu1);
+  m.impl("neg.out", &neg_out_pu1);
+  m.impl("exp", &exp_pu1);
+  m.impl("exp.out", &exp_out_pu1);
+  m.impl("masked_fill_.Scalar", &masked_fill_pu1);
+  m.impl("masked_fill_.Tensor", &masked_fill_tensor_pu1);
+  m.impl("cat", &cat_pu1);
+  m.impl("cat.out", &cat_out_pu1);
+  m.impl("linalg_vector_norm", &vector_norm_pu1);
+  m.impl("linalg_vector_norm.out", &vector_norm_out_pu1);
   m.impl("mm", &mm_pu1);
   m.impl("mm.out", &mm_out_pu1);
   m.impl("bmm", &bmm_pu1);
@@ -1611,6 +2048,8 @@ TORCH_LIBRARY_FRAGMENT(hpu_complex, m) {  // a fragment: Team C's branch may def
         });
   // Whether a host-backed tensor was ever allocated: torch.compile(hpu_backend) then keeps float64 nodes eager.
   m.def("host_in_use() -> bool", []() { return host_in_use(); });
+  // Lazy mode: how many complex64 storages hold a Habana tensor (lazy_check checks that it drains).
+  m.def("lazy_storages_alive() -> int", []() { return lazy_owners_alive.load(); });
 }
 
 // After the registrations above (same translation unit: initialized in order).

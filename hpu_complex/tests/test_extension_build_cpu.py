@@ -18,9 +18,17 @@ _SCRIPT = """
 import json, sys, torch
 from torch.utils.cpp_extension import load
 load(name="hpu_complex_cpu_build_check", sources=[sys.argv[1]], is_python_module=False, verbose=False)
-ops = ["aten::view.dtype", "aten::view_as_complex", "aten::view_as_real", "aten::mm.out", "aten::copy_"]
+ops = ["aten::view.dtype", "aten::view_as_complex", "aten::view_as_real", "aten::mm.out", "aten::copy_",
+       "aten::mul.Tensor", "aten::add_.Scalar", "aten::rsub.Tensor", "aten::div.out_mode",
+       "aten::cat", "aten::cat.out", "aten::exp", "aten::exp.out", "aten::neg", "aten::neg.out",
+       "aten::masked_fill_.Scalar", "aten::masked_fill_.Tensor", "aten::linalg_vector_norm",
+       "aten::linalg_vector_norm.out"]
 table = {op: [line.split(":")[0] for line in torch._C._dispatch_dump(op).splitlines() if "fft_ext" in line]
          for op in ops}
+# The complex-scalar kernels at AutogradHPU hand every other call to AutogradOther: its entry must be torch's
+# autograd kernel (VariableType), the one AutogradHPU had before.
+table["autograd_other"] = {op: next(line for line in torch._C._dispatch_dump_table(op).splitlines()
+                                    if line.startswith("AutogradOther")) for op in ops[5:9]}
 print("TABLE" + json.dumps(table))
 """
 
@@ -46,3 +54,22 @@ def test_entry_points_are_registered(registered):
     assert "HPU" in registered["aten::view_as_complex"]
     assert {"PrivateUse1"} <= set(registered["aten::view_as_real"]) & set(registered["aten::mm.out"]) & set(
         registered["aten::copy_"])
+
+
+def test_complex_scalar_kernels_sit_at_autograd_hpu(registered):
+    """x_hpu * 2j and friends are promoted at AutogradHPU, before Habana's float kernels (lazy mode aborts there)."""
+    for op in ("aten::mul.Tensor", "aten::add_.Scalar", "aten::rsub.Tensor", "aten::div.out_mode"):
+        assert "AutogradHPU" in registered[op], op
+
+
+def test_other_calls_reach_torch_autograd_kernel_through_autograd_other(registered):
+    for op, line in registered["autograd_other"].items():
+        assert "VariableType" in line and "fft_ext" not in line, (op, line)
+
+
+def test_green_ops_have_card_kernels(registered):
+    """Green's complex cat, exp, neg, masked_fill_ and linalg.vector_norm run on the pairs, not the CPU fallback."""
+    for op in ("aten::cat", "aten::cat.out", "aten::exp", "aten::exp.out", "aten::neg", "aten::neg.out",
+               "aten::masked_fill_.Scalar", "aten::masked_fill_.Tensor", "aten::linalg_vector_norm",
+               "aten::linalg_vector_norm.out"):
+        assert "PrivateUse1" in registered[op], op

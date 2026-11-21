@@ -4,8 +4,10 @@
     PT_HPU_LAZY_MODE=1 python3 repro/lazy_complex_scalar.py --case mul [--no-ext]
 
 spd_learn's Green builds its Gabor wavelets as ``torch.exp(2j * pi * f * tt)`` with real HPU tensors ``f``,
-``tt``. In lazy mode this aborts the process (``value cannot be converted to type double without overflow``,
-then a Synapse device critical error) instead of raising. Each case prints ``CASE <name> <ext> -> <outcome>``.
+``tt``. Without hpu_complex, lazy mode aborts the process (``value cannot be converted to type double without
+overflow``, then a Synapse device critical error) inside Habana's float mul/add instead of raising (a Habana bug).
+With hpu_complex.enable() these calls are taken at AutogradHPU, before Habana's kernels, and compute right (the
+``ext`` rows). Each case prints ``CASE <name> <ext> -> <outcome>``.
 """
 import argparse
 import os
