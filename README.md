@@ -39,7 +39,8 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   `empty_strided` check the dtype at `BackendSelect` and redispatch (no
   eager tax, no float-op crashes).
 - Entry points from real HPU tensors use the `HPU` key: `_fft_r2c`,
-  `view_as_complex`, `torch.complex` (and `_neg_view`, which only complex
+  `view_as_complex`, `torch.complex`, `x.view(torch.complex64)` (with torch's own layout
+  checks and messages) (and `_neg_view`, which only complex
   code calls, for the imaginary part of a conjugate view). Every complex64
   factory on the HPU allocates through `empty`/`empty_strided`, so all are
   caught at `BackendSelect`: `zeros`, `ones`, `full`, `randn`, `rand`,
@@ -64,10 +65,12 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   complex64 does on other backends.
 - `torch.compile(backend="hpu_backend")`: complex nodes, and nodes that
   read a float view of complex storage (`view_as_real`, `.real`, `.imag`,
-  `view(dtype)`; a fused graph misreads a strided one), run eagerly on these
+  `view(dtype)`, and any view of those, e.g. `z.diagonal().real` or
+  `view_as_real(z)[..., 0].mT`; a fused graph misreads a strided one), run eagerly on these
   kernels; the other float nodes, fresh results such as `abs()` included,
-  stay in Synapse graphs. Habana's view-chain fusion skips complex
-  views: it bakes the strides traced by the fake tensors into one
+  stay in Synapse graphs. Habana's view-chain fusion starts no chain at, and runs no chain into, a view
+  touching complex storage (complex views, their float views such as `V.real.mT`, float views feeding
+  `view(complex64)`): it bakes the strides traced by the fake tensors into one
   `as_strided`, and torch's meta of `linalg_eig` gives contiguous
   eigenvectors where the kernel returns column-major ones. Without these two
   patches the compiled `eig`/`eigvals`/`qr` gradients were wrong with no error.
@@ -138,9 +141,12 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   views and `copy_()`). `hpu_complex.enable()` stays safe and silent in
   lazy mode for real-only `float32`/`bfloat16` models and for the
   float-pair API (`hpu_complex.rfft`, `hpu_complex.stft`), while
-  `complex64` creation, `torch.fft.*`, `torch.view_as_complex`,
+  `complex64` creation (`.to(torch.complex64)`, `torch.polar` included), `torch.fft.*`,
+  `torch.view_as_complex`, `x.view(torch.complex64)`,
   `torch.complex`, and `torch.linalg.eig`/`eigvals` on HPU raise an
-  explicit `RuntimeError` (no process abort). **Workaround:** run in
+  explicit `RuntimeError` (no process abort). The mode comes from the bridge's `is_lazy()`; without it,
+  `PT_HPU_LAZY_MODE` decides and unset counts as lazy (warned), since older bridges default to lazy
+  (1.21.4 has `is_lazy()` and defaults to eager). **Workaround:** run in
   eager mode (`PT_HPU_LAZY_MODE=0`), optionally with
   `torch.compile(model, backend="hpu_backend")` for simple complex+FFT
   modules (note: compiled `spd_learn.models.Green` fails with
@@ -162,6 +168,10 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   not run through `rfft`/`stft`: their backward is a C++ autograd
   Function. Writes through the imaginary part of a conjugate view
   (`z.conj().imag[...] = v`) do not reach `z`.
+- `out=` of the registered ops follows torch: a wrong-shape `out` is resized in its own storage (in place,
+  warned when it had elements; growth reallocates the same storage, without keeping the old values), an
+  expanded `out` raises, and so does an `mm`/`bmm` `out` on another device; `copy_` raises on a partial overlap
+  of source and target.
 - Copies between a plain CPU tensor and a plain HPU tensor never reach
   these kernels (neither carries the complex key), so Habana's `copy_`
   decides: `complex_cpu.copy_(real_hpu)` raises "Unsupported pytorch type
@@ -191,9 +201,11 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
 python -m pytest hpu_complex/tests/ -q            # CPU (the HPU tests skip without habana_frameworks)
 # The CPU suite checks the complex GEMM's formula and block layout in pure torch (test_cmatmul_formula_cpu.py),
 # and the hpu_backend pass patches on stub passes plus the rank-6 permute-block rule (test_compile_patches_cpu.py).
+# test_extension_build_cpu.py builds the C++ extension against CPU torch and checks its dispatcher registrations.
 # The C++ kernels themselves (mm/bmm and its CPU threshold, copy_pu1 staging, complex_view, the lazy guard)
-# need a Gaudi to run: they are covered only by pu1_check.py, run_on_hpu.py and lazy_check.py below.
+# need a Gaudi to run: they are covered only by pu1_check.py, review4_check.py, run_on_hpu.py and lazy_check.py.
 python hpu_complex/tests/pu1_check.py            # Gaudi: eager + compiled vs CPU
+python hpu_complex/tests/review4_check.py        # Gaudi: compiled float views of complex storage, x.view(complex64), out=/copy_ rules
 python hpu_complex/tests/r2c_grad_check.py       # Gaudi: rfft gradients vs CPU float64
 python hpu_complex/tests/run_on_hpu.py           # Gaudi: test_on_hpu.py without pytest
 python hpu_complex/tests/lazy_check.py           # Gaudi (PT_HPU_LAZY_MODE=1): lazy-mode guards & real-only safety
