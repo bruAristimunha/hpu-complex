@@ -999,18 +999,15 @@ at::Tensor smith_div(const at::Tensor& ar, const at::Tensor& ai, const at::Tenso
   return at::stack({re, im}, -1);
 }
 
-// (ar + i ai) / (c + 0i) as c10::complex's division computes it, not ar / c + i ai / c: |c| >= |0| always, so
-// rat = 0 / c and scl = 1 / c, re = (ar + ai rat) scl and im = (ai - ar rat) scl, and c = 0 gives ar / |c|, ai / |c|.
-// The cross terms are signed zeros, or NaN where the other part is infinite: (inf + 1i) / 2 is inf + nan i in torch.
-at::Tensor real_div(const at::Tensor& ar, const at::Tensor& ai, const at::Tensor& c) {
-  const auto scl = (c + 0.0).reciprocal();  // 1 / c, and +inf (1 / |c|) at c = -0 too
-  const auto rat = c.sign() * 0.0;         // 0 / c: a zero of c's sign, NaN for a NaN c (1 / c overflows for 1e-45)
-  auto re = (ar + ai * rat) * scl;
-  auto im = (ai - ar * rat) * scl;
-  const auto zero = c == 0;
-  re = at::where(zero, ar * scl, re);
-  im = at::where(zero, ai * scl, im);
-  return at::stack({re, im}, -1);
+// (ar + i ai) / (c + 0i): ar / c + i ai / c, plus torch's cross terms ai * (0 / c) and -ar * (0 / c), which are zeros
+// for a finite part and NaN for an infinite one: (inf + 1i) / 2 is inf + nan i in torch (c10::complex's Smith
+// division), where the per-part quotient gave inf + 0.5i. Three ops more than the per-part quotient: the exact form
+// (Smith with a zero imaginary part, 13 ops) cost lazy Green 18 ms a step (Gaudi2, bridge 1.21.4; Green divides its
+// wavelets by their norm, forward and backward). Left as before: zero signs where a quotient part is exactly 0, a
+// zero c next to an infinite other part (NaN here, torch inf), and the last ulp (torch multiplies by 1 / c).
+at::Tensor real_div(const at::Tensor& pair, const at::Tensor& c) {
+  const auto cross = at::tensor({0.0f, -0.0f}).to(pair.device());  // re + ai * 0, im - ar * 0
+  return pair / c.unsqueeze(-1) + pair.flip(-1) * cross;
 }
 
 at::Tensor div_pu1(const at::Tensor& a, const at::Tensor& b) {
@@ -1026,7 +1023,7 @@ at::Tensor div_pu1(const at::Tensor& a, const at::Tensor& b) {
     return at::div(a, b);
   }
   if (!pb) {  // complex / real: torch's (ar + i ai) / (c + 0i), Smith's algorithm with a zero imaginary part
-    return complex_result(real_div(pa->select(-1, 0), pa->select(-1, 1), hpu_float(b, device)));
+    return complex_result(real_div(*pa, hpu_float(b, device)));
   }
   auto br = pb->select(-1, 0), bi = pb->select(-1, 1);
   if (!pa) {

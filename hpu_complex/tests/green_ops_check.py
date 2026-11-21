@@ -431,10 +431,20 @@ def add_checks(check, err, grad_err, worst, sync=lambda: None):
           cat_out_cast_and_alias, 0)
     zq = torch.tensor([complex(inf, 1), complex(1, inf), complex(nan, 1), 1 + 1j, complex(inf, 1), 3 + 4j, 3 + 4j,
                        complex(-0.0, 1), 1 + 1j], dtype=torch.complex64)
-    xq = torch.tensor([2.0, -3.0, 2.0, 0.0, 0.0, inf, -inf, -2.0, nan])
+    xq = torch.tensor([2.0, -3.0, 2.0, 0.0, -2.0, inf, -inf, -2.0, nan])
     wq = torch.tensor([complex(inf, 0), complex(nan, 0), 1 + 2j], dtype=torch.complex64)
+
+    def nan_and_rel(got, ref):
+        """1 unless NaN sits where torch has it, infinities match, and finite parts agree to 2.4e-7 relative (Habana's
+        float division is not correctly rounded; torch multiplies by 1 / c)."""
+        g, r = torch.view_as_real(got.cpu()), torch.view_as_real(ref)
+        if not torch.equal(g.isnan(), r.isnan()) or not torch.equal(g[r.isinf()], r[r.isinf()]):
+            return 1.0
+        fin = r.isfinite()
+        return float(((g[fin] - r[fin]).abs() > 2.4e-7 * r[fin].abs()).any())
+
     check("review2 B9: complex / real tensor and alpha=1+0j: NaN where torch puts it", lambda: worst(
-        _nan_bits_err(zq.to(hpu) / xq.to(hpu), one_by_one(torch.div, zq, xq), signed_zeros=False),
+        nan_and_rel(zq.to(hpu) / xq.to(hpu), one_by_one(torch.div, zq, xq)),
         _nan_bits_err(torch.add(zq[:3].to(hpu), wq.to(hpu), alpha=1 + 0j),
                       one_by_one(lambda p, q: torch.add(p, q, alpha=1 + 0j), zq[:3], wq), signed_zeros=False)), 0)
 

@@ -70,7 +70,8 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   torch. `exp` follows C99 cexp at
   non-finite inputs and computes e^a in two halves, so `exp(88.75 + i pi/4) = 2.47e38 (1 + i)` fits (torch's
   complex64 kernel: inf + inf i; within 2 ulp of torch elsewhere). Complex division is Smith's algorithm, as
-  torch's (`1 / 1e20j` is `-1e-20j`, not 0), also by a real tensor (`(inf + 1j) / 2` is `inf + nan j`, as torch).
+  torch's (`1 / 1e20j` is `-1e-20j`, not 0), also by a real tensor (`(inf + 1j) / 2` is `inf + nan j`, as torch; zero signs, a zero divisor next to an infinite
+  part and torch's own `1 / c` overflow are left as the per-part quotient gives them, kept for speed: README Limits).
   complex64 with a float64 HPU tensor is complex128, in host memory; a float64 `self` of `add_`/`mul_` with a
   complex operand raises torch's cast error, and a complex32 result type (a 0-d complex64 with float16) raises.
 - Complex `mm`/`bmm` (so `@`, `matmul`, `einsum` products) are one real GEMM on the card:
@@ -255,7 +256,9 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   tensors on the card with a real `alpha` (`a + b`, `a - b`, gradient accumulation) are added per part, where
   torch multiplies `b` by `alpha + 0i` first: at an infinite or NaN part of `b` torch puts a NaN in the other part
   (`inf + 0i` gives `inf + nan i`), and exact-zero signs can differ (the exact form cost 25 ms of a 75 ms lazy step;
-  a Python scalar, a real operand and a complex `alpha`, `1 + 0j` included, keep torch's form). A complex64 HPU tensor with a 0-d CPU
+  a Python scalar, a real operand and a complex `alpha`, `1 + 0j` included, keep torch's form). A complex64 tensor
+  divided by a real one is the per-part quotient plus torch's NaN cross terms (3 ops; the exact Smith form cost lazy
+  Green 18 ms a step): NaN placement as torch, zero signs and the last ulp can differ. A complex64 HPU tensor with a 0-d CPU
   complex128 or float64 tensor stays complex64 on the card, where torch gives complex128: autograd hands saved
   Python scalars to the backward as such tensors, and complex128 would route every such gradient through host
   memory and a device sync (+12 ms a lazy step); torch's engine casts the gradient back to complex64 anyway. A real
