@@ -14,6 +14,7 @@ device-agnostic float API on [..., 2] pairs.
 import importlib.util
 import math
 import os
+import threading
 import warnings
 
 from . import _core as core
@@ -77,6 +78,26 @@ def _holds_host_values(gm, example_inputs=()):
     return host_in_use and any(isinstance(t, torch.Tensor) and _host_backed(t) for t in example_inputs)
 
 
+def _eager_for_host_inputs(gm, compiled):
+    """compiled, except on a call with a host-backed input, which runs gm eagerly. Dynamo guards a graph on dtype, shape,
+    strides and device, not on where the storage lives: a graph compiled for card tensors is reused for host memory of
+    the same metadata (h([7], complex128).view(complex64) after h([1, 2])), whose pointer Synapse would read as device
+    memory. One host_in_use() call per run while no complex128 tensor was ever made."""
+    import torch
+
+    boxed = getattr(compiled, "_boxed_call", False)
+
+    def run(*args):
+        inputs = args[0] if boxed else args
+        if torch.ops.hpu_complex.host_in_use() and any(
+                isinstance(a, torch.Tensor) and _host_backed(a) for a in inputs):
+            return gm.forward(*inputs)
+        return compiled(*args)
+
+    run._boxed_call = boxed
+    return run
+
+
 def _complex128_graphs_run_eagerly():
     """torch.compile(backend="hpu_backend") of a graph holding complex128 values: the graph runs eagerly, whole.
 
@@ -99,7 +120,7 @@ def _complex128_graphs_run_eagerly():
     def hpu_backend(gm, example_inputs, **kwargs):
         if _holds_host_values(gm, example_inputs):
             return gm.forward
-        return original(gm, example_inputs, **kwargs)
+        return _eager_for_host_inputs(gm, original(gm, example_inputs, **kwargs))
 
     hpu_backend.hpu_complex = True
     registry._COMPILER_FNS["hpu_backend"] = hpu_backend
@@ -284,8 +305,9 @@ def _pickle_complex128_through_the_cpu():
             if not _dense(values):
                 values = values.contiguous()
             flat = values.as_strided((values.numel(),), (1,), values.storage_offset())
+            raw = flat.view(torch.uint8).numpy().tobytes()  # bytes of any dtype (numpy has no bfloat16)
             return (_rebuild_host_backed_from_cpu,
-                    (flat.numpy().tobytes().decode("latin-1"), self.dtype, str(self.device), self.requires_grad,
+                    (raw.decode("latin-1"), self.dtype, str(self.device), self.requires_grad,
                      tuple(values.shape), tuple(values.stride())))
         return original(self, proto)
 
@@ -293,16 +315,59 @@ def _pickle_complex128_through_the_cpu():
     torch.Tensor._reduce_ex_internal = _reduce_ex_internal
 
 
-def _restore_device(device, data):
-    """torch.load's map_location for a rebuilt tensor: a str, device or dict as torch's _get_restore_location, and a
-    callable as torch calls it for a storage (storage, location) -> a storage (its device) or None (the saved one)."""
+_LEGACY_LOAD = threading.local()
+
+
+def _legacy_load_sees_map_location():
+    """torch.load of a legacy (_use_new_zipfile_serialization=False) checkpoint: torch hands map_location to rebuild
+    functions (_serialization_tls) around zip loads only, so a host-backed tensor of a legacy file was restored to its
+    saved device whatever map_location said (map_location="cpu" in a process without a Gaudi failed importing
+    torch.hpu). hpu_complex's rebuilder reads it from here then; torch's own rebuilders are left as they are."""
+    import functools
+
+    import torch.serialization as serialization
+
+    original = serialization._legacy_load
+    if getattr(original, "hpu_complex", False):
+        return
+
+    @functools.wraps(original)
+    def _legacy_load(f, map_location, pickle_module, **pickle_load_args):
+        saved = getattr(_LEGACY_LOAD, "map_location", None)
+        _LEGACY_LOAD.map_location = map_location
+        try:
+            return original(f, map_location, pickle_module, **pickle_load_args)
+        finally:
+            _LEGACY_LOAD.map_location = saved
+
+    _legacy_load.hpu_complex = True
+    serialization._legacy_load = _legacy_load
+
+
+def _restore(device, data):
+    """torch.load's map_location for a rebuilt tensor (data: its CPU values): (device, values). A str, device or dict as
+    torch's _get_restore_location; a callable as torch calls it for a storage, (storage, location) -> None (the saved
+    device) or the storage to restore, whose bytes and device then replace the saved ones as in torch's own load (a
+    callback returning a zeroed storage restores zeros)."""
     import torch
 
-    map_location = torch.serialization._serialization_tls.map_location
-    if callable(map_location) and not isinstance(map_location, (str, torch.device, dict)):
-        restored = map_location(data.untyped_storage(), device)
-        return torch.device(device) if restored is None else torch.device(restored.device)
-    return torch.device(torch._utils._get_restore_location(device))
+    map_location = getattr(torch.serialization._serialization_tls, "map_location", None)
+    if map_location is None:
+        map_location = getattr(_LEGACY_LOAD, "map_location", None)
+    if map_location is None:
+        return torch.device(device), data
+    if isinstance(map_location, dict):
+        return torch.device(map_location.get(device, device)), data
+    if isinstance(map_location, (str, torch.device)):
+        return torch.device(map_location), data
+    restored = map_location(data.untyped_storage(), device)
+    if restored is None:
+        return torch.device(device), data
+    storage = restored.untyped() if isinstance(restored, torch.TypedStorage) else restored
+    if storage.device.type != "cpu":  # its bytes, read back on the CPU (a float64 view would hold float32 values)
+        storage = torch.empty(0, dtype=torch.uint8, device=storage.device).set_(storage).cpu().untyped_storage()
+    values = torch.empty(0, dtype=data.dtype).set_(storage, data.storage_offset(), data.size(), data.stride())
+    return torch.device(restored.device), values
 
 
 def _rebuild_host_backed_from_cpu(data, dtype, device, requires_grad, size=None, stride=None):
@@ -319,7 +384,7 @@ def _rebuild_host_backed_from_cpu(data, dtype, device, requires_grad, size=None,
         flat = (torch.frombuffer(bytearray(data.encode("latin-1")), dtype=dtype, count=n) if n
                 else torch.empty(0, dtype=dtype))
         data = flat.as_strided(size, stride) if stride is not None else flat.reshape(size)
-    device = _restore_device(device, data)
+    device, data = _restore(device, data)
     if device.type == "hpu" and dtype in (torch.float64, torch.complex128) and hasattr(torch.ops.hpu_complex,
                                                                                      "host_from_cpu"):
         tensor = torch.ops.hpu_complex.host_from_cpu(data.to(dtype), device)
@@ -385,6 +450,7 @@ def _deepcopy_complex128_in_host_memory():
 
 try:  # at import: no torch here is fine (enable() needs it anyway)
     _allow_rebuild_in_torch_load()
+    _legacy_load_sees_map_location()
 except ImportError:
     pass
 

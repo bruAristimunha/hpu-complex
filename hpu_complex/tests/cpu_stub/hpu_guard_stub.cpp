@@ -220,13 +220,21 @@ void fake_hpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) 
     }
   }
   op.redispatchBoxed(c10::DispatchKeySet(c10::DispatchKey::CPU), stack);
-  // A written argument the CPU kernel resized (an out=) got new CPU memory: resize the HPU tensor and copy.
+  // A written argument the CPU kernel resized (an out=) got new CPU memory and possibly its own strides (nonzero's
+  // out is (1, n)-strided): the HPU tensor takes the kernel's sizes and strides, over storage grown to hold them, and
+  // the values are copied when the CPU memory moved.
   for (auto& [hpu, cpu] : written) {
     const bool moved = aliases.hpu_of.find(cpu.storage().unsafeGetStorageImpl()) == aliases.hpu_of.end() ||
                        cpu.storage().data() != hpu.storage().data();
     if (moved || !cpu.sizes().equals(hpu.sizes()) || !cpu.strides().equals(hpu.strides())) {
-      if (!cpu.sizes().equals(hpu.sizes())) {
-        resize_hpu(hpu, cpu.sizes(), std::nullopt);
+      if (!cpu.sizes().equals(hpu.sizes()) || !cpu.strides().equals(hpu.strides())) {
+        const auto item = static_cast<int64_t>(hpu.dtype().itemsize());
+        const auto needed = static_cast<int64_t>(
+            at::detail::computeStorageNbytes(cpu.sizes(), cpu.strides(), item, hpu.storage_offset()));
+        if (static_cast<int64_t>(hpu.storage().nbytes()) < needed) {
+          resize_hpu(hpu, {(needed + item - 1) / item - hpu.storage_offset()}, std::nullopt);
+        }
+        hpu.unsafeGetTensorImpl()->set_sizes_and_strides(cpu.sizes(), cpu.strides());
       }
       if (moved) {
         CpuAliases fresh;

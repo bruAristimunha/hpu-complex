@@ -11,14 +11,58 @@ import torch
 hpu = torch.device("hpu")
 
 
+_STRICT = [False]  # inside _no_cpu_fallback: the card side of cmp / rel128 is watched for CPU computation
+
+
+def _cpu_allocations(fn, at_least):
+    """fn() and the CPU allocations of at least ``at_least`` bytes its ops made (torch.profiler's memory events).
+
+    The dispatcher counter below sees only the extension's CPU fallback: a kernel that computes on the CPU itself
+    (vector_norm(z.cpu().cdouble()).float().to(z.device), an explicit .cpu()) allocates a CPU copy of its input, and is
+    caught here. Smaller host allocations are the bridge's own (24 bytes around a strided view, Gaudi2, 1.21.4).
+    """
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CPU], profile_memory=True) as prof:
+        out = fn()
+    return out, [e.cpu_memory_usage for e in prof.events() if e.cpu_memory_usage >= at_least]
+
+
+def _card(fn, args=()):
+    """fn(), the card side of a comparison; inside _no_cpu_fallback it must not copy an input's worth of memory to the
+    CPU (the smallest input tensor of args sets the size)."""
+    if not _STRICT[0]:
+        return fn()
+    sizes = [a.numel() * a.element_size() for a in args if isinstance(a, torch.Tensor) and a.numel() > 1]
+    out, big = _cpu_allocations(fn, max(min(sizes, default=32), 32))
+    assert not big, ("CPU allocations on the card side", big[:8])
+    return out
+
+
+def _host_path(fn):
+    """fn() inside _no_cpu_fallback, for a case that computes on the CPU by design (complex128 lives in host memory)."""
+    def wrapped():
+        strict, _STRICT[0] = _STRICT[0], False
+        try:
+            return fn()
+        finally:
+            _STRICT[0] = strict
+    return wrapped
+
+
 def _no_cpu_fallback(fn):
     """fn's ops all ran on the card: no hpu_complex CPU-fallback call (counted per call: the warning is once per op and
-    process, so a later fallback of an op that warned before would pass unseen) and no such warning."""
+    process, so a later fallback of an op that warned before would pass unseen), no such warning, and the card side of
+    every cmp / rel128 in fn allocated no CPU memory beyond 0-d scalars (an explicit CPU computation)."""
     def wrapped():
         before = torch.ops.hpu_complex.cpu_fallback_calls()
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            out = fn()
+        _STRICT[0] = True
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                out = fn()
+        finally:
+            _STRICT[0] = False
         ran = [str(w.message)[:90] for w in caught if "runs on the CPU" in str(w.message)]
         calls = torch.ops.hpu_complex.cpu_fallback_calls() - before
         assert not ran and calls == 0, (ran, calls)
@@ -66,8 +110,8 @@ def add_checks(check, err, grad_err, worst, sync=lambda: None):
 
     def cmp(fn, *args):
         """fn(*hpu args) against fn(*cpu args): values and dtype."""
-        got = fn(*[a.to(hpu) if isinstance(a, torch.Tensor) else a for a in args])
-        sync()
+        inputs = [a.to(hpu) if isinstance(a, torch.Tensor) else a for a in args]
+        got = _card(lambda: (fn(*inputs), sync())[0], args)
         ref = fn(*args)
         assert got.dtype == ref.dtype and got.device.type == "hpu", (got.dtype, ref.dtype, got.device)
         return err(got, ref)
@@ -172,7 +216,7 @@ def add_checks(check, err, grad_err, worst, sync=lambda: None):
     check("complex linalg.vector_norm: ord / dim / keepdim, conj, strided, 0-d", _no_cpu_fallback(lambda: worst(
         *[cmp(lambda t, o=o, d=d, k=k: torch.linalg.vector_norm(t, o, d, k), z) for o, d, k in cases],
         cmp(lambda t: torch.linalg.vector_norm(t.conj().mT, dim=0), z), cmp(lambda t: torch.linalg.norm(t[1, 2, 3]), z),
-        cmp(lambda t: torch.linalg.vector_norm(t, dtype=torch.complex128), z))), 1e-5)
+        _host_path(lambda: cmp(lambda t: torch.linalg.vector_norm(t, dtype=torch.complex128), z))())), 1e-5)
     check("complex linalg.vector_norm fwd+grad (ord 2, 1, inf; relative)", _no_cpu_fallback(lambda: worst(
         *[grad_err(lambda t, o=o: torch.linalg.vector_norm(torch.complex(t, t.flip(-1)), o, -1), xr, relative=True)
           for o in (2, 1, math.inf)])), 1e-5)
@@ -243,12 +287,13 @@ def add_checks(check, err, grad_err, worst, sync=lambda: None):
     def rel128(fn, *args):
         """fn on the card against the exact value (fn in complex128 on the CPU) rounded to the result's dtype, relative:
         a part that overflows float32 is inf in both, a part that underflows is 0 in both."""
-        got = fn(*[a.to(hpu) if isinstance(a, torch.Tensor) else a for a in args])
-        sync()
+        inputs = [a.to(hpu) if isinstance(a, torch.Tensor) else a for a in args]
+        got = _card(lambda: (fn(*inputs), sync())[0], args)
         ref = fn(*[a.to(torch.complex128 if a.is_complex() else torch.float64) for a in args])
         g, r = got.detach().cpu(), ref.detach().to(got.dtype).to(ref.dtype)
         g, r = (torch.view_as_real(g), torch.view_as_real(r)) if g.is_complex() else (g, r)
         assert torch.equal(g.isnan(), r.isnan()) and torch.equal(g.isinf(), r.isinf()), (got, ref)
+        assert torch.equal(g[r.isinf()].double(), r[r.isinf()]), (got, ref)  # an infinity of the wrong sign fails
         fin = r.isfinite()
         return ((g[fin].double() - r[fin]).abs() / r[fin].abs().clamp_min(1e-300)).max().item() if fin.any() else 0.0
 
@@ -346,3 +391,111 @@ def add_checks(check, err, grad_err, worst, sync=lambda: None):
         return worst(e, err(alias, torch.tensor([1, 2], dtype=torch.complex64)), err(x, torch.tensor([2 + 0j])))
 
     check("review #1/#3/#4/#5: failed set_, growing out= prefix, set_() detach, overlapping add_/mul_", storage_cases, 0)
+
+    # ---- fix/complex-review-2: the second review of PR #11 (CODEX_REVIEW.txt, Part B), on the card ----------------
+    def one_by_one(fn, *args):
+        """fn per element on the CPU: torch's scalar kernel, whose NaN placement is the same on every CPU (its
+        vectorized complex kernels differ between x86 and ARM)."""
+        return torch.cat([fn(*[a[i:i + 1] for a in args]) for i in range(args[0].shape[0])])
+
+    small_ord = (([1e20, 1e-30], 0.01), ([1e30, 1e-20], -0.01), ([1e20, 1e-30], 0.5), ([1, 2, 3], 0.7),
+                 ([1e-30, 2e-30], 0.25), ([0j, 1 + 1j], -0.5))
+    check("review2 B5: vector_norm, |ord| < 1 keeps terms whose ratio under/overflows (relative x |ord|)",
+          _no_cpu_fallback(lambda: worst(*[
+              abs(o) * rel128(lambda t, o=o: torch.linalg.vector_norm(t, o), torch.tensor(v, dtype=torch.complex64))
+              for v, o in small_ord])), 1e-5)
+
+    def norm_nan_placement():
+        zz = torch.tensor([[inf, nan], [complex(inf, nan), 1.0], [nan, 1.0], [inf, 1.0], [complex(nan, 1), 1j]],
+                          dtype=torch.complex64)
+        errs = []
+        for o in (2, 1, 3.0, 0.5, -1, inf, -inf, 0):
+            got = torch.linalg.vector_norm(zz.to(hpu), o, dim=1).cpu()
+            ref = torch.linalg.vector_norm(zz.abs().double(), o, dim=1).float()  # torch's rule on the moduli
+            nan_ref = ref.isnan()
+            errs.append(float(not (torch.equal(got.isnan(), nan_ref) and torch.equal(got[~nan_ref], ref[~nan_ref]))))
+        return worst(*errs)
+
+    check("review2 B5: vector_norm NaN placement: NaN modulus anywhere -> NaN, inf + nan i is inf", norm_nan_placement, 0)
+
+    def cat_out_cast_and_alias():
+        out = torch.zeros(2, dtype=torch.complex64, device=hpu)
+        torch.cat([torch.tensor([4097], dtype=torch.int32, device=hpu),
+                   torch.tensor([1], dtype=torch.float16, device=hpu)], out=out)
+        zz = torch.tensor([1 + 2j, 3 + 4j], device=hpu)
+        _raises(lambda: torch.cat([zz.view(torch.float32)], out=zz), "memory location")
+        return worst(err(out, torch.tensor([4097, 1], dtype=torch.complex64)),
+                     err(zz, torch.tensor([1 + 2j, 3 + 4j])))
+
+    check("review2 B6: cat.out casts each input (int32 4097 with float16), a real view of out raises",
+          cat_out_cast_and_alias, 0)
+    zq = torch.tensor([complex(inf, 1), complex(1, inf), complex(nan, 1), 1 + 1j, complex(inf, 1), 3 + 4j, 3 + 4j,
+                       complex(-0.0, 1), 1 + 1j], dtype=torch.complex64)
+    xq = torch.tensor([2.0, -3.0, 2.0, 0.0, -2.0, inf, -inf, -2.0, nan])
+    wq = torch.tensor([complex(inf, 0), complex(nan, 0), 1 + 2j], dtype=torch.complex64)
+
+    def nan_and_rel(got, ref):
+        """1 unless NaN sits where torch has it, infinities match, and finite parts agree to 2.4e-7 relative (Habana's
+        float division is not correctly rounded; torch multiplies by 1 / c)."""
+        g, r = torch.view_as_real(got.cpu()), torch.view_as_real(ref)
+        if not torch.equal(g.isnan(), r.isnan()) or not torch.equal(g[r.isinf()], r[r.isinf()]):
+            return 1.0
+        fin = r.isfinite()
+        return float(((g[fin] - r[fin]).abs() > 2.4e-7 * r[fin].abs()).any())
+
+    check("review2 B9: complex / real tensor and alpha=1+0j: NaN where torch puts it", lambda: worst(
+        nan_and_rel(zq.to(hpu) / xq.to(hpu), one_by_one(torch.div, zq, xq)),
+        _nan_bits_err(torch.add(zq[:3].to(hpu), wq.to(hpu), alpha=1 + 0j),
+                      one_by_one(lambda p, q: torch.add(p, q, alpha=1 + 0j), zq[:3], wq), signed_zeros=False)), 0)
+
+    def sum_out_dtype():
+        f = torch.empty((), device=hpu)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            torch.sum(torch.tensor([1 + 3j, 2 - 1j], device=hpu), 0, out=f)
+        d = torch.empty((), dtype=torch.complex128, device=hpu)
+        torch.sum(torch.tensor([2 ** 24, 1, -2 ** 24], dtype=torch.complex64, device=hpu), 0, out=d)
+        _raises(lambda: torch.neg(torch.tensor([1j], device=hpu), out=torch.empty(1, dtype=torch.complex128,
+                                                                                 device=hpu)), "Found dtype")
+        return worst(err(f, torch.tensor(3.0)), err(d, torch.tensor(1 + 0j, dtype=torch.complex128)))
+
+    check("review2 B10: sum(out=float32) sums real parts, sum(out=complex128) sums in complex128, neg out dtype",
+          sum_out_dtype, 0)
+
+    def set_and_inplace_cases():
+        x = torch.tensor([2 + 0j], device=hpu)
+        x.set_(torch.tensor([7 + 0j], device=hpu).untyped_storage(), 0, (1,), (-1,))  # stock: accepted
+        y = torch.tensor([2 + 0j, 3 + 0j], device=hpu)
+        _raises(lambda: y.set_(torch.zeros(3, dtype=torch.complex64, device=hpu).untyped_storage(), 0, (2,), (-1,)),
+                "Negative strides")
+        _raises(lambda: y.set_(torch.zeros(3, dtype=torch.complex64, device=hpu).untyped_storage(), -1, (2,), (1,)),
+                "invalid storage offset")
+        s = torch.tensor([1j, 2j], dtype=torch.complex128, device=hpu).untyped_storage()
+        _raises(lambda: torch.empty(0, dtype=torch.complex128, device=hpu).set_(s[16:32]), "slice of a complex128")
+        d = torch.tensor([2.0], dtype=torch.float64, device=hpu)
+        _raises(lambda: d.add_(torch.tensor([1 + 1j], device=hpu)), "can't be cast")
+        sync()
+        return worst(err(x, torch.tensor([7 + 0j])), err(y, torch.tensor([2 + 0j, 3 + 0j])), err(d.float(),
+                                                                                                torch.tensor([2.0])))
+
+    check("review2 B1/B2/B4: set_ (singleton negative stride, failed set_, host slice), float64 add_ of complex",
+          set_and_inplace_cases, 0)
+
+    # ---- review2 B15: the detectors themselves catch the review's mutations ----------------------------------------
+    def detectors_catch_mutations():
+        zz = torch.randn(3, 4, 5, dtype=torch.complex64)
+        caught = 0
+        try:  # an explicit CPU computation: vector_norm on a complex128 CPU copy, moved back
+            _no_cpu_fallback(lambda: cmp(lambda t: torch.linalg.vector_norm(t.cpu().cdouble()).float().to(t.device),
+                                         zz))()
+        except AssertionError as e:
+            caught += "CPU allocations" in str(e)
+        try:  # an infinity of the wrong sign
+            rel128(lambda t: -t if t.device.type == "hpu" else t, torch.tensor([complex(inf, 1.0)],
+                                                                             dtype=torch.complex64))
+        except AssertionError:
+            caught += 1
+        return float(caught != 2)
+
+    check("review2 B15: the CPU-computation and inf-sign detectors catch the review's mutations",
+          detectors_catch_mutations, 0)
