@@ -75,8 +75,16 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   squaring). With rows and columns interleaved (re, im per index), `E(L)` of a triangle with a real diagonal is
   triangular, and the real Cholesky factor of `E(H)` is `E(L)` (unique), so `cholesky` is one real Cholesky
   (Habana's). `householder_product` is the compact WY form `I - V T V^H`, `T = (I + diag(tau) striu(V^H V))^-1
-  diag(tau)` (no division: `tau = 0` needs no special case). Gradients: autograd through the real ops, or torch's
-  formulas (`cholesky`, `cholesky_solve`); `info` is nonzero exactly when torch's is, its index may differ.
+  diag(tau)` (no division: `tau = 0` needs no special case). `cholesky`'s `info` is torch's, read from the factor's
+  diagonal (Habana's is a constant 0). `solve_triangular` rotates each row by the conjugate phase of its diagonal
+  entry and runs one real substitution (hpu-ops' TPC kernel); `cholesky_inverse` is Habana's on the interleaved factor
+  (`E(H^-1)`) and `cholesky_solve` that times `v(B)`; `qr` is Habana's real QR of `W E(A)` (a fixed orthogonal `W`:
+  Habana's qr is NaN on a zero Householder tail, `repro/habana_qr_nan.py`) re-signed to a positive real diagonal
+  (torch's factors up to those real signs); `eigvalsh` the means of the sorted pairs of the embedding's eigenvalues;
+  `hpu_complex.linalg.hpd_slogdet` / `hpd_logdet` (explicit: torch has no Hermitian flag) the log of the Cholesky
+  diagonal of an HPD matrix, with torch's slogdet gradient. Gradients: autograd through the real ops, or torch's
+  formulas (`cholesky`, `cholesky_solve`, `cholesky_inverse`, `solve_triangular`, `qr`); the `info` of `solve`/`inv`
+  is nonzero exactly when torch's is, its index may differ.
   Batch 32, Gaudi2, bridge 1.21.4, median of 3 alternating rounds of 20 synced calls, speed-up over the CPU route
   (forward / forward + backward; `tests/clinalg_card_check.py`), errors within 10x of CPU complex64's:
 
@@ -91,7 +99,9 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   | `lstsq` (with grad only, n = 16) | 0.9x / 2.0x | 0.7x / 3.0x |
 
   Habana's float32 `cholesky` returns NaN with `info = 0` when the dim before the matrix equals its order (a batch
-  of 32 matrices of order 32): `repro/habana_cholesky_nan.py`; the module views such a batch as `(b, 1, n, n)`.
+  of 32 matrices of order 32): `repro/habana_cholesky_nan.py`, swept in `repro/habana_linalg_shape_sweep.py`
+  (orders 2-64, eager and lazy: only that dim; padding the batch by one identity moves the trap to b + 1 = n); the
+  module views such a batch as `(b, 1, n, n)`.
 - Complex `mm`/`bmm` (so `@`, `matmul`, `einsum` products) are one real GEMM on the card:
   `[ar | ai] @ [[br, bi], [-bi, br]] = [cr | ci]`, conjugate operands included (they reach `mm`/`bmm`
   unresolved). Products below 2²² multiply-adds (batch·m·k·n) go to the CPU instead, one copy each way, where
