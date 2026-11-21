@@ -214,10 +214,17 @@ def _cmm(ar, ai, br, bi):
 
 
 def _info_from_real(info):
-    """The complex info from the real one: 0 stays 0. Interleaved Cholesky fails first at an odd real index 2j - 1
-    (the real pivot there is the complex one), hence j = (info + 1) // 2; the Gauss-Jordan index follows the kernel's
-    elimination order (as for float32 on the card), mapped the same way."""
+    """The complex info from the interleaved real Cholesky's: 0 stays 0; it fails first at an odd real index 2j - 1
+    (the real pivot there is the complex one), hence j = (info + 1) // 2."""
     return torch.where(info > 0, (info + 1) // 2, info)
+
+
+def _info_from_block(info, n):
+    """The complex info from the real one on the block embedding, whose columns j and n + j are complex column j:
+    real index k (1-based) is complex column k, or k - n past n. Exact for torch's index when the real elimination
+    meets the zero pivot in the complex order (a zero column or diagonal); for other singular matrices the index
+    follows the kernel's elimination order, as for float32 on the card (it is nonzero exactly when torch's is)."""
+    return torch.where(info > n, info - n, info)
 
 
 def _is_vector_rhs(A, B):
@@ -248,7 +255,7 @@ def solve_ex(A, B, left=True, check_errors=False):
     br, bi = _pair(rhs)
     X, info = torch.linalg.solve_ex(_block(ar, ai), _block_rhs(br, bi))
     X = _from_block_rhs(X, n)
-    info = _info_from_real(info)
+    info = _info_from_block(info, n)
     if check_errors:
         torch.ops.aten._linalg_check_errors(info, "torch.linalg.solve_ex", is_matrix=A.dim() == 2)
     LU, pivots = _placeholder_lu(A.shape, batch, n, A.device)
@@ -259,7 +266,7 @@ def inv_ex(A, check_errors=False):
     n = A.shape[-1]
     ar, ai = _pair(A)
     Minv, info = torch.linalg.inv_ex(_block(ar, ai))
-    info = _info_from_real(info)
+    info = _info_from_block(info, n)
     if check_errors:
         torch.ops.aten._linalg_check_errors(info, "linalg.inv_ex", is_matrix=A.dim() == 2)
     return _complex(Minv[..., :n, :n], Minv[..., n:, :n]), info
@@ -370,6 +377,11 @@ class _Cholesky(torch.autograd.Function):
         L, E = ctx.saved_tensors
         if ctx.upper:
             L, gL = L.mH, gL.mH
+        if torch.is_grad_enabled():  # create_graph: the same formula through differentiable ops on L (no saved E)
+            gA = _ctril(_cmatmul(L.mH, gL))
+            gA = 0.5 * (gA + _ctril(gA, -1).mH)
+            gA = solve_triangular(L.mH, gA, upper=True)
+            return solve_triangular(L, gA, upper=False, left=False), None
         lr, li = _pair(L)
         gr, gi = _pair(gL)
         xr, xi = _cmm(lr.mT, -li.mT, gr, gi)  # L^H gL
@@ -581,11 +593,36 @@ def eigh(A, UPLO="L", compute_v=True):
 # ---- pinv, lstsq ------------------------------------------------------------------------------------------------------
 
 
+class _HermitianFromLower(torch.autograd.Function):
+    """The Hermitian matrix of ``A``'s lower triangle (real diagonal), with the incoming gradient passed through
+    unchanged: torch's ``pinv(hermitian=True)`` gradient is that of the general ``pinv`` at the Hermitian matrix
+    (measured on the CPU, complex128), neither masked to the triangle nor made Hermitian."""
+
+    @staticmethod
+    def forward(ctx, A):
+        return _complex(*_hermitian_pairs(A, False))
+
+    @staticmethod
+    def backward(ctx, g):
+        return g
+
+
+def _default_rtol(A):
+    """torch's default tolerance, eps * max(m, n) of the complex matrix (the embedding's would be twice that)."""
+    return torch.finfo(torch.float32).eps * max(A.shape[-2], A.shape[-1])
+
+
 def pinv(A, atol=None, rtol=None, hermitian=False):
     """``linalg.pinv``: ``pinv(E(A)) = E(pinv A)``. The singular values of ``E(A)`` are those of ``A``, each twice, so
-    ``atol`` and ``rtol`` keep their meaning."""
+    ``atol`` and ``rtol`` keep their meaning; torch's default ``rtol`` (both unset) is passed explicitly, from the
+    complex shape. ``hermitian``: the Hermitian matrix of the lower triangle (real diagonal), as torch's eigh reads it."""
     m, n = A.shape[-2], A.shape[-1]
-    ar, ai = _pair(A)
+    if hermitian:
+        ar, ai = _pair(_HermitianFromLower.apply(A))
+    else:
+        ar, ai = _pair(A)
+    if atol is None and rtol is None:
+        rtol = _default_rtol(A)
     P = torch.linalg.pinv(_block(ar, ai), atol=atol, rtol=rtol, hermitian=hermitian)
     return _complex(P[..., :n, :m], P[..., n:, :m])
 
@@ -594,17 +631,21 @@ def lstsq(A, B, rcond=None, driver=None):
     """``linalg.lstsq``: ``min |E(A) x - [br; bi]|`` is ``min |A x - b|`` (the norms agree), so the real solution is
     ``[xr; xi]``, each residual is the complex one, the real rank is twice the complex one and the real singular
     values are the complex ones, each twice."""
-    vector = B.dim() == A.dim() - 1
+    vector = _is_vector_rhs(A, B)
     rhs = B.unsqueeze(-1) if vector else B
     n = A.shape[-1]
+    if rcond is None:  # torch's default from the complex shape (the embedding's would be twice it)
+        rcond = _default_rtol(A)
     ar, ai = _pair(A)
     br, bi = _pair(rhs)
     X, residuals, rank, sv = torch.linalg.lstsq(_block(ar, ai), _block_rhs(br, bi), rcond=rcond, driver=driver)
     X = _from_block_rhs(X, n)
-    if rank.numel():
-        rank = rank // 2
     if sv.numel():
         sv = sv[..., 0::2].contiguous()
+        if rank.numel():  # from the complex singular values, one per pair: a pair split at the cutoff counts once
+            rank = (sv > rcond * sv[..., :1]).sum(-1)
+    elif rank.numel():  # gelsy: no singular values; a pair split at the cutoff counts once
+        rank = (rank + 1) // 2
     return (X.squeeze(-1) if vector else X), residuals, rank, sv
 
 
@@ -734,9 +775,13 @@ def _takes_pinv(A, atol=None, rtol=None, hermitian=False):
 
 
 def _takes_lstsq(A, B, rcond=None, *, driver=None):
-    if not (isinstance(B, torch.Tensor) and _complex_on_card(A, B) and A.dim() >= 2 and B.dim() >= A.dim() - 1):
+    if not (isinstance(B, torch.Tensor) and _complex_on_card(A, B) and A.dim() >= 2 and B.dim() >= 1):
         return False
-    if B.shape[-2 if B.dim() == A.dim() else -1] != A.shape[-2]:
+    if not _is_vector_rhs(A, B) and B.dim() < A.dim():
+        # torch's lstsq treats such a B (e.g. A (1, 3, 2), B (3, 4) -> solution (3, 2, 4)) by its own broadcast
+        # rule: torch's route
+        return False
+    if B.shape[-1 if _is_vector_rhs(A, B) else -2] != A.shape[-2]:
         return False
     return _real_on_card("svd", 2 * max(A.shape[-2:]))
 

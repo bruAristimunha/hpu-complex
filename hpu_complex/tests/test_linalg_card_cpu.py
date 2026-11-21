@@ -509,3 +509,79 @@ def test_default_routes(card_linalg, monkeypatch, lazy):
     assert not taken_by("solve_triangular", lambda: torch.linalg.solve_triangular(A, B, upper=True))
     monkeypatch.setenv("HPU_COMPLEX_LINALG", "all")
     assert taken_by("eigh", lambda: torch.linalg.eigh(H))
+
+
+# ---- review round (PR #16): the exact inputs that failed --------------------------------------------------------
+
+EPS32 = torch.finfo(torch.float32).eps
+
+
+@pytest.mark.parametrize("upper", [False, True])
+def test_cholesky_double_backward(card_linalg, upper):
+    """create_graph through cholesky: before, the backward used the saved real factor (no graph to A): Hessian 5.6
+    (lower) / 13.2 (upper) off. complex128 inputs through the module's functions, against torch."""
+    from hpu_complex.linalg import cholesky_ex
+
+    g = torch.Generator().manual_seed(3)
+    H0 = torch.randn(3, 3, dtype=C128, generator=g)
+    H0 = H0 @ H0.mH + 3 * torch.eye(3)
+    W = torch.randn(3, 3, dtype=C128, generator=g)
+
+    def hvp(f):
+        x = H0.clone().requires_grad_()
+        (gr,) = torch.autograd.grad((f(x) * W).abs().pow(2).sum(), x, create_graph=True)
+        return torch.autograd.grad((gr * W).abs().pow(2).sum(), x)[0]
+
+    h1 = hvp(lambda a: cholesky_ex(a, upper)[0])
+    h2 = hvp(lambda a: torch.linalg.cholesky(a, upper=upper))
+    assert (h1 - h2).abs().max() <= 1e-10 * h2.abs().max()
+
+
+def test_pinv_hermitian_reads_the_lower_triangle_and_a_real_diagonal(card_linalg):
+    g = torch.Generator().manual_seed(0)
+    H = torch.randn(3, 3, dtype=C128, generator=g)
+    H = H @ H.mH + torch.eye(3)
+    junk = H.tril() + 5j * torch.triu(torch.ones(3, 3, dtype=C128), 1) + 0.3j * torch.eye(3)
+    # values (0.79 / 0.12 off before); torch's gradient at such an input depends on the unread entries, so the
+    # gradient is checked at the Hermitian matrix itself
+    check(lambda a: torch.linalg.pinv(a, hermitian=True), [junk], "pinv", card_linalg, grad=False)
+    check(lambda a: torch.linalg.pinv(a, hermitian=True), [H], "pinv", card_linalg, gtol=2e-4)
+
+
+def test_default_tolerances_from_the_complex_shape(card_linalg):
+    A = torch.diag(torch.tensor([1.0, 3 * EPS32], dtype=C128))  # above eps * max(m, n), below twice it
+    P = torch.linalg.pinv(A.to(C64).to(HPU)).cpu()
+    assert P[1, 1].real > 1e6  # 2.8e6, as torch; the embedding's default rtol gave 0
+    sol, res, rank, sv = torch.linalg.lstsq(A.to(C64).to(HPU), torch.ones(2, 1, dtype=C64, device=HPU),
+                                            driver="gelsd")
+    assert rank.cpu().item() == torch.linalg.lstsq(A.to(C64), torch.ones(2, 1, dtype=C64), driver="gelsd").rank == 2
+
+
+def test_lstsq_vector_rule_as_torch(card_linalg):
+    g = torch.Generator().manual_seed(2)
+    A, B = torch.randn(1, 3, 2, dtype=C64, generator=g), torch.randn(3, 3, dtype=C64, generator=g)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        got = torch.linalg.lstsq(A.to(HPU), B.to(HPU)).solution
+    assert got.shape == torch.linalg.lstsq(A, B).solution.shape == (3, 2, 3)  # was (6, 2, 3)
+    check(lambda a, b: torch.linalg.lstsq(a, b).solution, [rand(2, 3, 2, seed=1), rand(2, 3, seed=2)], "lstsq",
+          card_linalg, gtol=2e-4)  # a batch of vectors
+
+
+@pytest.mark.parametrize("d", [[1, 0], [1, 1, 0], [1, 0, 1]])
+def test_singular_info_index_as_torch(card_linalg, d):
+    A = torch.diag(torch.tensor(d, dtype=C64))
+    ref = torch.linalg.inv_ex(A).info.item()
+    assert torch.linalg.inv_ex(A.to(HPU)).info.cpu().item() == ref
+    assert torch.linalg.solve_ex(A.to(HPU), torch.ones(len(d), 1, dtype=C64, device=HPU)).info.cpu().item() == ref
+    with pytest.raises(torch.linalg.LinAlgError, match=f"element {ref} is zero"):
+        torch.linalg.inv(A.to(HPU))
+
+
+def test_lstsq_rank_counts_a_pair_once(card_linalg):
+    """A singular value at the cutoff appears twice in the embedding; one of the pair may fall below: rank from the
+    complex singular values (gelsd/gelss), and rounded up for gelsy."""
+    A = torch.diag(torch.tensor([1.0, 1.5 * 2 * EPS32], dtype=C64))  # 1.5x torch's cutoff eps * max(m, n)
+    for driver in ("gelsd", "gelss", "gelsy"):
+        got = torch.linalg.lstsq(A.to(HPU), torch.ones(2, 1, dtype=C64, device=HPU), driver=driver).rank.cpu()
+        assert got.item() == torch.linalg.lstsq(A, torch.ones(2, 1, dtype=C64), driver=driver).rank.item()
