@@ -135,7 +135,7 @@ def _stepped(a, b):
     return a
 
 
-GAUDI_ONLY = {'isfinite', 'isnan', 'eq', 'ne', 'allclose', 'cholesky', 'inv', 'det', 'slogdet', 'solve', 'lstsq', 'matrix_power_neg', 'nonzero_mask', 'masked_scatter'}  # results Habana holds: see the module docstring
+GAUDI_ONLY = set()  # the fake HPU backend (cpu_stub) now holds the bool/int/float32 results these needed Habana for
 BREAKS = {}  # repeat and tile (they call unfold) were breaks until unfold became a PrivateUse1 view
 
 
