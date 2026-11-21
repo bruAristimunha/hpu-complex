@@ -180,6 +180,10 @@ def main():
                 row["ab_median_min_max"] = {k: [statistics.median(v), min(v), max(v)]
                                             for k, v in row["ab_ms_per_step"].items()}
         row["cpu_warnings"] = sorted({str(w.message)[:160] for w in caught if "runs on the CPU" in str(w.message)})
+        # complex128 in host memory (computed on the CPU) anywhere in the step, and hpu_complex's CPU-fallback calls
+        ops = torch.ops.hpu_complex
+        row["host_in_use"] = bool(ops.host_in_use()) if hasattr(ops, "host_in_use") else None
+        row["ext_cpu_fallback_calls"] = int(ops.cpu_fallback_calls()) if hasattr(ops, "cpu_fallback_calls") else None
         ls = torch.stack(losses).cpu()
         row["loss_first_last"] = [round(ls[0].item(), 5), round(ls[-1].item(), 5)]
         row["finite"] = bool(torch.isfinite(ls).all())

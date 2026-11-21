@@ -60,8 +60,9 @@ def _touches_complex(node):
     return touched(node) or any(touched(n) for n in node.all_input_nodes)
 
 
-def _holds_host_values(gm):
-    """A Dynamo graph whose values may be host-backed: a complex128 value, or float64 once complex128 was allocated."""
+def _holds_host_values(gm, example_inputs=()):
+    """A Dynamo graph whose values may be host-backed: a complex128 value, float64 once complex128 was allocated, or an
+    input that lives in host memory whatever its dtype (z128.view(torch.float32) is float32 host memory)."""
     import torch
 
     host_in_use = torch.ops.hpu_complex.host_in_use()
@@ -69,7 +70,11 @@ def _holds_host_values(gm):
         dtypes = {getattr(v, "dtype", None) for v in (node.meta.get("example_value"), node.meta.get("val"))}
         if torch.complex128 in dtypes or (host_in_use and torch.float64 in dtypes):
             return True
-    return False
+        grapharg = node.meta.get("grapharg") if node.op == "placeholder" else None
+        example = getattr(grapharg, "example", None)
+        if host_in_use and isinstance(example, torch.Tensor) and _host_backed(example):
+            return True
+    return host_in_use and any(isinstance(t, torch.Tensor) and _host_backed(t) for t in example_inputs)
 
 
 def _complex128_graphs_run_eagerly():
@@ -92,7 +97,7 @@ def _complex128_graphs_run_eagerly():
 
     @functools.wraps(original)
     def hpu_backend(gm, example_inputs, **kwargs):
-        if _holds_host_values(gm):
+        if _holds_host_values(gm, example_inputs):
             return gm.forward
         return original(gm, example_inputs, **kwargs)
 
@@ -234,11 +239,27 @@ def _bridge_is_lazy():
 
 
 def _host_backed(t):
-    """A complex128 HPU tensor or a float64 view of one: tagged (PrivateUse1) and not complex64, so in host memory."""
+    """A tensor in host memory that reports the HPU device: complex128, its real and dtype views (z128.view(complex64)
+    included), float64 results of its ops. The extension decides from the storage itself, never from the dtype."""
     import torch
 
-    return (t.device.type == "hpu" and t.dtype != torch.complex64
-            and torch._C._dispatch_keys(t).has(torch._C.DispatchKey.PrivateUse1))
+    if t.device.type != "hpu" or not torch._C._dispatch_keys(t).has(torch._C.DispatchKey.PrivateUse1):
+        return False
+    try:
+        return bool(torch.ops.hpu_complex.is_host_backed(t))
+    except (AttributeError, RuntimeError):  # extension not loaded: no host-backed tensor can exist
+        return False
+
+
+def _dense(t):
+    """t's elements fill one block of memory, in some order of its dims (a permutation of contiguous strides)."""
+    dims = sorted((d for d in range(t.dim()) if t.shape[d] != 1), key=lambda d: t.stride(d))
+    expected = 1
+    for d in dims:
+        if t.stride(d) != expected:
+            return False
+        expected *= t.shape[d]
+    return True
 
 
 def _pickle_complex128_through_the_cpu():
@@ -258,29 +279,47 @@ def _pickle_complex128_through_the_cpu():
         if _host_backed(self):
             # Its bytes as a latin-1 str, not a CPU tensor: torch.load(map_location="hpu") would restore a tensor's
             # storage on the card, at float32 precision for float64; and weights_only=True accepts a str, not bytes.
-            values = self.detach().cpu().resolve_conj().resolve_neg().contiguous()
+            # A dense layout (a transpose, channels_last) is kept: the bytes in memory order, with the strides.
+            values = self.detach().cpu().resolve_conj().resolve_neg()
+            if not _dense(values):
+                values = values.contiguous()
+            flat = values.as_strided((values.numel(),), (1,), values.storage_offset())
             return (_rebuild_host_backed_from_cpu,
-                    (values.numpy().tobytes().decode("latin-1"), self.dtype, str(self.device), self.requires_grad, tuple(values.shape)))
+                    (flat.numpy().tobytes().decode("latin-1"), self.dtype, str(self.device), self.requires_grad,
+                     tuple(values.shape), tuple(values.stride())))
         return original(self, proto)
 
     _reduce_ex_internal.hpu_complex = True
     torch.Tensor._reduce_ex_internal = _reduce_ex_internal
-    torch.serialization.add_safe_globals([_rebuild_host_backed_from_cpu])  # torch.load's default weights_only=True
 
 
-def _rebuild_host_backed_from_cpu(data, dtype, device, requires_grad, size=None):
+def _restore_device(device, data):
+    """torch.load's map_location for a rebuilt tensor: a str, device or dict as torch's _get_restore_location, and a
+    callable as torch calls it for a storage (storage, location) -> a storage (its device) or None (the saved one)."""
+    import torch
+
+    map_location = torch.serialization._serialization_tls.map_location
+    if callable(map_location) and not isinstance(map_location, (str, torch.device, dict)):
+        restored = map_location(data.untyped_storage(), device)
+        return torch.device(device) if restored is None else torch.device(restored.device)
+    return torch.device(torch._utils._get_restore_location(device))
+
+
+def _rebuild_host_backed_from_cpu(data, dtype, device, requires_grad, size=None, stride=None):
     """torch.load of a tensor _pickle_complex128_through_the_cpu saved: back into host memory on the HPU (exact).
 
     torch's own _rebuild_device_tensor_from_cpu_tensor would rebuild a float64 view or result of a complex128 tensor
-    with .to(device): an ordinary Habana float64 tensor, at float32 precision. map_location is honored; anywhere but the
-    HPU it is that .to(device).
+    with .to(device): an ordinary Habana float64 tensor, at float32 precision. map_location is honored (callables too);
+    anywhere but the HPU it is that .to(device). Works in a process without a Gaudi (map_location="cpu").
     """
     import torch
 
     if isinstance(data, str):
         n = math.prod(size)
-        data = (torch.frombuffer(bytearray(data.encode("latin-1")), dtype=dtype, count=n) if n else torch.empty(0, dtype=dtype)).reshape(size)
-    device = torch.device(torch._utils._get_restore_location(device))
+        flat = (torch.frombuffer(bytearray(data.encode("latin-1")), dtype=dtype, count=n) if n
+                else torch.empty(0, dtype=dtype))
+        data = flat.as_strided(size, stride) if stride is not None else flat.reshape(size)
+    device = _restore_device(device, data)
     if device.type == "hpu" and dtype in (torch.float64, torch.complex128) and hasattr(torch.ops.hpu_complex,
                                                                                      "host_from_cpu"):
         tensor = torch.ops.hpu_complex.host_from_cpu(data.to(dtype), device)
@@ -288,6 +327,17 @@ def _rebuild_host_backed_from_cpu(data, dtype, device, requires_grad, size=None)
         tensor = data.to(dtype=dtype, device=device)
     tensor.requires_grad = requires_grad
     return tensor
+
+
+def _allow_rebuild_in_torch_load():
+    """torch.load's default weights_only=True accepts the rebuilder of host-backed tensors in any process that imported
+    hpu_complex, with or without a Gaudi (a checkpoint written on the card loads on a CPU machine)."""
+    import torch
+
+    try:
+        torch.serialization.add_safe_globals([_rebuild_host_backed_from_cpu])
+    except AttributeError:  # torch < 2.4: no weights_only allowlist
+        pass
 
 
 def _deepcopy_complex128_in_host_memory():
@@ -333,6 +383,12 @@ def _deepcopy_complex128_in_host_memory():
     torch.Tensor.__deepcopy__ = __deepcopy__
 
 
+try:  # at import: no torch here is fine (enable() needs it anyway)
+    _allow_rebuild_in_torch_load()
+except ImportError:
+    pass
+
+
 def enable(enter_mode: bool = False):
     """Activate: C++ kernels (Gaudi stack); complex nodes of compiled graphs run eagerly on them.
 
@@ -351,6 +407,7 @@ def enable(enter_mode: bool = False):
     global _MODE_ENTERED
     import torch
 
+    _allow_rebuild_in_torch_load()  # a checkpoint of host-backed tensors loads on a CPU machine too
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         from .extension import load_extension
 

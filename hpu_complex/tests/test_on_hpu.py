@@ -202,8 +202,16 @@ def test_complex_linalg_backward_on_hpu():
         yc.backward()
         yh.backward()
         torch.hpu.synchronize()
-        assert _max_err(ah.grad, ac.grad) / max(ac.grad.abs().max().item(), 1e-12) < 5e-4
-        assert _max_err(th.grad, tc.grad) / max(tc.grad.abs().max().item(), 1e-12) < 5e-4
+        # Against complex128 (the exact gradient), next to the CPU's own complex64 error on the same input: some draws
+        # are ill-conditioned (CPU complex64 itself 1e-4 off), where a fixed 5e-4 bound against the CPU's complex64 is
+        # a coin toss (main 4.0e-4, this branch 5.7e-4 on one draw; both at the CPU's error on 24 random draws).
+        a64, t64 = ac.detach().to(torch.complex128).requires_grad_(), tc.detach().to(torch.complex128).requires_grad_()
+        hh_fn(a64, t64).backward()
+        ea, et = (_max_err(g, r.grad) / r.grad.abs().max().item() for g, r in ((ah.grad, a64), (th.grad, t64)))
+        ca, ct = (_max_err(g, r.grad) / r.grad.abs().max().item() for g, r in ((ac.grad, a64), (tc.grad, t64)))
+        print(f"householder_product bwd rel err vs complex128: card {ea:.1e} {et:.1e}, CPU complex64 {ca:.1e} {ct:.1e}",
+              flush=True)
+        assert ea < max(5e-4, 10 * ca) and et < max(5e-4, 10 * ct), ("householder_product bwd", ea, et, ca, ct)
     print("complex64 linalg 6-op fwd+bwd: OK")
 
 

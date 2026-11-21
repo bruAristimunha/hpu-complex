@@ -31,6 +31,7 @@
 #include <torch/library.h>
 #include <ATen/EmptyTensor.h>
 #include <ATen/MemoryOverlap.h>
+#include <ATen/WrapDimUtilsMulti.h>
 #include <ATen/Operators.h>
 #include <ATen/ops/set_native.h>
 #include <ATen/ops/unfold_native.h>
@@ -420,12 +421,32 @@ at::Device device_of(const at::Tensor& a, const at::Tensor& b) {
   return a.defined() && !a.is_cpu() ? a.device() : b.device();
 }
 
-// torch's device rule for an op on a host-backed operand: a CPU operand must be 0-d (a CPU scalar tensor).
+// torch's device rule (TensorIterator): every operand on one device, index included (hpu:0 and hpu:1 raise), except
+// CPU 0-d tensors (wrapped Python scalars, CPU scalar tensors).
 void check_host_devices(std::initializer_list<const at::Tensor*> operands) {
+  std::optional<at::Device> device;
   for (const auto* t : operands) {
-    TORCH_CHECK(!t->defined() || !t->is_cpu() || t->dim() == 0,
-                "Expected all tensors to be on the same device, but found at least two devices, hpu:0 and cpu!");
+    if (t->defined() && !t->is_cpu()) {
+      TORCH_CHECK(!device || *device == t->device(), "Expected all tensors to be on the same device, but found at "
+                  "least two devices, ", *device, " and ", t->device(), "!");
+      device = t->device();
+    }
   }
+  for (const auto* t : operands) {
+    TORCH_CHECK(!t->defined() || !t->is_cpu() || t->dim() == 0, "Expected all tensors to be on the same device, but "
+                "found at least two devices, ", device.value_or(at::Device(at::kHPU, 0)), " and cpu!");
+  }
+}
+
+// torch's result type of a binary op is complex128 while neither operand is host-backed (complex64 with a float64 HPU
+// tensor): computed on the CPU in complex128 and kept in host memory, as torch promotes (the card pair kernels would
+// round the float64 operand to float32 and return complex64). Not for a 0-d CPU operand: autograd hands saved Python
+// scalars back to the backward as such tensors (complex128, no longer wrapped numbers), so every z * 2j in a model
+// would send its gradient through host memory and a device sync (lazy Green: 64 -> 76 ms a step, measured); its
+// engine casts that gradient back to complex64 anyway. Those stay complex64 on the card, as before (README Limits).
+bool promotes_to_complex128(const at::Tensor& a, const at::Tensor& b) {
+  const auto cpu_scalar = [](const at::Tensor& t) { return t.defined() && t.is_cpu() && t.dim() == 0; };
+  return !cpu_scalar(a) && !cpu_scalar(b) && at::native::result_type(a, b) == at::kComplexDouble;  // no dispatch
 }
 
 // TensorIterator's check on a written argument: the result dtype must cast to it (a complex result into a real
@@ -464,10 +485,9 @@ at::Tensor from_cpu(const at::Tensor& t, const at::Device& device) {
 at::Tensor empty_like_pu1(const at::Tensor& self, std::optional<at::ScalarType> dtype, std::optional<at::Layout> layout,
                           std::optional<at::Device> device, std::optional<bool> pin_memory,
                           std::optional<at::MemoryFormat> memory_format) {
-  if (host_backed(self) && dtype.value_or(self.scalar_type()) == at::kDouble &&
-      (!device || device->type() == self.device().type())) {
+  if (host_backed(self) && dtype.value_or(self.scalar_type()) == at::kDouble && (!device || device->is_hpu())) {
     auto like = at::empty_like(host_cpu(self), dtype, layout, at::kCPU, pin_memory, memory_format);
-    return make_host_empty(like.sizes(), like.strides(), like.dtype(), self.device());
+    return make_host_empty(like.sizes(), like.strides(), like.dtype(), device ? hpu_index(*device) : self.device());
   }
   return at::native::empty_like(self, dtype, layout, device, pin_memory, memory_format);
 }
@@ -484,9 +504,9 @@ at::Tensor clone_pu1(const at::Tensor& self, std::optional<at::MemoryFormat> mem
 at::Tensor to_copy_pu1(const at::Tensor& self, std::optional<at::ScalarType> dtype, std::optional<at::Layout> layout,
                        std::optional<at::Device> device, std::optional<bool> pin_memory, bool non_blocking,
                        std::optional<at::MemoryFormat> memory_format) {
-  if (host_backed(self) && (!device || device->type() == self.device().type())) {
+  if (host_backed(self) && (!device || device->is_hpu())) {  // hpu:N kept: a host copy reporting that device
     return from_cpu(at::_to_copy(host_cpu(self), dtype, layout, std::nullopt, pin_memory, non_blocking, memory_format),
-                    self.device());
+                    device ? hpu_index(*device) : self.device());
   }
   return at::native::_to_copy(self, dtype, layout, device, pin_memory, non_blocking, memory_format);
 }
@@ -512,7 +532,7 @@ at::Tensor host_deepcopy(const at::Tensor& self, const std::optional<at::Tensor>
     }
     storage = fresh.storage();
   }
-  auto out = at::detail::make_tensor<at::TensorImpl>(c10::TensorImpl::VIEW, std::move(storage), complex_keys(),
+  auto out = at::detail::make_tensor<at::TensorImpl>(c10::TensorImpl::VIEW, std::move(storage), host_keys(),
                                                      self.dtype());
   auto* impl = out.unsafeGetTensorImpl();
   impl->set_sizes_and_strides(self.sizes(), self.strides());
@@ -548,16 +568,22 @@ at::Tensor empty_backend_select(c10::SymIntArrayRef size, std::optional<at::Scal
                                 std::optional<at::Layout> layout, std::optional<at::Device> device,
                                 std::optional<bool> pin_memory, std::optional<at::MemoryFormat> memory_format) {
   auto ks = factory_keys(dtype, layout, device);
-  if (complex_on_hpu(dtype, ks)) {
+  if (complex_on_hpu(dtype, ks) || complex128_on_hpu(dtype, ks)) {
+    auto sizes = C10_AS_INTARRAYREF_SLOW(size);
+    // memory_format's strides (channels_last, ...), as torch's empty gives them
+    std::vector<int64_t> strides;
+    if (memory_format == at::MemoryFormat::ChannelsLast || memory_format == at::MemoryFormat::ChannelsLast3d) {
+      strides = at::empty(sizes, at::TensorOptions().dtype(*dtype).device(at::kMeta), memory_format).strides().vec();
+    } else {
+      const auto contiguous = c10::contiguous_strides(sizes);
+      strides.assign(contiguous.begin(), contiguous.end());
+    }
     const auto dev = device ? *device : at::Device(at::kHPU);
+    if (*dtype == at::kComplexDouble) {
+      return make_host_empty(sizes, strides, caffe2::TypeMeta::Make<c10::complex<double>>(), dev);
+    }
     check_not_lazy(dev, "complex64 tensor creation on HPU");
-    auto sizes = C10_AS_INTARRAYREF_SLOW(size);
-    return make_complex_empty(sizes, c10::contiguous_strides(sizes), dev);
-  }
-  if (complex128_on_hpu(dtype, ks)) {
-    auto sizes = C10_AS_INTARRAYREF_SLOW(size);
-    return make_host_empty(sizes, c10::contiguous_strides(sizes), caffe2::TypeMeta::Make<c10::complex<double>>(),
-                           *device);
+    return make_complex_empty(sizes, strides, dev);
   }
   return at::_ops::empty_memory_format::redispatch(ks, size, dtype, layout, device, pin_memory, memory_format);
 }
@@ -772,26 +798,41 @@ at::Tensor view_dtype_hpu(const at::Tensor& self, at::ScalarType dtype) {
   return complex_of(self, v.sizes(), v.strides(), v.storage_offset());
 }
 
-// The complex128 view of a host-backed float64 [..., 2] tensor (view_as_real of a complex128 one, or a slice of it).
+// The key set of a view of a host-backed tensor: an inference tensor's views are inference tensors (no autograd keys),
+// as torch's views keep their base's keys.
+DispatchKeySet keys_like(const at::Tensor& self) {
+  return self.key_set().has(DispatchKey::AutogradPrivateUse1)
+             ? complex_keys()
+             : complex_keys() - c10::autograd_dispatch_keyset_with_ADInplaceOrView;
+}
+
+// The complex view of a host-backed real [..., 2] tensor (view_as_real of a complex128 one, or a slice of it; float32
+// for a complex64 view of complex128 memory). Host memory stays host memory, whatever the dtype.
 at::Tensor view_as_complex_pu1(const at::Tensor& self) {
-  TORCH_CHECK(host_backed(self) && self.scalar_type() == at::kDouble,
+  TORCH_CHECK(host_backed(self) && (self.scalar_type() == at::kDouble || self.scalar_type() == at::kFloat),
               "hpu_complex: view_as_complex of a tagged ", self.scalar_type(), " tensor");
   auto c = at::view_as_complex(host_cpu(self));  // torch's checks (last dim 2, stride 1, even strides and offset)
-  return view_of(self, complex_keys(), c.dtype(), c.sizes(), c.strides(), c.storage_offset());
+  return view_of(self, keys_like(self), c.dtype(), c.sizes(), c.strides(), c.storage_offset());
 }
 
 at::Tensor view_as_real_pu1(const at::Tensor& self) {
   if (host_backed(self)) {
     auto r = at::view_as_real(host_cpu(self));  // torch's checks (no unresolved conjugate)
-    return view_of(self, complex_keys(), r.dtype(), r.sizes(), r.strides(), r.storage_offset());
+    return view_of(self, keys_like(self), r.dtype(), r.sizes(), r.strides(), r.storage_offset());
   }
   return pair_view(self);
 }
 
 // z.view(dtype): the stock kernel copies the PrivateUse1 key onto the new dtype, and nothing here computes on a
 // tagged real tensor (its float ops would come straight back): a real view gets the plain HPU keys, as
-// view_as_real does.
+// view_as_real does. Host memory stays tagged whatever the dtype (z128.view(complex64) is complex64 in host memory,
+// computed on the CPU); card storage cannot hold a complex128 or float64 view (complex128 lives in host memory, and
+// Habana reads float64 at float32 precision), so those raise instead of computing on a misclassified tensor.
 at::Tensor view_dtype_pu1(const at::Tensor& self, at::ScalarType dtype) {
+  TORCH_CHECK(host_backed(self) || (dtype != at::kComplexDouble && dtype != at::kDouble),
+              "hpu_complex: a ", dtype, " view of complex64 HPU storage is not supported: ", dtype, " HPU tensors "
+              "live in host memory (complex128) or at float32 precision on the card (float64). Use .to(", dtype,
+              ") for a copy");
   auto v = at::native::view_dtype(self, dtype);
   if (v.is_complex() || host_backed(v)) {  // host memory stays tagged: every op on it computes on the CPU
     return v;
@@ -873,8 +914,8 @@ bool both_real(const std::optional<at::Tensor>& pa, const std::optional<at::Tens
 }
 
 at::Tensor mul_pu1(const at::Tensor& a, const at::Tensor& b) {
-  if (any_host(a, b)) {
-    check_host_devices({&a, &b});
+  check_host_devices({&a, &b});
+  if (any_host(a, b) || promotes_to_complex128(a, b)) {
     return from_cpu(at::mul(cpu_operand(a), cpu_operand(b)), device_of(a, b));
   }
   HPU_COMPLEX_NO_AUTOCAST;
@@ -892,9 +933,25 @@ at::Tensor mul_pu1(const at::Tensor& a, const at::Tensor& b) {
   return complex_result(pa ? *pa * hpu_float(b, device).unsqueeze(-1) : *pb * hpu_float(a, device).unsqueeze(-1));
 }
 
+// a / b as torch's c10::complex division (Smith's algorithm, numpy's): the larger part of b is divided out first, so
+// |b|^2 is never formed (1 / 1e20j was 0 and 1 / 1e-30j nan - inf i with the |b|^2 form). A real operand is torch's
+// x + 0i, so NaN and signed-zero placement follow torch too; b = 0 gives a / 0 per part (complex inf or NaN).
+at::Tensor smith_div(const at::Tensor& ar, const at::Tensor& ai, const at::Tensor& br, const at::Tensor& bi) {
+  const auto abs_r = br.abs(), abs_i = bi.abs();
+  const auto real_major = abs_r >= abs_i;
+  const auto rat = at::where(real_major, bi / br, br / bi);
+  const auto scl = at::where(real_major, br + bi * rat, bi + br * rat).reciprocal();
+  auto re = at::where(real_major, ar + ai * rat, ar * rat + ai) * scl;
+  auto im = at::where(real_major, ai - ar * rat, ai * rat - ar) * scl;
+  const auto zero = (abs_r == 0).logical_and(abs_i == 0);
+  re = at::where(zero, ar / abs_r, re);
+  im = at::where(zero, ai / abs_i, im);
+  return at::stack({re, im}, -1);
+}
+
 at::Tensor div_pu1(const at::Tensor& a, const at::Tensor& b) {
-  if (any_host(a, b)) {
-    check_host_devices({&a, &b});
+  check_host_devices({&a, &b});
+  if (any_host(a, b) || promotes_to_complex128(a, b)) {
     return from_cpu(at::div(cpu_operand(a), cpu_operand(b)), device_of(a, b));
   }
   HPU_COMPLEX_NO_AUTOCAST;
@@ -904,50 +961,76 @@ at::Tensor div_pu1(const at::Tensor& a, const at::Tensor& b) {
   if (both_real(pa, pb, a, b)) {
     return at::div(a, b);
   }
-  if (!pb) {
+  if (!pb) {  // complex / real: torch's (ar + i ai) / (b + 0i) is ar / b + i ai / b for every b, zeros and NaN included
     return complex_result(*pa / hpu_float(b, device).unsqueeze(-1));
   }
   auto br = pb->select(-1, 0), bi = pb->select(-1, 1);
-  auto inv = (br * br + bi * bi).reciprocal();
-  if (!pa) {  // real / complex = a conj(b) / |b|^2
+  if (!pa) {
     auto ar = hpu_float(a, device);
-    return complex_result(at::stack({ar * br * inv, -ar * bi * inv}, -1));
+    return complex_result(smith_div(ar, at::zeros_like(ar), br, bi));
   }
-  auto ar = pa->select(-1, 0), ai = pa->select(-1, 1);
-  return complex_result(at::stack({(ar * br + ai * bi) * inv, (ai * br - ar * bi) * inv}, -1));
+  return complex_result(smith_div(pa->select(-1, 0), pa->select(-1, 1), br, bi));
 }
 
+// a + alpha b as torch computes it: alpha b is a complex product even for alpha = 1 (so inf + 0i in b gives
+// inf + nan i, as on the CPU), a real operand is x + 0i, and alpha may be complex.
 at::Tensor add_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha) {
-  if (any_host(a, b)) {
-    check_host_devices({&a, &b});
+  check_host_devices({&a, &b});
+  if (any_host(a, b) || promotes_to_complex128(a, b)) {
     return from_cpu(at::add(cpu_operand(a), cpu_operand(b), alpha), device_of(a, b));
   }
   HPU_COMPLEX_NO_AUTOCAST;
-  TORCH_CHECK(!alpha.isComplex(), "hpu_complex: complex alpha is not supported");
   const auto device = hpu_device_of(a, b);
-  const double s = alpha.toDouble();
   auto pa = pair_of(a, device);
   auto pb = pair_of(b, device);
   if (both_real(pa, pb, a, b)) {
     return at::add(a, b, alpha);
   }
-  if (pa && pb) {
-    return complex_result(s == 1.0 ? *pa + *pb : *pa + *pb * s);
+  const auto s = alpha.toComplexDouble();
+  const auto sr = static_cast<double>(static_cast<float>(s.real()));
+  const auto si = static_cast<double>(static_cast<float>(s.imag()));
+  const auto br = pb ? pb->select(-1, 0) : hpu_float(b, device);
+  // alpha b = (sr br - si bi) + i (sr bi + si br), with bi = 0 for a real b (then sr bi and si bi are the signed zeros
+  // 0 sr and 0 si: x - (+0) is x, x - (-0) is x + 0, -0 + x is x, +0 + x is x + 0).
+  at::Tensor kr, ki;
+  if (pa && pb && si == 0.0 && !a.is_cpu() && !b.is_cpu()) {
+    // Two complex tensors on the card, a real alpha (gradient accumulation, sub): pair arithmetic, one or two ops.
+    // torch's alpha * b differs from s b only where b has an inf or NaN part (inf + 0i in b gives inf + nan i there)
+    // and in the sign of an exact-zero sum; the exact form below cost 25 ms of a 75 ms lazy Green step (Gaudi2,
+    // bridge 1.21.4). A Python scalar, a real operand and a complex alpha keep torch's exact form.
+    return complex_result(sr == 1.0 ? *pa + *pb : *pa + *pb * sr);
   }
-  // complex + real: the real part moves, the imaginary part is the complex operand's (scaled when it is b).
+  if (pb) {
+    const auto bi = pb->select(-1, 1);
+    kr = br * sr - bi * si;
+    ki = bi * sr + br * si;
+  } else if (std::isfinite(sr) && std::isfinite(si)) {
+    kr = br * sr;
+    ki = br * si;
+    if (std::signbit(0.0f * static_cast<float>(si))) {
+      kr = kr + 0.0;
+    }
+    if (!std::signbit(0.0f * static_cast<float>(sr))) {
+      ki = ki + 0.0;
+    }
+  } else {
+    const auto bi = at::zeros_like(br);
+    kr = br * sr - bi * si;
+    ki = bi * sr + br * si;
+  }
   if (pa) {
-    return complex_result(stack_pair(pa->select(-1, 0) + hpu_float(b, device) * s, pa->select(-1, 1)));
+    return complex_result(stack_pair(pa->select(-1, 0) + kr, pa->select(-1, 1) + ki));
   }
-  return complex_result(stack_pair(hpu_float(a, device) + pb->select(-1, 0) * s, pb->select(-1, 1) * s));
+  return complex_result(stack_pair(hpu_float(a, device) + kr, ki + 0.0));  // a real a is a + 0i
 }
 
 at::Tensor sub_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha) {
-  if (any_host(a, b)) {
-    check_host_devices({&a, &b});
+  check_host_devices({&a, &b});
+  if (any_host(a, b) || promotes_to_complex128(a, b)) {
     return from_cpu(at::sub(cpu_operand(a), cpu_operand(b), alpha), device_of(a, b));
   }
-  TORCH_CHECK(!alpha.isComplex(), "hpu_complex: complex alpha is not supported");
-  return add_pu1(a, b, -alpha.toDouble());
+  const auto s = alpha.toComplexDouble();
+  return add_pu1(a, b, alpha.isComplex() ? at::Scalar(-s) : at::Scalar(-alpha.toDouble()));
 }
 
 // |z| = hypot(re, im), scaled by m = max(|re|, |im|) as C's hypot: Habana's own vector_norm and hypot square in float
@@ -994,7 +1077,7 @@ at::Tensor as_pair(const at::Tensor& t, const at::Device& device) {
 
 // where(cond, a, b) with a complex a or b (compiled sgn backward: where(|z| == 0, 0, z / |z|)).
 at::Tensor where_pu1(const at::Tensor& cond, const at::Tensor& a, const at::Tensor& b) {
-  if (any_host(a, b)) {
+  if (any_host(a, b) || promotes_to_complex128(a, b)) {
     check_host_devices({&a, &b});  // cond: a mask of any device, as before
     return from_cpu(at::where(cpu_operand(cond), cpu_operand(a), cpu_operand(b)), device_of(a, b));
   }
@@ -1094,56 +1177,64 @@ void check_out(const at::Tensor& out, const at::Tensor& value, bool matrix_mm) {
               ", but got ", out.dtype(), " instead");
 }
 
-at::Tensor& write_out(at::Tensor& out, const at::Tensor& value, bool matrix_mm = false) {
+void check_lazy_partial_overlap(const at::Tensor& self, const at::Tensor& src);
+
+// TensorIterator's alias check of a written tensor against the inputs: a partial overlap raises (the kernels compute
+// the value first and copy it, so the CPU's in-place order cannot be reproduced). Tagged tensors share their
+// StorageImpl with their views; host tensors' CPU views have separate storages, so the check is on the tagged ones.
+void check_written_overlap(const at::Tensor& out, std::initializer_list<const at::Tensor*> inputs) {
+  if (!tagged(out)) {
+    return;
+  }
+  for (const auto* t : inputs) {
+    if (t->defined() && tagged(*t)) {
+      at::assert_no_partial_overlap(out, *t);
+      check_lazy_partial_overlap(out, *t);
+    }
+  }
+}
+
+// An out= write, torch's checks first: an expanded out, a result dtype that cannot be cast to out's (a complex result
+// into a real out), out partly overlapping an input; then torch's resize warning, the resize and the copy.
+at::Tensor& write_out(at::Tensor& out, const at::Tensor& value, std::initializer_list<const at::Tensor*> inputs,
+                      bool matrix_mm = false) {
   check_out(out, value, matrix_mm);
+  check_can_cast(value.scalar_type(), out);
+  check_written_overlap(out, inputs);
   at::native::resize_output_check(out, value.sizes());  // torch's warning when a non-empty out changes shape
   return copy_into(out, value);
 }
 
-// An out= write of a result computed from host-backed operands: torch's checks first (an expanded out, a complex
-// result into a real out, out partly overlapping an input; the host tensors' CPU views have separate storages, so
-// TensorIterator's alias check is done here on the tagged tensors).
 at::Tensor& host_out(at::Tensor& out, const at::Tensor& value, std::initializer_list<const at::Tensor*> inputs,
                      bool matrix_mm = false) {
-  check_out(out, value, matrix_mm);
-  check_can_cast(value.scalar_type(), out);
-  if (host_backed(out)) {
-    for (const auto* t : inputs) {
-      if (host_backed(*t)) {
-        at::assert_no_partial_overlap(out, *t);
-      }
-    }
-  }
-  at::native::resize_output_check(out, value.sizes());
-  return copy_into(out, value);
+  return write_out(out, value, inputs, matrix_mm);
 }
 
 at::Tensor& mm_out_pu1(const at::Tensor& a, const at::Tensor& b, at::Tensor& out) {
-  return any_host(a, b) ? host_out(out, mm_pu1(a, b), {&a, &b}, /*matrix_mm=*/true)
-                        : write_out(out, mm_pu1(a, b), /*matrix_mm=*/true);
+  return host_out(out, mm_pu1(a, b), {&a, &b}, /*matrix_mm=*/true);
 }
 at::Tensor& bmm_out_pu1(const at::Tensor& a, const at::Tensor& b, at::Tensor& out) {
-  return any_host(a, b) ? host_out(out, bmm_pu1(a, b), {&a, &b}, /*matrix_mm=*/true)
-                        : write_out(out, bmm_pu1(a, b), /*matrix_mm=*/true);
+  return host_out(out, bmm_pu1(a, b), {&a, &b}, /*matrix_mm=*/true);
 }
 
 at::Tensor& mul_out_pu1(const at::Tensor& a, const at::Tensor& b, at::Tensor& out) {
-  return any_host(a, b) ? host_out(out, mul_pu1(a, b), {&a, &b}) : write_out(out, mul_pu1(a, b));
+  return host_out(out, mul_pu1(a, b), {&a, &b});
 }
 at::Tensor& div_out_pu1(const at::Tensor& a, const at::Tensor& b, at::Tensor& out) {
-  return any_host(a, b) ? host_out(out, div_pu1(a, b), {&a, &b}) : write_out(out, div_pu1(a, b));
+  return host_out(out, div_pu1(a, b), {&a, &b});
 }
 at::Tensor& add_out_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha, at::Tensor& out) {
-  return any_host(a, b) ? host_out(out, add_pu1(a, b, alpha), {&a, &b}) : write_out(out, add_pu1(a, b, alpha));
+  return host_out(out, add_pu1(a, b, alpha), {&a, &b});
 }
 at::Tensor& sub_out_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha, at::Tensor& out) {
-  return any_host(a, b) ? host_out(out, sub_pu1(a, b, alpha), {&a, &b}) : write_out(out, sub_pu1(a, b, alpha));
+  return host_out(out, sub_pu1(a, b, alpha), {&a, &b});
 }
+// abs/sgn/vector_norm of a complex tensor: torch's out dtype is the value's (a float out for abs, exactly).
 at::Tensor& abs_out_pu1(const at::Tensor& self, at::Tensor& out) {
-  return host_backed(self) ? host_out(out, abs_pu1(self), {&self}) : write_out(out, abs_pu1(self));
+  return host_out(out, abs_pu1(self), {&self});
 }
 at::Tensor& sgn_out_pu1(const at::Tensor& self, at::Tensor& out) {
-  return host_backed(self) ? host_out(out, sgn_pu1(self), {&self}) : write_out(out, sgn_pu1(self));
+  return host_out(out, sgn_pu1(self), {&self});
 }
 // In-place variants: the result must keep self's shape and fit its dtype, as TensorIterator enforces; copy_into
 // would otherwise resize self (detaching a view from its base) or drop an imaginary part.
@@ -1155,6 +1246,7 @@ at::Tensor& assign_inplace(at::Tensor& self, const at::Tensor& value) {
   return copy_into(self, value);
 }
 at::Tensor& mul__pu1(at::Tensor& self, const at::Tensor& other) {
+  check_written_overlap(self, {&other});  // z[1:].mul_(z[:-1]) raises, as TensorIterator does
   if (host_backed(self)) {
     check_host_devices({&other});
     return host_inplace(self, [&](at::Tensor& s) { s.mul_(cpu_operand(other)); });
@@ -1165,9 +1257,15 @@ at::Tensor& mul__pu1(at::Tensor& self, const at::Tensor& other) {
     check_can_cast(value.scalar_type(), self);
     return assign_inplace(self, value.to(self.scalar_type()));
   }
+  if (promotes_to_complex128(self, other)) {  // complex64 self, float64 other: computed in complex128, cast back
+    check_host_devices({&self, &other});
+    auto value = at::mul(cpu_operand(self), cpu_operand(other));
+    return assign_inplace(self, value.to(self.scalar_type()));
+  }
   return assign_inplace(self, mul_pu1(self, other));
 }
 at::Tensor& add__pu1(at::Tensor& self, const at::Tensor& other, const at::Scalar& alpha) {
+  check_written_overlap(self, {&other});
   if (host_backed(self)) {
     check_host_devices({&other});
     return host_inplace(self, [&](at::Tensor& s) { s.add_(cpu_operand(other), alpha); });
@@ -1176,6 +1274,11 @@ at::Tensor& add__pu1(at::Tensor& self, const at::Tensor& other, const at::Scalar
     check_host_devices({&self});
     auto value = at::add(cpu_operand(self), cpu_operand(other), alpha);
     check_can_cast(value.scalar_type(), self);
+    return assign_inplace(self, value.to(self.scalar_type()));
+  }
+  if (promotes_to_complex128(self, other)) {
+    check_host_devices({&self, &other});
+    auto value = at::add(cpu_operand(self), cpu_operand(other), alpha);
     return assign_inplace(self, value.to(self.scalar_type()));
   }
   return assign_inplace(self, add_pu1(self, other, alpha));
@@ -1237,8 +1340,15 @@ std::optional<at::Tensor> real_times_complex_scalar(const std::string& name, c10
     return std::nullopt;
   }
   const auto& other = args[1 - real_at];
-  if (other.isTensor() && other.toTensor().requires_grad()) {  // its gradient: the promoted op's autograd
-    return std::nullopt;
+  // A 0-d complex tensor is read with .item() only when its autograd is not needed: not when it requires grad or has
+  // a forward-AD tangent (those keep the promoted op, whose autograd has both). Not covered: a w modified in place
+  // between x * w and the backward is not detected (README Limits); Green makes 10 such calls a step, and the
+  // promoted op cost them ~90 dispatched ops (measured with torch.profiler).
+  if (other.isTensor()) {
+    const auto& w = other.toTensor();
+    if (w.requires_grad() || w._fw_grad(/*level=*/0).defined()) {
+      return std::nullopt;
+    }
   }
   const auto c64 = other.isTensor() ? other.toTensor().item().toComplexDouble() : other.toScalar().toComplexDouble();
   const c10::complex<float> c(static_cast<float>(c64.real()), static_cast<float>(c64.imag()));
@@ -1276,6 +1386,22 @@ std::optional<at::Tensor> real_times_complex_scalar_1d(bool mul, bool sub, c10::
   return at::complex(re, at::full_like(re, static_cast<double>(k_im)));
 }
 
+// torch's argument checks of add/sub/rsub that the promotion would skip (they live in the CPU/CUDA kernels, not in the
+// meta functions): bool subtraction (sub_check) and a bool alpha for a non-bool result (alpha_check).
+void check_like_torch(const c10::FunctionSchema& schema, c10::ArrayRef<c10::IValue> args) {
+  const auto& name = schema.name();
+  const bool sub = name == "aten::sub" || name == "aten::sub_" || name == "aten::rsub";
+  const auto is_bool = [](const c10::IValue& v) {
+    return v.isTensor() ? v.toTensor().scalar_type() == at::kBool : v.isScalar() && v.toScalar().isBoolean();
+  };
+  TORCH_CHECK(!sub || !(is_bool(args[0]) || is_bool(args[1])), "Subtraction, the `-` operator, with a bool tensor is "
+              "not supported. If you are trying to invert a mask, use the `~` or `logical_not()` operator instead.");
+  const auto alpha = schema.argumentIndexWithName("alpha");
+  if (alpha && args[*alpha].isScalar()) {
+    TORCH_CHECK(!args[*alpha].toScalar().isBoolean(), "Boolean alpha only supported for Boolean results.");
+  }
+}
+
 void complex_scalar_autograd_hpu(const c10::OperatorHandle& op, DispatchKeySet ks, torch::jit::Stack* stack) {
   const auto& schema = op.schema();
   const auto n = schema.arguments().size();
@@ -1289,9 +1415,12 @@ void complex_scalar_autograd_hpu(const c10::OperatorHandle& op, DispatchKeySet k
   }
   const auto* self_alias = schema.arguments()[0].alias_info();
   const bool inplace = self_alias != nullptr && self_alias->isWrite();
-  // torch's check, before Habana's float add/sub sees a complex alpha (two real HPU tensors)
-  if ((schema.name() == "aten::add" || schema.name() == "aten::sub") && n >= 3 && args[2].isScalar() &&
-      args[2].toScalar().isComplex() && real_hpu(args[0]) && args[1].isTensor() && !args[1].toTensor().is_complex()) {
+  // torch's check, before Habana's float add/sub sees a complex alpha (two real HPU tensors; add_, sub_, rsub too)
+  const auto& name = schema.name();
+  if ((name == "aten::add" || name == "aten::sub" || name == "aten::add_" || name == "aten::sub_" ||
+       name == "aten::rsub") &&
+      n >= 3 && args[2].isScalar() && args[2].toScalar().isComplex() && real_hpu(args[0]) && args[1].isTensor() &&
+      !args[1].toTensor().is_complex()) {
     TORCH_CHECK(false, "For non-complex input tensors, argument alpha must not be a complex number.");
   }
   int64_t real_at = -1;
@@ -1319,6 +1448,8 @@ void complex_scalar_autograd_hpu(const c10::OperatorHandle& op, DispatchKeySet k
                   " can't be cast to the desired output type ", written.scalar_type());
     }
   }
+  // the promotion below must not accept a call torch rejects (sub(bool_x, 1j), add(x, 1j, alpha=True)).
+  check_like_torch(schema, args);
   TORCH_CHECK(result == at::kComplexFloat || result == at::kComplexDouble, "hpu_complex: ", result,
               " is not supported on HPU (complex64 and complex128 are)");
   if (!writes && result == at::kComplexFloat) {
@@ -1430,28 +1561,35 @@ at::Tensor& copy_pu1(at::Tensor& self, const at::Tensor& src, bool non_blocking)
 }
 
 // Resize a tagged complex tensor in place, as resize_ does: contiguous strides at the same offset, in the same
-// storage; one too small grows in place (a new allocation of the same StorageImpl, so every view of it sees the
-// result; the old contents are not kept: callers overwrite them all).
+// storage. One too small grows in place, as torch's resize_bytes does: a new allocation in the same StorageImpl with
+// the old bytes copied over, so every view of it sees the result and values outside the resized range are kept
+// (torch.neg(v, out=base[1:]) keeps base[0]).
 void resize_complex(at::Tensor& t, c10::IntArrayRef sizes) {
   auto strides = c10::contiguous_strides(sizes);
   const auto needed = static_cast<size_t>(
       at::detail::computeStorageNbytes(sizes, strides, t.dtype().itemsize(), t.storage_offset()));
   auto storage = t.storage();
-  if (storage.nbytes() < needed) {
+  const auto old_nbytes = storage.nbytes();
+  if (old_nbytes < needed) {
     if (host_backed(t)) {  // host memory has no allocator: a new host block in the same StorageImpl
       void* data = c10::alloc_cpu(needed);
+      if (old_nbytes > 0) {
+        std::memcpy(data, storage.data(), old_nbytes);
+      }
       storage.set_data_ptr_noswap(c10::DataPtr(data, data, &host_free, hpu_index(t.device())));
-    } else if (lazy_base(t).defined()) {
-      // Lazy mode: a new Habana tensor in the same StorageImpl (the old LazyOwner is released), so every view of the
-      // storage sees it, as eager growth does; the old contents are not kept.
-      auto flat = at::empty({static_cast<int64_t>((needed + sizeof(float) - 1) / sizeof(float))},
-                            at::TensorOptions().dtype(at::kFloat).device(t.device()));
-      auto* ctx = lazy_owner(flat);
-      storage.set_data_ptr_noswap(c10::DataPtr(ctx, ctx, &lazy_owner_free, t.device()));
+    } else if (auto old = lazy_base(t); old.defined()) {
+      // Lazy mode: Habana's own resize_ of the storage's Habana tensor (its detached alias): Habana grows the storage
+      // in its lazy graph, keeps the old values, and its views taken before (view_as_real, .real of this tensor, the
+      // real tensor it was made from) follow it (measured, Gaudi2, bridge 1.21.4: a float view taken before resize_
+      // reads later writes). The Habana tensor's sizes do not matter here: its views are as_strided in storage terms.
+      const auto floats = static_cast<int64_t>((needed + sizeof(float) - 1) / sizeof(float));
+      old.resize_({std::max<int64_t>(floats - old.storage_offset(), 0)});
     } else {
-      auto* allocator = storage.allocator();
-      TORCH_CHECK(allocator != nullptr && storage.resizable(), "Trying to resize storage that is not resizable");
-      storage.set_data_ptr_noswap(allocator->allocate(needed));
+      // torch's own storage growth for the device (resize_bytes_nocuda: Habana's resize_ of a byte tensor over the
+      // storage, which copies the old bytes in its stream order). Copying them here around a swapped DataPtr lost them
+      // on the card: Habana's eager ops resolve the storage's address when they run, after the swap (measured).
+      TORCH_CHECK(storage.resizable(), "Trying to resize storage that is not resizable");
+      at::native::resize_bytes_nocuda(storage, static_cast<int64_t>(needed));
     }
     storage.set_nbytes(needed);
   }
@@ -1505,7 +1643,7 @@ at::Tensor sum_pu1(const at::Tensor& self, at::OptionalIntArrayRef dim, bool kee
 
 at::Tensor& sum_out_pu1(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,
                         std::optional<at::ScalarType> dtype, at::Tensor& out) {
-  return write_out(out, sum_pu1(self, dim, keepdim, dtype));
+  return write_out(out, sum_pu1(self, dim, keepdim, dtype), {&self});
 }
 
 at::Tensor& fill_pu1(at::Tensor& self, const at::Scalar& value) {
@@ -1528,24 +1666,46 @@ at::Tensor& zero_pu1(at::Tensor& self) {
 }
 
 // torch.load rebuilds every tensor as empty(0).set_(storage, offset, size, stride): attach the device storage in
-// place, as the backends' own set_ kernels do (the CPU fallback would hand a CPU tensor the HPU storage).
+// place, as the backends' own set_ kernels do (the CPU fallback would hand a CPU tensor the HPU storage). The bounds are
+// checked before anything is installed: a set_ that raises leaves self (and a tensor autograd saved) unchanged.
 at::Tensor& set_storage_pu1(at::Tensor& self, at::Storage source, int64_t storage_offset, c10::IntArrayRef size,
                             c10::IntArrayRef stride) {
+  const auto strides = stride.empty() ? c10::contiguous_strides(size) : at::DimVector(stride.begin(), stride.end());
+  const bool lazy_source = source.data_ptr().get_deleter() == &lazy_owner_free;
   if (self.scalar_type() != at::kComplexFloat && source.device().type() == at::kHPU &&
       source.data_ptr().get_deleter() != &host_free) {
+    // A complex64 storage made in lazy mode holds a Habana tensor, not bytes: there is nothing to copy from it.
+    TORCH_CHECK(!lazy_source, "hpu_complex: set_ of a ", self.scalar_type(), " HPU tensor onto the storage of a "
+                "complex64 tensor made in Habana lazy mode is not supported (", self.scalar_type(), " HPU tensors "
+                "live in host memory): use .to(", self.scalar_type(), ") instead");
     // complex128 from Habana storage (torch.load(map_location="hpu") restores storages there): its bytes are copied
     // into host memory, so the tensor holds its own copy rather than an alias of source.
     const auto nbytes = static_cast<int64_t>(source.nbytes());
+    at::native::checkInBoundsForStorage(size, c10::IntArrayRef(strides), storage_offset, self.dtype(), source);
     auto bytes = at::empty({0}, at::TensorOptions().dtype(at::kByte).device(source.device()));
     bytes.set_(source, 0, {nbytes}, {1});
     auto host = make_host_empty({nbytes}, {1}, caffe2::TypeMeta::Make<uint8_t>(), source.device());
     host_cpu(host).copy_(bytes.cpu());
     source = host.storage();
   }
-  const auto strides = stride.empty() ? c10::contiguous_strides(size) : at::DimVector(stride.begin(), stride.end());
+  at::native::checkInBoundsForStorage(size, c10::IntArrayRef(strides), storage_offset, self.dtype(), source);
   at::native::checkSetStorage(self, std::move(source), storage_offset, size, c10::IntArrayRef(strides));
   at::native::setStrided(self, size, c10::IntArrayRef(strides), storage_offset);
   return self;
+}
+
+// a.set_(storage): the whole storage as a 1-D tensor (ATen's composite would build a CPU tensor first: a device error).
+at::Tensor& set_source_storage_pu1(at::Tensor& self, at::Storage source) {
+  const auto n = static_cast<int64_t>(source.nbytes() / self.dtype().itemsize());
+  return set_storage_pu1(self, std::move(source), 0, {n}, {});
+}
+
+// a.set_(): an empty tensor over a fresh empty storage of its own, detached from the old one (its views keep it).
+at::Tensor& set_empty_pu1(at::Tensor& self) {
+  auto fresh = host_backed(self) || self.scalar_type() != at::kComplexFloat
+                   ? make_host_empty({0}, {1}, self.dtype(), self.device())
+                   : make_complex_empty({0}, {1}, self.device());
+  return set_storage_pu1(self, fresh.storage(), 0, {0}, {});
 }
 
 // a.set_(b): a takes b's storage, offset, sizes and strides, so the two alias (ATen's kernel: set_ on the storage,
@@ -1575,7 +1735,10 @@ at::Tensor neg_pu1(const at::Tensor& self) {
 }
 
 // exp(a + ib) = e^a (cos b + i sin b). An imaginary part that is exactly 0 stays exactly 0 (signed), as C99 cexp and
-// torch's kernels give for a real-valued complex input (exp(inf + 0i) = inf + 0i, not inf * sin(0) = NaN).
+// torch's kernels give for a real-valued complex input (exp(inf + 0i) = inf + 0i, not inf * sin(0) = NaN). e^a is
+// split in two halves, (e^(a/2) cos b) e^(a/2): a result that fits in float32 (exp(88.75 + i pi/4) = 2.47e38 (1 + i))
+// is not lost to an e^a that overflows first (torch's own complex64 kernel gives inf + inf i there). One rounding more
+// than e^a cos b (within 2 ulp of torch); three launches more, where a where(a > 88, ...) form cost seven.
 at::Tensor exp_pu1(const at::Tensor& self) {
   if (host_backed(self)) {
     return from_cpu(at::exp(host_cpu(self)), self.device());
@@ -1583,11 +1746,11 @@ at::Tensor exp_pu1(const at::Tensor& self) {
   HPU_COMPLEX_NO_AUTOCAST;
   auto pair = values_pair(self);
   auto a = pair.select(-1, 0), b = pair.select(-1, 1);
-  auto ea = a.exp();
+  auto ea = (a * 0.5).exp();  // e^(a/2): (e^(a/2) cos b) e^(a/2) overflows only where the result does
+  auto re = ea * b.cos() * ea;
   // where(b != 0, ...), not where(b == 0, b, ...): the same values, and 6x faster on Gaudi2 eager (bridge 1.21.4:
   // 0.26 against 1.5 ms for this exp of a (10, 125) tensor, measured; the == form was slower than the CPU fallback).
-  auto im = at::where(b != 0, ea * b.sin(), b);
-  auto re = ea * b.cos();
+  auto im = at::where(b != 0, ea * b.sin() * ea, b);
   // C99 cexp at an infinite real part and a non-finite imaginary part: exp(-inf + i inf/nan) = 0 + 0i,
   // exp(+inf + i inf/nan) = inf + nan i (e^a * cos(b) would be NaN for both). ea is 0 or inf there, and ea - ea gives
   // the imaginary part (0 - 0 = 0, inf - inf = nan).
@@ -1597,12 +1760,42 @@ at::Tensor exp_pu1(const at::Tensor& self) {
   return complex_result(at::stack({re, im}, -1));
 }
 
+// neg/exp with out=: a real self (dispatched here through a complex out) is torch's real op, then cast into out as
+// TensorIterator does: exp(float, out=complex64) is accepted, neg's out must have self's dtype.
 at::Tensor& neg_out_pu1(const at::Tensor& self, at::Tensor& out) {
-  return host_backed(self) ? host_out(out, neg_pu1(self), {&self}) : write_out(out, neg_pu1(self));
+  if (!self.is_complex() && !host_backed(self)) {
+    TORCH_CHECK(out.scalar_type() == self.scalar_type(), "Found dtype ", out.scalar_type(), " but expected ",
+                self.scalar_type());
+  }
+  return write_out(out, self.is_complex() || host_backed(self) ? neg_pu1(self) : at::neg(self), {&self});
 }
 
 at::Tensor& exp_out_pu1(const at::Tensor& self, at::Tensor& out) {
-  return host_backed(self) ? host_out(out, exp_pu1(self), {&self}) : write_out(out, exp_pu1(self));
+  return write_out(out, self.is_complex() || host_backed(self) ? exp_pu1(self) : at::exp(self), {&self});
+}
+
+// masked_fill_ on an expanded self (stride 0, size > 1): torch warns and writes through every alias, so a memory
+// location gets the value when any mask element over it is set. The mask is reduced over the expanded dims, and the
+// fill runs on one slice of them.
+bool fill_expanded(at::Tensor& self, const at::Tensor& m, const at::Scalar& value) {
+  std::vector<int64_t> dims;
+  for (int64_t d = 0; d < self.dim(); ++d) {
+    if (self.stride(d) == 0 && self.size(d) > 1) {
+      dims.push_back(d);
+    }
+  }
+  if (dims.empty()) {
+    return false;
+  }
+  TORCH_WARN("Use of masked_fill_ on expanded tensors is deprecated. Please clone() the tensor before performing this "
+             "operation. This also applies to advanced indexing e.g. tensor[mask] = scalar");
+  auto slice = self;
+  for (auto d : dims) {
+    slice = slice.narrow(d, 0, 1);
+  }
+  auto any = m.any(dims, /*keepdim=*/true);  // where some alias of an element is masked
+  slice.masked_fill_(any, value);
+  return true;
 }
 
 at::Tensor& masked_fill_pu1(at::Tensor& self, const at::Tensor& mask, const at::Scalar& value) {
@@ -1612,10 +1805,14 @@ at::Tensor& masked_fill_pu1(at::Tensor& self, const at::Tensor& mask, const at::
     return host_inplace(self, [&](at::Tensor& s) { s.masked_fill_(cpu_operand(mask), value); });
   }
   HPU_COMPLEX_NO_AUTOCAST;
-  at::assert_no_internal_overlap(self);
+  // torch's checked conversion of the value (an overflowing part raises: complex(-0.0, 1e40) is not -0 + inf i).
+  const auto c = static_cast<c10::complex<double>>(value.to<c10::complex<float>>());
   // torch's in-place rule: the mask broadcasts to self, never self to the mask.
   auto m = (mask.dim() >= 5 ? dense_copy(mask) : mask).to(self.device()).expand(self.sizes());
-  const auto c = value.toComplexDouble();
+  if (fill_expanded(self, m, value)) {
+    return self;
+  }
+  at::assert_no_internal_overlap(self);
   auto pair = values_pair(self);
   const bool plus_zero = c.real() == 0.0 && c.imag() == 0.0 && !std::signbit(c.real()) && !std::signbit(c.imag());
   const bool signed_zero = (c.real() == 0.0 && std::signbit(c.real())) || (c.imag() == 0.0 && std::signbit(c.imag()));
@@ -1694,12 +1891,45 @@ at::Tensor cat_pu1(const at::ITensorListRef& tensors, int64_t dim) {
   return complex_result(at::cat(pairs, d));
 }
 
+// cat.out as torch: the inputs' result type must cast to out's dtype (no complex into a real out), out may not overlap
+// an input, and the values are concatenated in out's dtype (an int32 16777217 into a complex128 out stays exact): the
+// card's pair path for a complex64 out, the CPU otherwise.
 at::Tensor& cat_out_pu1(const at::ITensorListRef& tensors, int64_t dim, at::Tensor& out) {
-  return write_out(out, cat_pu1(tensors, dim));
+  std::vector<at::Tensor> all(tensors.begin(), tensors.end());
+  TORCH_CHECK(!all.empty(), "torch.cat(): expected a non-empty list of Tensors");
+  const auto result = at::native::result_type(at::ITensorListRef(all));
+  TORCH_CHECK(at::canCast(result, out.scalar_type()), "torch.cat(): input types can't be cast to the desired output "
+              "type ", out.scalar_type());
+  at::assert_no_internal_overlap(out);
+  for (const auto& t : all) {
+    if (tagged(t) && tagged(out)) {
+      at::assert_no_overlap(out, t);
+    }
+  }
+  bool host = host_backed(out);
+  for (const auto& t : all) {
+    host |= host_backed(t);
+  }
+  at::Tensor value;
+  if (!host && out.scalar_type() == at::kComplexFloat && result != at::kComplexDouble) {
+    value = cat_pu1(tensors, dim);
+  } else {
+    std::vector<at::Tensor> cpu;
+    for (const auto& t : all) {
+      TORCH_CHECK(t.device() == out.device(), "Expected all tensors to be on the same device, but found at least two "
+                  "devices, ", out.device(), " and ", t.device(), "!");
+      cpu.push_back(cpu_operand(t).to(out.scalar_type()));
+    }
+    value = at::cat(cpu, dim);
+  }
+  at::native::resize_output_check(out, value.sizes());
+  return copy_into(out, value);
 }
 
-// ||z||_ord over dim = the real vector norm of |z| (any ord, dim, keepdim: torch's own kernel on the moduli). ord 2
-// reduces the pairs directly: sqrt of the sum of squares over dim and the pair dim, one launch.
+// ||z||_ord over dim = the real vector norm of |z| (the scaled modulus), for every ord. Habana's float norm squares
+// unscaled (|1e-30| gave 0, |3e19 + 3e19j| inf): a positive finite ord is computed as M ||z / M|| with M the largest
+// modulus over dim, a negative one with the smallest, so nothing over- or underflows that torch keeps; 0 and +-inf
+// need no scaling. Duplicate dims raise as torch (also for a 0-d input).
 at::Tensor vector_norm_pu1(const at::Tensor& self, const at::Scalar& ord, at::OptionalIntArrayRef dim, bool keepdim,
                            std::optional<at::ScalarType> dtype) {
   if (host_backed(self)) {
@@ -1714,34 +1944,57 @@ at::Tensor vector_norm_pu1(const at::Tensor& self, const at::Scalar& ord, at::Op
     return at::linalg_vector_norm(self.cpu(), ord, dim, keepdim, std::nullopt).to(self.device());
   }
   HPU_COMPLEX_NO_AUTOCAST;
-  auto pair = values_pair(self);
-  if (!ord.isComplex() && ord.toDouble() == 2.0) {
-    std::vector<int64_t> dims;
-    if (dim.has_value() && !dim->empty()) {
-      for (auto d : *dim) {
-        dims.push_back(c10::maybe_wrap_dim(d, std::max<int64_t>(self.dim(), 1)));
+  const auto p = ord.toDouble();
+  std::vector<int64_t> dims;
+  if (dim.has_value()) {
+    dims.assign(dim->begin(), dim->end());
+  }
+  (void)at::dim_list_to_bitset(dims, std::max<int64_t>(self.dim(), 1));  // torch's duplicate and range checks
+  if (p == 2.0) {
+    // ord 2 (Green's norm): one scaled reduction of the pairs over dim and the pair dim, M sqrt(sum (x / M)^2) with M
+    // the largest |part|, half the launches of the general path; an infinite part gives inf even next to a NaN.
+    auto pair = values_pair(self);
+    std::vector<int64_t> all;
+    if (dims.empty()) {
+      for (int64_t d = 0; d < self.dim(); ++d) {
+        all.push_back(d);
       }
     } else {
-      for (int64_t d = 0; d < self.dim(); ++d) {
-        dims.push_back(d);
+      for (auto d : dims) {
+        all.push_back(c10::maybe_wrap_dim(d, std::max<int64_t>(self.dim(), 1)));
       }
     }
     if (self.dim() == 0) {
-      dims.clear();
+      all.clear();
     }
-    dims.push_back(pair.dim() - 1);
-    auto out = at::linalg_vector_norm(pair, 2, dims, /*keepdim=*/true);
-    out = out.squeeze(-1);
-    dims.pop_back();
-    return keepdim || dims.empty() ? out : out.squeeze(dims);
+    all.push_back(pair.dim() - 1);
+    const auto inf = std::numeric_limits<float>::infinity();
+    const auto mag = at::nan_to_num(pair.abs(), 0.0, inf, -inf);  // NaN parts out of the bound: inf wins over NaN
+    const auto bound = at::amax(mag, all, /*keepdim=*/true);
+    const auto scale = at::where(bound.isfinite().logical_and(bound > 0), bound, at::ones_like(bound));
+    auto norm = at::linalg_vector_norm(pair / scale, 2, all, /*keepdim=*/true) * scale;
+    norm = at::where(bound == inf, bound, norm);
+    norm = norm.squeeze(-1);
+    all.pop_back();
+    return keepdim || all.empty() ? norm : norm.squeeze(all);
   }
-  return at::linalg_vector_norm(modulus(pair, false), ord, dim, keepdim, std::nullopt);
+  const auto mod = modulus(values_pair(self), false);
+  if (p == 0.0 || std::isinf(p) || std::isnan(p)) {
+    return at::linalg_vector_norm(mod, ord, dim, keepdim, std::nullopt);
+  }
+  const auto bound = p > 0 ? at::amax(mod, dims, /*keepdim=*/true) : at::amin(mod, dims, /*keepdim=*/true);
+  const auto scale = at::where(bound.isfinite().logical_and(bound > 0), bound, at::ones_like(bound));
+  auto norm = at::linalg_vector_norm(mod / scale, ord, dim, keepdim, std::nullopt);
+  return norm * scale.view(norm.sizes());
 }
 
 at::Tensor& vector_norm_out_pu1(const at::Tensor& self, const at::Scalar& ord, at::OptionalIntArrayRef dim,
                                 bool keepdim, std::optional<at::ScalarType> dtype, at::Tensor& out) {
-  return host_backed(self) ? host_out(out, vector_norm_pu1(self, ord, dim, keepdim, dtype), {&self})
-                           : write_out(out, vector_norm_pu1(self, ord, dim, keepdim, dtype));
+  auto value = vector_norm_pu1(self, ord, dim, keepdim, dtype);
+  // torch's rule: out has the norm's (real) dtype exactly.
+  TORCH_CHECK(out.scalar_type() == value.scalar_type(), "Expected out tensor to have dtype ",
+              c10::toRealValueType(dtype.value_or(self.scalar_type())), ", but got ", out.scalar_type(), " instead");
+  return write_out(out, value, {&self});
 }
 
 // ---- autograd of _fft_r2c on HPU: the onesided backward as one GEMM ----------------------
@@ -1859,6 +2112,23 @@ void host_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   std::optional<at::Device> device;
   std::vector<std::pair<at::Tensor, at::Tensor>> written;  // (argument, its CPU copy)
   check_no_partial_overlap(schema, originals);
+  // torch's device rule for the tensor arguments (index lists, Tensor?[], may stay on the CPU as torch allows): one
+  // device, index included; a CPU tensor only as a 0-d scalar.
+  std::optional<at::Device> common;
+  for (const auto& iv : originals) {
+    if (!iv.isTensor() || !iv.toTensor().defined()) {
+      continue;
+    }
+    const auto& t = iv.toTensor();
+    if (t.is_cpu()) {
+      TORCH_CHECK(t.dim() == 0, "Expected all tensors to be on the same device, but found at least two devices, hpu:0 "
+                  "and cpu! (in ", schema.operator_name(), ")");
+    } else {
+      TORCH_CHECK(!common || *common == t.device(), "Expected all tensors to be on the same device, but found at least "
+                  "two devices, ", *common, " and ", t.device(), "! (in ", schema.operator_name(), ")");
+      common = t.device();
+    }
+  }
   auto to_cpu = [&](const at::Tensor& t, bool write) {
     if (!t.defined() || t.is_cpu()) {
       return t;
@@ -1929,11 +2199,14 @@ void host_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   }
 }
 
+std::atomic<int64_t> cpu_fallback_calls{0};
+
 void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   if (has_host_arg(op, stack)) {
     host_fallback(op, stack);
     return;
   }
+  cpu_fallback_calls.fetch_add(1);
   static std::set<std::string> warned;
   static std::mutex warned_mutex;
   {
@@ -2094,6 +2367,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("fill_.Scalar", &fill_pu1);
   m.impl("zero_", &zero_pu1);
   m.impl("set_.source_Storage_storage_offset", &set_storage_pu1);
+  m.impl("set_.source_Storage", &set_source_storage_pu1);
+  m.impl("set_", &set_empty_pu1);
 }
 
 TORCH_LIBRARY_FRAGMENT(hpu_complex, m) {  // a fragment: Team C's branch may define the namespace too
@@ -2107,6 +2382,11 @@ TORCH_LIBRARY_FRAGMENT(hpu_complex, m) {  // a fragment: Team C's branch may def
         });
   // Whether a host-backed tensor was ever allocated: torch.compile(hpu_backend) then keeps float64 nodes eager.
   m.def("host_in_use() -> bool", []() { return host_in_use(); });
+  // Whether a tensor lives in host memory (complex128, its real and dtype views, float64 results): torch.save,
+  // copy.deepcopy and the torch.compile guards ask this, never the dtype.
+  m.def("is_host_backed(Tensor t) -> bool", [](const at::Tensor& t) { return host_backed(t); });
+  // How many calls reached the CPU fallback (warned once per op; card checks compare this count around a call).
+  m.def("cpu_fallback_calls() -> int", []() { return cpu_fallback_calls.load(); });
   // Lazy mode: how many complex64 storages hold a Habana tensor (lazy_check checks that it drains).
   m.def("lazy_storages_alive() -> int", []() { return lazy_owners_alive.load(); });
 }

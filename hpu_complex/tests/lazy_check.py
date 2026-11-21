@@ -210,13 +210,38 @@ def check_lazy_aliasing():
     r3.add_(1)
     htcore.mark_step()
     assert torch.equal(z3.cpu(), torch.full((4,), 1 + 2j)) and torch.equal(r3.cpu()[:, 1], torch.full((4,), 2.0))
-    # 3. an out= resize keeps the StorageImpl: a view taken before sees the result, as in eager mode
+    # 3. an out= resize keeps the StorageImpl: a complex view taken before sees the result, as in eager mode, and
+    # the values outside the resized range are kept (main lost them)
     out = torch.zeros(2, dtype=torch.complex64, device=hpu)
     alias = out.view(-1)
     torch.mul(torch.ones(6, device=hpu), 2j, out=out)
     htcore.mark_step()
     assert out.shape == (6,) and out.untyped_storage is not None
     assert alias.data_ptr() == out.data_ptr(), "out= resize detached a view"
+    assert torch.equal(alias.cpu(), torch.full((2,), 2j)) and torch.equal(out.cpu(), torch.full((6,), 2j)), alias.cpu()
+    base = torch.tensor([11, 22, 33], dtype=torch.complex64, device=hpu)
+    torch.neg(torch.tensor([7, 8, 9, 10], dtype=torch.complex64, device=hpu), out=base[1:])
+    htcore.mark_step()
+    assert torch.equal(base.cpu(), torch.tensor([11, -7, -8], dtype=torch.complex64)), base.cpu()
+    # 3b. real views taken before the growth follow it (Habana's own resize_ of the storage's Habana tensor; main
+    # grew into a new Habana tensor, and a real view kept reading the old values)
+    out2 = torch.zeros(2, dtype=torch.complex64, device=hpu)
+    real, imag = torch.view_as_real(out2), out2.imag
+    torch.mul(torch.ones(6, device=hpu), 2j, out=out2)
+    htcore.mark_step()
+    assert torch.equal(real.cpu(), torch.tensor([[0.0, 2.0], [0.0, 2.0]])), real.cpu()
+    out2.add_(1)
+    htcore.mark_step()
+    assert torch.equal(real.cpu()[:, 0], torch.ones(2)) and torch.equal(imag.cpu(), torch.full((2,), 2.0)), real.cpu()
+    del real, imag
+    # 3c. set_ of a complex128 tensor onto a lazy complex64 storage raises (main handed Habana a LazyOwner pointer)
+    z64 = torch.zeros(2, dtype=torch.complex64, device=hpu)
+    try:
+        torch.empty(0, dtype=torch.complex128, device=hpu).set_(z64.untyped_storage(), 0, (1,), (1,))
+    except RuntimeError as exc:
+        assert "lazy mode" in str(exc), str(exc)
+    else:
+        raise AssertionError("complex128 set_ onto a lazy complex64 storage did not raise")
     # 4. two view_as_complex of one tensor: torch's partial-overlap check still fires
     r4 = torch.randn(5, 2, device=hpu)
     a, b = torch.view_as_complex(r4), torch.view_as_complex(r4)
@@ -238,7 +263,7 @@ def check_lazy_aliasing():
         print(f"lazy_check untyped_storage().cpu() raises: {str(exc).splitlines()[0][:100]}")
     else:
         raise AssertionError("untyped_storage().cpu() of a lazy complex tensor did not raise")
-    print("lazy_check aliasing (r.data=, resize_, writes both ways, out= resize, overlap, save): OK")
+    print("lazy_check aliasing (r.data=, resize_, writes both ways, out= resize and growth, set_, overlap, save): OK")
 
 
 def check_lazy_storages_drain():

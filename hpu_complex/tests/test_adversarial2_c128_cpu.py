@@ -97,11 +97,11 @@ OPS = {
     "chunk": (lambda a: a.chunk(2, 1), [A]), "movedim": (lambda a: a.movedim(0, 1).contiguous(), [A]),
     "reshape_noncontig": (lambda a: a.mT.reshape(-1), [A]), "flatten_view": (lambda a: a.flatten(), [A]),
     "expand_contig": (lambda a: a[:1].expand(3, 4).contiguous(), [A]),
-    "gather": (lambda a: a.gather(1, torch.tensor([[0, 1], [2, 3], [1, 1]])), [A]),
-    "index_select": (lambda a: a.index_select(1, torch.tensor([3, 0])), [A]),
-    "take": (lambda a: a.take(torch.tensor([0, 5, 11])), [A]),
+    "gather": (lambda a: a.gather(1, torch.tensor([[0, 1], [2, 3], [1, 1]], device=a.device)), [A]),
+    "index_select": (lambda a: a.index_select(1, torch.tensor([3, 0], device=a.device)), [A]),
+    "take": (lambda a: a.take(torch.tensor([0, 5, 11], device=a.device)), [A]),
     "nonzero_mask": (lambda a: a[a.real > 0], [A]),
-    "scatter_add": (lambda a, b: a.clone().scatter_add_(1, torch.tensor([[0, 0, 1, 1]] * 3), b), [A, B]),
+    "scatter_add": (lambda a, b: a.clone().scatter_add_(1, torch.tensor([[0, 0, 1, 1]] * 3, device=a.device), b), [A, B]),
     "index_put_accumulate": (lambda a, b: a.clone().index_put_((torch.tensor([0, 0]),), b[:2], accumulate=True), [A, B]),
     "masked_scatter": (lambda a, b: a.masked_scatter(a.real > 0, b), [A, B]),
     "pad": (lambda a: torch.nn.functional.pad(a, (1, 2)), [A]),
@@ -219,6 +219,18 @@ def test_resize_then_view_sees_writes():
     v = z[0]
     z.fill_(3)
     same(back(v), torch.full((4,), 3, dtype=C128), 0)
+
+
+def test_view_taken_before_growth_keeps_values_and_sees_writes():
+    """A view taken BEFORE the storage grows: torch keeps the old bytes and the view keeps aliasing the storage."""
+    for dev in ("cpu", HPU):
+        z = torch.tensor([[1, 2], [3, 4]], dtype=C128, device=dev)
+        before, real = z.view(-1), z.real  # a complex and a float64 view
+        z.resize_(4, 4)
+        same(back(z.view(-1)[:4]), torch.tensor([1, 2, 3, 4], dtype=C128), 0)  # main: the prefix was lost
+        z.fill_(3)
+        same(back(before), torch.full((4,), 3, dtype=C128), 0)
+        same(back(real), torch.full((2, 2), 3, dtype=F64), 0)
 
 
 def test_requires_grad_leaf_inplace_raises():
