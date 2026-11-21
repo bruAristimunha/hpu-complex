@@ -126,6 +126,89 @@ def _complex128_graphs_run_eagerly():
     registry._COMPILER_FNS["hpu_backend"] = hpu_backend
 
 
+def _fold_conj_of_python_scalars(gm):
+    """Autograd's backward of ``x * c`` (c a Python complex: Green's ``2j * pi * f * t``) traces to
+    ``mul(grad, _conj(c))``: AOT makes c a 0-d complex128 tensor, Habana's mixed-device pass moves it to the card, and
+    the gradient of every such product goes through complex128 host memory (CPU ops and copies), where eager autograd
+    keeps it complex64 on the card (the extension does not promote complex64 with a 0-d CPU tensor). After the first
+    such graph the process holds host memory, so every later graph with a float64 value runs eagerly. The conjugate
+    is folded into the Python scalar (a wrapped number, so the product stays complex64, as in eager mode) and the
+    metadata recomputed. Returns whether the graph changed."""
+    import torch
+    from torch._guards import detect_fake_mode
+    from torch.fx.passes.fake_tensor_prop import FakeTensorProp
+
+    aten = torch.ops.aten
+    conjugates = (aten._conj.default, aten.conj.default, aten.conj_physical.default, aten.resolve_conj.default)
+    arithmetic = {aten.mul.Tensor, aten.div.Tensor, aten.add.Tensor, aten.sub.Tensor}
+    changed = False
+    for node in list(gm.graph.nodes):
+        if not (node.op == "call_function" and node.target in conjugates and len(node.args) == 1
+                and isinstance(node.args[0], complex)):
+            continue
+        scalar = node.args[0].conjugate() if node.target != aten.resolve_conj.default else node.args[0]
+        for user in list(node.users):
+            # the scalar as the second operand only: a Python number cannot be the Tensor self of these overloads
+            if user.op == "call_function" and user.target in arithmetic and user.args[0] is not node:
+                user.args = tuple(scalar if a is node else a for a in user.args)
+                changed = True
+        if not node.users:
+            gm.graph.erase_node(node)
+    if not changed:
+        return False
+    gm.graph.lint()
+    gm.recompile()
+    inputs = [n.meta.get("val") for n in gm.graph.nodes if n.op == "placeholder"]
+    mode = detect_fake_mode(inputs)
+    if mode is not None:
+        FakeTensorProp(gm, mode).propagate_dont_convert_inputs(*inputs)
+    return True
+
+
+def _aot_graphs_keep_complex64_scalars():
+    """hpu_backend's forward, backward and inference graphs (after AOT autograd).
+
+    - _fold_conj_of_python_scalars first.
+    - A graph that still holds host-backed values runs eagerly as a whole, as _complex128_graphs_run_eagerly does for
+      the Dynamo graph (whose complex128 values can appear only after AOT, in the backward).
+    - A graph with nodes that run eagerly on the extension's kernels is partitioned by Habana's Python partitioner,
+      not its C++ one. Measured (Gaudi2, bridge 1.21.4): with the C++ partitioner, the fused graph that reads three
+      eager 0-d results (the gradients of three selected frequencies of Green's wavelets) gets its inputs in another
+      order than the Python one gives, with the same partitions, and returns one of them doubled: compiled Green's
+      wavelet gradients were up to 9x off with no error (repro/compiled_green_bisect.py). The Python partitioner's
+      graphs are right (gradients as eager mode, 1e-4).
+    """
+    try:
+        from habana_frameworks.torch.dynamo.compile_backend import backends
+        from habana_frameworks.torch.dynamo.compile_backend import config as hpu_config
+    except ImportError:
+        return
+    if getattr(backends, "_hpu_complex_aot", False):
+        return
+    if hasattr(backends, "import_compilers"):
+        backends.import_compilers()
+
+    def wrap(compiler):
+        def compile_graph(gm, example_inputs, *args, **kwargs):
+            _fold_conj_of_python_scalars(gm)
+            if _holds_host_values(gm, example_inputs):
+                from functorch.compile import make_boxed_func
+
+                return make_boxed_func(gm.forward)  # AOT calls its compiled graphs with a boxed list
+            if getattr(hpu_config, "use_cpp_partitioner", False) and any(
+                    n.op == "call_function" and _runs_eagerly(n) for n in gm.graph.nodes):
+                with hpu_config.patch(use_cpp_partitioner=False):
+                    return compiler(gm, example_inputs, *args, **kwargs)
+            return compiler(gm, example_inputs, *args, **kwargs)
+
+        return compile_graph
+
+    for name in ("hpu_training_compiler_fw", "hpu_training_compiler_bw", "hpu_inference_compiler"):
+        if callable(getattr(backends, name, None)):
+            setattr(backends, name, wrap(getattr(backends, name)))
+    backends._hpu_complex_aot = True
+
+
 def _complex_out(node):
     """An FX node with a complex output."""
     import torch
@@ -168,6 +251,13 @@ def _view_chain_reaches_complex(node):
 def _runs_eagerly(node):
     """A complex node, or a reader of a float view of complex storage (see is_eager_fallback_required)."""
     return _touches_complex(node) or any(_views_complex_storage(n) for n in node.all_input_nodes)
+
+
+def _complex_bmm(a, b):
+    """Stands for a complex aten.bmm node while Habana's bmm-view pass runs (never called)."""
+    import torch
+
+    return torch.ops.aten.bmm.default(a, b)
 
 
 def _complex_nodes_run_eagerly():
@@ -230,7 +320,33 @@ def _complex_nodes_run_eagerly():
 
         passes.pass_fuse_view_chains = pass_fuse_view_chains
 
+    # pass_remove_unnecessary_bmm_view drops the views around a bmm, so the bmm takes the 4-D or 5-D tensors before
+    # them (Synapse's bmm accepts those). A complex bmm runs eagerly on the extension's kernel, which takes 3-D only:
+    # compiled z @ z.mT.conj() of a 4-D complex z raised "hpu_complex: bmm shapes [4, 10, 22, 137] @ ..." (Gaudi2,
+    # bridge 1.21.4). The pass does not see complex bmm nodes.
+    remove_bmm_view = getattr(passes, "pass_remove_unnecessary_bmm_view", None)
+    if remove_bmm_view is not None:
+        def pass_remove_unnecessary_bmm_view(ctx):
+            import torch
+
+            bmm = torch.ops.aten.bmm.default
+            hidden = [n for n in ctx.graph_module.graph.nodes
+                      if n.op == "call_function" and n.target == bmm and _touches_complex(n)]
+            for node in hidden:
+                node.target = _complex_bmm
+            try:
+                changed = remove_bmm_view(ctx)
+            finally:
+                for node in hidden:
+                    node.target = bmm
+                if hidden:
+                    ctx.graph_module.recompile()
+            return changed
+
+        passes.pass_remove_unnecessary_bmm_view = pass_remove_unnecessary_bmm_view
+
     _complex128_graphs_run_eagerly()
+    _aot_graphs_keep_complex64_scalars()
 
     try:  # private, and absent before 1.20: its absence must not cost the patches above
         from habana_frameworks.torch.dynamo.compile_backend._passes import batch_as_strided
@@ -483,6 +599,9 @@ def enable(enter_mode: bool = False):
         _complex_nodes_run_eagerly()
         _pickle_complex128_through_the_cpu()
         _deepcopy_complex128_in_host_memory()
+        from . import linalg as _linalg  # complex64 linalg on the card from real ops (HPU_COMPLEX_LINALG=0: off)
+
+        _linalg.install()
     elif not hasattr(torch, "hpu") and importlib.util.find_spec("habana_frameworks") is not None:
         warnings.warn("hpu_complex: habana_frameworks is installed but torch.hpu is not loaded, so the "
                       "extension is not enabled; import habana_frameworks.torch.core before "

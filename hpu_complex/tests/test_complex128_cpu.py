@@ -268,9 +268,10 @@ def test_lazy_guard_allows_complex128():
         assert_hpu_exact(z * z, x * x)
         assert_hpu_exact(torch.zeros(2, dtype=torch.complex128, device=HPU), torch.zeros(2, dtype=torch.complex128))
         assert_hpu_exact(torch.view_as_complex(torch.view_as_real(z)), x)
-        # complex64 itself runs in lazy mode now (lazy views, lazy_check.py on the card); the guard that remains
-        # refuses it under torch.inference_mode, before any allocation
-        with torch.inference_mode(), pytest.raises(RuntimeError, match="inference_mode is not supported in Habana lazy"):
-            torch.zeros(2, dtype=torch.complex64, device=HPU)
+        # complex64 runs in lazy mode (lazy views, lazy_check.py on the card), under torch.inference_mode too now:
+        # its tensors made there are inference tensors, like the Habana tensors they live in (inference_check.py)
+        with torch.inference_mode():
+            z64 = torch.zeros(2, dtype=torch.complex64, device=HPU)
+        assert z64.is_inference() and torch.equal(z64.cpu(), torch.zeros(2, dtype=torch.complex64))
     finally:
         torch.ops.hpu_complex.set_lazy_mode(False)
