@@ -48,7 +48,9 @@ def test_cholesky_info_from_the_diagonal_only():
     Lreal = torch.eye(8).repeat(3, 1, 1)
     Lreal[1, 4:, 4:] = float("nan")  # complex pivot 3 (real 4, 5) failed
     Lreal[2, 5, 5] = -0.0  # the second real pivot of complex 3 not positive
-    assert _cholesky_info(Lreal).tolist() == [0, 3, 3]
+    assert _cholesky_info(Lreal, torch.zeros(3, dtype=torch.int32)).tolist() == [0, 3, 3]
+    # a LAPACK factor with the original diagonal kept: its own real info (here real pivot 5, complex 3) is taken
+    assert _cholesky_info(torch.eye(8).repeat(2, 1, 1), torch.tensor([0, 5], dtype=torch.int32)).tolist() == [0, 3]
 
 
 @pytest.mark.parametrize("batch", [(8,), (2, 8), (8, 1)])
@@ -236,7 +238,7 @@ def test_cholesky_inverse(card_linalg, n, upper):
 
 def test_cholesky_inverse_reads_one_triangle_and_batch_equal_to_order(card_linalg):
     L = torch.linalg.cholesky(hpd(8, 4, 4, seed=1))  # batch 8 = the real order
-    junk = L + torch.triu(rand(8, 4, 4, seed=2), 1) + 0.3j * torch.eye(4, dtype=C128)  # diagonal's imaginary part
+    junk = L + torch.triu(rand(8, 4, 4, seed=2), 1)  # (a complex diagonal: test_cholesky_inverse_complex_...)
     got = torch.cholesky_inverse(junk.to(C64).to(HPU)).cpu().to(C128)
     torch.testing.assert_close(got, torch.cholesky_inverse(L), atol=2e-5, rtol=1e-5)
 
@@ -384,3 +386,100 @@ def test_eigvalsh_declined_keeps_torchs_route(card_linalg, monkeypatch):
     assert taken(card_linalg, "eigvalsh") == calls
     torch.testing.assert_close(w.cpu().double(), torch.linalg.eigvalsh(H), atol=3e-5, rtol=0)
     torch.testing.assert_close(wc.cpu(), torch.linalg.eigvalsh(H))
+
+
+
+# ---- revision round (PR #17 review) ------------------------------------------------------------------------------
+
+
+def _complex_diag_factor(*shape, seed):
+    n = shape[-1]
+    return rand(*shape, seed=seed).tril() + 2 * (1 + 1j) * torch.eye(n, dtype=C128)
+
+
+@pytest.mark.parametrize("upper", [False, True])
+def test_cholesky_solve_complex_diagonal_as_torch(card_linalg, upper):
+    """The review's repro: L = randn(4, 4).tril() + 2(1 + 1j) I gave relative error 2.44 (the diagonal's imaginary
+    part was dropped). Now L diag(conj(phi)) has the same L L^H: torch's values and gradients."""
+    L = _complex_diag_factor(2, 4, 4, seed=1)
+    if upper:
+        L = L.mH
+    check(lambda b, f: torch.cholesky_solve(b, f, upper=upper), [rand(2, 4, 2, seed=2), L], "cholesky_solve",
+          card_linalg, gtol=2e-4)
+
+
+@pytest.mark.parametrize("upper", [False, True])
+def test_cholesky_inverse_complex_and_negative_diagonal(card_linalg, upper):
+    """A real diagonal of either sign: torch's values and gradient. A complex diagonal: (L L^H)^-1 (torch's LAPACK
+    result there is not), with the gradient of that."""
+    L = torch.linalg.cholesky(hpd(2, 4, 4, seed=3))
+    L = L * torch.tensor([1.0, -1.0, 1.0, -1.0], dtype=C128)  # columns negated: same L L^H, negative diagonal
+    L = L.mH if upper else L
+    check(lambda f: torch.cholesky_inverse(f, upper=upper), [L], "cholesky_inverse", card_linalg, gtol=2e-4)
+    C = _complex_diag_factor(2, 4, 4, seed=4)
+    C = C.mH if upper else C
+    got = torch.cholesky_inverse(C.to(C64).to(HPU), upper=upper).cpu().to(C128)
+    H = C.mH @ C if upper else C @ C.mH
+    torch.testing.assert_close(got, torch.linalg.inv(H.to(C64).to(C128)), atol=2e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize("which", ["solve", "inverse"])
+@pytest.mark.parametrize("upper", [False, True])
+def test_complex_diagonal_gradients_by_finite_differences(which, upper):
+    """The module's functions in complex128 on the CPU against finite differences (gradcheck), complex diagonal. The
+    factor is parametrized by its triangle (torch's formula, which the module keeps, is not masked to it, while the
+    forward never reads the other triangle: that part of the gradient is torch's convention, not a derivative)."""
+    from hpu_complex.linalg import cholesky_inverse, cholesky_solve
+
+    L = _complex_diag_factor(3, 3, seed=5)
+    P = (L.mH if upper else L).detach().requires_grad_()
+    B = rand(3, 2, seed=6).requires_grad_()
+
+    def tri(p):
+        return p.triu() if upper else p.tril()
+
+    if which == "solve":
+        assert torch.autograd.gradcheck(lambda b, p: cholesky_solve(b, tri(p), upper), (B, P))
+    else:
+        assert torch.autograd.gradcheck(lambda p: cholesky_inverse(tri(p), upper), (P,))
+
+
+def test_hpd_slogdet_second_derivative_is_torchs(card_linalg):
+    """A gradient-penalty loss: the backward is differentiable (was 0.94 off, the saved factor had no graph)."""
+    from hpu_complex.linalg import hpd_slogdet
+
+    H = hpd(2, 4, 4, seed=7).to(C64)
+    W = rand(2, 4, 4, seed=8).to(C64)
+
+    def penalty(x, w, slogdet):
+        (g,) = torch.autograd.grad(slogdet(x).logabsdet.sum(), x, create_graph=True)
+        return (g * w).abs().pow(2).sum()
+
+    a = H.to(HPU).requires_grad_()
+    penalty(a, W.to(HPU), hpd_slogdet).backward()
+    r = H.to(C128).requires_grad_()
+    penalty(r, W.to(C128), torch.linalg.slogdet).backward()
+    torch.testing.assert_close(a.grad.cpu().to(C128), r.grad, atol=1e-4, rtol=1e-3)
+
+
+def test_cholesky_info_schur_failure_and_off_diagonal_nan(card_linalg):
+    """Failures the diagonal alone does not show on a LAPACK factor: a Schur complement that is not positive (every
+    diagonal entry positive) and a NaN below the diagonal."""
+    H = hpd(3, 5, 5, seed=9).to(C64)
+    H[1, 3, 2] = H[1, 2, 3] = 10.0  # |h_32|^2 > h_22 h_33: fails at order 4
+    H[2, 4, 1] = complex(float("nan"), 0)  # NaN below the diagonal, row 5
+    ref = torch.linalg.cholesky_ex(H).info
+    assert ref.tolist()[0] == 0 and ref.tolist()[1] > 0 and ref.tolist()[2] > 0
+    assert torch.linalg.cholesky_ex(H.to(HPU)).info.cpu().tolist() == ref.tolist()
+
+
+def test_hpd_slogdet_singular_is_nan_on_and_off_the_card(card_linalg):
+    from hpu_complex.linalg import hpd_slogdet
+
+    S = torch.zeros(2, 3, 3, dtype=C128)
+    S[0] = torch.eye(3)
+    S[1] = torch.diag(torch.tensor([1.0, 1.0, 0.0], dtype=C128))  # exactly singular
+    off = hpd_slogdet(S).logabsdet
+    on = hpd_slogdet(S.to(C64).to(HPU)).logabsdet.cpu()
+    for out in (off, on):
+        assert out[0] == 0 and out[1].isnan()

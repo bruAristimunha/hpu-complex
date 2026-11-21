@@ -65,6 +65,9 @@ def main():
             bad[i, i, i] = -10.0  # matrix i fails at complex order i + 1
         if b > n:
             bad[n, n - 1, n - 1] = float("nan")
+        if b > n + 2 and n >= 3:  # a Schur-complement failure (all diagonal entries positive), an off-diagonal NaN
+            bad[n + 1, 2, 1] = bad[n + 1, 1, 2] = 10.0 * (H[n + 1, 1, 1].real * H[n + 1, 2, 2].real).sqrt()
+            bad[n + 2, n - 1, 0] = complex(float("nan"), 0)
         Lc = torch.linalg.cholesky(H.to(C128))
         B = torch.randn(b, n, 3, dtype=C64)
         calls0, ext0, fb0 = sum(L.CALLS.values()), ext.cpu_fallback_calls(), fb_ops()
@@ -75,9 +78,14 @@ def main():
         X = torch.cholesky_solve(B.to("hpu"), Lh)
         Q, R = torch.linalg.qr(H.to("hpu"))
         lad = L.hpd_slogdet(H.to("hpu")).logabsdet
+        # a factor with a complex diagonal (review repro: relative error 2.44 before): cholesky_solve as torch,
+        # cholesky_inverse as (L L^H)^-1
+        Lz = (torch.randn(b, n, n, dtype=C64).tril() + 2 * (1 + 1j) * torch.eye(n)).to(C64)
+        Xz = torch.cholesky_solve(B.to("hpu"), Lz.to("hpu"))
+        Iz = torch.cholesky_inverse(Lz.to("hpu"))
         w = torch.linalg.eigvalsh(H.to("hpu")) if 2 * n <= 32 else None
         res = {k: cpu(v) for k, v in dict(L=Lh, info_ok=info_ok, info_bad=info_bad, info_upper=info_upper, inv=inv,
-                                           X=X, Q=Q, R=R, lad=lad).items()}
+                                           X=X, Q=Q, R=R, lad=lad, Xz=Xz, Iz=Iz).items()}
         if w is not None:
             res["w"] = cpu(w)
         fb1 = fb_ops()
@@ -93,7 +101,9 @@ def main():
         errs = {"L": rel(res["L"], Lc), "inv": rel(res["inv"], torch.cholesky_inverse(Lc)),
                 "X": rel(res["X"], torch.cholesky_solve(B.to(C128), Lc)),
                 "QR": rel(res["Q"].to(C128) @ res["R"].to(C128), H.to(C128)),
-                "lad": rel(res["lad"].double(), torch.linalg.slogdet(H.to(C128)).logabsdet)}
+                "lad": rel(res["lad"].double(), torch.linalg.slogdet(H.to(C128)).logabsdet),
+                "Xz": rel(res["Xz"], torch.cholesky_solve(B.to(C128), Lz.to(C128))),
+                "Iz": rel(res["Iz"], torch.linalg.inv(Lz.to(C128) @ Lz.to(C128).mH))}
         if w is not None:
             errs["w"] = rel(res["w"].double(), torch.linalg.eigvalsh(H.to(C128)))
         row["err"] = {k: float(f"{v:.1e}") for k, v in errs.items()}

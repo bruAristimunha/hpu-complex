@@ -380,10 +380,18 @@ def _ctril(z, diagonal=0):
 
 
 def _factor_embedding(L, upper):
-    """The interleaved embedding of a Cholesky factor's triangle (one triangle read; the imaginary part of the diagonal,
-    which a Cholesky factor does not have, ignored), for Habana's real kernels, which read that triangle only."""
-    lr, li = _pair(L)
-    return _interleaved(lr, li.triu(1) if upper else li.tril(-1))
+    """The interleaved embedding of a triangular factor with the same ``L L^H`` (``U^H U``) and a real positive
+    diagonal, for Habana's real kernels (which read one triangle only): ``L' = L diag(conj(phi))`` (``U' =
+    diag(conj(phi)) U``), ``phi = diag / |diag|``, so ``L' L'^H = L L^H`` and ``diag(L') = |diag|``, the rotation
+    ``solve_triangular`` does by rows. A complex diagonal is thus right (torch's ``cholesky_solve`` uses it); the
+    rotation is ``hypot``, one division and one complex scaling, no host read."""
+    v = torch.view_as_real(L.resolve_conj().resolve_neg().contiguous())
+    lr, li = v[..., 0], v[..., 1]
+    d = torch.diagonal(v, 0, -3, -2)  # (..., 2, n)
+    p = d / torch.hypot(d[..., :1, :], d[..., 1:, :])  # (re, im) of phi (a zero diagonal: NaN, singular anyway)
+    ur, ui = (p[..., 0, :, None], p[..., 1, :, None]) if upper else (p[..., 0, None, :], p[..., 1, None, :])
+    rr, ri = lr * ur + li * ui, li * ur - lr * ui  # times conj(phi): rows (upper) or columns (lower)
+    return _interleaved(rr, ri.triu(1) if upper else ri.tril(-1))  # the diagonal's residue of im: 0
 
 
 def _from_interleaved(X):
@@ -459,8 +467,10 @@ class _CholeskyInverse(torch.autograd.Function):
 
 def cholesky_inverse(L, upper=False):
     """``cholesky_inverse``: ``(L L^H)^-1`` (``(U^H U)^-1``) from Habana's real ``cholesky_inverse`` of the interleaved
-    factor. The imaginary part of the diagonal is ignored (a Cholesky factor has a real diagonal; for one that is not
-    real, LAPACK's result, which torch returns, is neither ``(L L^H)^-1`` nor Hermitian)."""
+    factor (rotated to a real positive diagonal, see ``_factor_embedding``). Equal to torch's for a real diagonal of
+    either sign. For a diagonal that is not real this is ``(L L^H)^-1``; torch's LAPACK result there (``potri``, whose
+    ``lauum`` reads only the real part of the inverted diagonal) is neither that nor Hermitian (measured, 0.045 off),
+    so the two differ there."""
     if torch.is_grad_enabled() and L.requires_grad:
         return _CholeskyInverse.apply(L, upper)
     return _from_interleaved(_cholesky_inverse_real(L, upper))
@@ -523,29 +533,37 @@ def _hermitian_lower_embedding(A, upper):
     return _interleaved(ar, ai.tril(-1))
 
 
-def _real_cholesky(E):
+def _real_cholesky(E, with_info=False):
     """Habana's real Cholesky factor of ``E`` (..., n2, n2). It returns NaN (info 0) when the dim before the matrix
     equals its order (bridge 1.21.4: every (..., n2, n2, n2) of the sweep in repro/habana_linalg_shape_sweep.py, eager
     and lazy; any other batch is right); the same batch as (..., n2, 1, n2, n2) is right in every swept shape (a view,
     no op). Its own ``info`` is a constant 0 and is not read."""
     n2 = E.shape[-1]
     if E.dim() >= 3 and E.shape[-3] == n2:
-        return torch.linalg.cholesky_ex(E.unsqueeze(-3))[0].squeeze(-3)
-    return torch.linalg.cholesky_ex(E)[0]
+        Lreal, info = torch.linalg.cholesky_ex(E.unsqueeze(-3))
+        Lreal, info = Lreal.squeeze(-3), info.squeeze(-1)
+    else:
+        Lreal, info = torch.linalg.cholesky_ex(E)
+    return (Lreal, info) if with_info else Lreal
 
 
-def _cholesky_info(Lreal):
-    """torch's ``info`` from the interleaved factor: the first real diagonal entry r (0-based) that is not positive
-    (NaN included, LAPACK's test) belongs to complex pivot r // 2, so info = r // 2 + 1, else 0. Habana's kernel gives
-    NaN from the failing pivot on (measured), LAPACK leaves the non-positive pivot there: both are caught. Each real
-    position holds its complex info (1, 1, 2, 2, ..., cached), the good ones n + 1; the least, modulo n + 1, is info:
-    five ops in float, cast at the end. (Measured on the card: ``amin`` over a (NaN, x) pair skips the NaN; strided
-    views of the diagonal and int64 arithmetic on an ``argmax`` gave wrong indices on a lazy graph's first run; an
-    ``argmax``-based rule took 2-6 ms per call in lazy mode.)"""
+def _cholesky_info(Lreal, real_info):
+    """torch's ``info`` for the interleaved factor. Habana's kernel reports ``info = 0`` always and gives NaN from the
+    failing pivot on (measured: a non-positive pivot, a Schur-complement failure and an off-diagonal NaN alike), so
+    the first real diagonal entry r (0-based) that is not positive (NaN included, LAPACK's test) is the failing real
+    pivot, of complex pivot r // 2: info = r // 2 + 1. Each real position holds its complex info (1, 1, 2, 2, ...,
+    cached), the good ones n + 1; the least, modulo n + 1, is that info. A LAPACK factor (the CPU stand-in) is not
+    read this way: Accelerate leaves the original diagonal from the failing pivot on, so the diagonal can look good;
+    its own real info is exact, mapped as (info + 1) // 2 and taken where nonzero. Float math, cast at the end.
+    (Measured on the card: ``amin`` over a (NaN, x) pair skips the NaN; strided views of the diagonal and int64
+    arithmetic on an ``argmax`` gave wrong indices on a lazy graph's first run; an ``argmax``-based rule took 2-6 ms
+    per call in lazy mode.)"""
     n = Lreal.shape[-1] // 2
     first = _info_positions(n, Lreal.device).expand(Lreal.shape[:-1]).masked_fill(
         torch.diagonal(Lreal, 0, -2, -1) > 0, n + 1).amin(-1)
-    return torch.remainder(first, n + 1).to(torch.int32)
+    real = real_info.float()
+    info = torch.where(real > 0, torch.floor((real + 1) * 0.5), torch.remainder(first, n + 1))
+    return info.to(torch.int32)
 
 
 @functools.lru_cache(maxsize=None)
@@ -557,10 +575,10 @@ def _info_positions(n, device):
 def _cholesky_ex(A, upper=False, keep_real=False):
     """``linalg_cholesky_ex``: the real Cholesky factor of the interleaved ``E(H)`` is ``E(L)``."""
     n = A.shape[-1]
-    Lreal = _real_cholesky(_hermitian_lower_embedding(A, upper))
+    Lreal, real_info = _real_cholesky(_hermitian_lower_embedding(A, upper), with_info=True)
     blocks = Lreal.reshape(*Lreal.shape[:-2], n, 2, n, 2)
     re, im = blocks[..., 0, :, 0], blocks[..., 1, :, 0].tril(-1)  # the diagonal is real (its rounding residue: 0)
-    info = _cholesky_info(Lreal)
+    info = _cholesky_info(Lreal, real_info)
     L = _complex(re.mT, -im.mT) if upper else _complex(re, im)
     return (L, info, Lreal) if keep_real else (L, info)
 
@@ -569,25 +587,31 @@ def _cholesky_ex(A, upper=False, keep_real=False):
 
 
 def _hpd_logabsdet_forward(A):
-    Lreal = _real_cholesky(_hermitian_lower_embedding(A, False))
-    # each complex pivot appears twice on the real diagonal: sum log = 2 sum log l_jj = log det H
-    return torch.log(torch.diagonal(Lreal, 0, -2, -1)).sum(-1), Lreal
+    Lreal, real_info = _real_cholesky(_hermitian_lower_embedding(A, False), with_info=True)
+    # each complex pivot appears twice on the real diagonal: sum log = 2 sum log l_jj = log det H; NaN unless every
+    # pivot is positive and the kernel reported no failure (an exactly singular matrix too, not -inf)
+    d = torch.diagonal(Lreal, 0, -2, -1)
+    ok = (d > 0).all(-1) & (real_info == 0)
+    return torch.where(ok, torch.log(d).sum(-1), float("nan")), Lreal
 
 
 class _HpdLogabsdet(torch.autograd.Function):
     """``log det H`` of the HPD matrix in the lower triangle of ``A``, with torch's ``slogdet`` gradient at ``H``:
     ``g A^-H = g H^-1`` (full, not masked to the triangle), ``H^-1`` from Habana's ``cholesky_inverse`` of the factor
-    the forward computed."""
+    the forward computed. With ``create_graph`` the same ``g A^-H`` through differentiable ops on ``A``
+    (``linalg.inv`` of H: the block-embedding route), so second derivatives are torch's slogdet's at H."""
 
     @staticmethod
     def forward(ctx, A):
         logabsdet, Lreal = _hpd_logabsdet_forward(A)
-        ctx.save_for_backward(Lreal)
+        ctx.save_for_backward(A, Lreal)
         return logabsdet
 
     @staticmethod
     def backward(ctx, g):
-        (Lreal,) = ctx.saved_tensors
+        A, Lreal = ctx.saved_tensors
+        if torch.is_grad_enabled():  # H from the lower triangle, its gradient passed through as for the full matrix
+            return g[..., None, None] * torch.linalg.inv(_HermitianFromLower.apply(A)).mH
         inv = torch.cholesky_inverse(Lreal)
         return _from_interleaved(g[..., None, None] * inv)
 
@@ -596,12 +620,14 @@ def hpd_slogdet(A):
     """``torch.linalg.slogdet`` of a Hermitian positive-definite complex ``A`` (its lower triangle read, as
     ``linalg.cholesky``): sign 1, ``logabsdet = 2 sum log diag(L)`` from one real Cholesky of the interleaved
     embedding, on the card. An explicit API, not a route of ``torch.linalg.slogdet``: torch has no Hermitian flag, and
-    testing for one would read the matrix on the host. A matrix that is not positive definite gives NaN
-    ``logabsdet`` (``torch.linalg.cholesky_ex`` reports which). The general complex determinant is not here.
-    Off the card (CPU, complex128) the same math runs through torch's ops."""
+    testing for one would read the matrix on the host. A matrix that is not positive definite, an exactly singular
+    one included, gives NaN ``logabsdet`` (not -inf: ``torch.linalg.cholesky_ex`` reports which), on and off the card.
+    The general complex determinant is not here. Off the card (CPU, complex128) the same math runs through torch's
+    ops."""
     if not _complex_on_card(A):
-        L = torch.linalg.cholesky_ex(A).L
-        logabsdet = 2 * torch.log(torch.diagonal(L, 0, -2, -1).real).sum(-1)
+        L, info = torch.linalg.cholesky_ex(A)
+        d = torch.diagonal(L, 0, -2, -1).real
+        logabsdet = torch.where((info == 0) & (d > 0).all(-1), 2 * torch.log(d).sum(-1), float("nan"))
         return torch.return_types.linalg_slogdet((torch.ones_like(logabsdet, dtype=A.dtype), logabsdet))
     _count("hpd_slogdet")
     if torch.is_grad_enabled() and A.requires_grad:
@@ -816,7 +842,9 @@ def _qr_forward(A, want_q):
     columns; the real QR with a positive diagonal is unique (full column rank), so the real factors re-signed to a
     positive diagonal are ``E(Q)``, ``E(R)``, and column 2j holds (re, im) of column j. R has a real positive
     diagonal: LAPACK's (and torch's) is real too, with the sign ``-sign(Re)`` of each Householder head; both are QR
-    decompositions (torch documents the signs as not unique), and ``Q`` differs from torch's by those column signs."""
+    decompositions (torch documents the signs as not unique), and ``Q`` differs from torch's by those column signs.
+    A rank-deficient ``A`` (a zero column, dependent columns) gives NaN: Habana's qr returns NaN for it, and ``W``
+    does not change the rank (torch returns a QR with a zero on R's diagonal)."""
     ar, ai = _pair(A)
     E = _interleaved(ar, ai)
     W = _mixing(E.shape[-2], E.device)
@@ -952,8 +980,11 @@ def _decline(op, args, kwargs):
     return op._op_dk(DispatchKey.Autograd, *args, **kwargs)
 
 
-# Where each op is taken by default: the modes where it measured not slower than the CPU route, forward and forward +
-# backward, batch 32, n = 16..32 (clinalg_card_check.py, Gaudi2, bridge 1.21.4; tables in TEAM_REPORT.md).
+# Where each op is taken by default, from the measured speed against the CPU route (forward and forward + backward,
+# batch 32, n = 4..32; clinalg_card_check.py, Gaudi2, bridge 1.21.4; tables in TEAM_REPORT.md). Keeping the work on
+# the card comes first: an op is routed where it measured at about parity or faster in that mode, even if some
+# sizes or variants were slower (noted per op; e.g. eager cholesky_solve(upper) 0.78x and cholesky_inverse 0.90x
+# forward at n = 16); it is gated to "with grad" or a mode only where it was clearly slower otherwise.
 # HPU_COMPLEX_LINALG=all takes every op in both modes (nothing on the CPU, at that speed); =0 none.
 ROUTES = {
     "solve": ("eager", "lazy"),

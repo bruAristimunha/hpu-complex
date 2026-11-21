@@ -84,9 +84,11 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   diag(tau)` (no division: `tau = 0` needs no special case). `cholesky`'s `info` is torch's, read from the factor's
   diagonal (Habana's is a constant 0). `solve_triangular` rotates each row by the conjugate phase of its diagonal
   entry and runs one real substitution (hpu-ops' TPC kernel); `cholesky_inverse` is Habana's on the interleaved factor
-  (`E(H^-1)`) and `cholesky_solve` that times `v(B)`; `qr` is Habana's real QR of `W E(A)` (a fixed orthogonal `W`:
+  (`E(H^-1)`; the factor's columns first rotated by the conjugate phase of its diagonal, which keeps `L L^H`, so a
+  complex diagonal is right: torch's `cholesky_solve`, and `(L L^H)^-1` for `cholesky_inverse`, where torch's LAPACK
+  result is not) and `cholesky_solve` that times `v(B)`; `qr` is Habana's real QR of `W E(A)` (a fixed orthogonal `W`:
   Habana's qr is NaN on a zero Householder tail, `repro/habana_qr_nan.py`) re-signed to a positive real diagonal
-  (torch's factors up to those real signs); `eigvalsh` the means of the sorted pairs of the embedding's eigenvalues;
+  (torch's factors up to those real signs; a rank-deficient matrix, e.g. a zero column, is still NaN); `eigvalsh` the means of the sorted pairs of the embedding's eigenvalues;
   `hpu_complex.linalg.hpd_slogdet` / `hpd_logdet` (explicit: torch has no Hermitian flag) the log of the Cholesky
   diagonal of an HPD matrix, with torch's slogdet gradient. Gradients: autograd through the real ops, or torch's
   formulas (`cholesky`, `cholesky_solve`, `cholesky_inverse`, `solve_triangular`, `qr`); the `info` of `solve`/`inv`
@@ -98,7 +100,11 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   |---|---|---|
   | `solve` (`left=False`: lazy only, eager 0.8-1.0x with backward) | 1.5-1.8x / 1.05-1.6x | 1.3-1.5x / 1.2-1.5x |
   | `inv` | 1.3-1.8x / 0.98-1.2x | 1.2-1.4x / 1.3-1.6x |
-  | `cholesky` | 1.1-1.3x / 1.2-1.3x | 1.1-1.5x / 1.7-2.1x |
+  | `cholesky` (torch's `info` computed) | 0.8-1.1x / 1.0-1.3x | 0.8-1.2x / 1.6-2.1x |
+  | `cholesky_solve` (n = 4-32) | 0.8-3.0x / 1.0-1.2x | 0.4-1.9x / 1.1-1.9x |
+  | `cholesky_inverse` (n = 4-32) | 0.75-3.5x / 0.9-1.2x | 0.8-2.5x / 1.2-2.1x |
+  | `solve_triangular` (lazy with grad only, n = 4-32) | 0.45-0.83x / 0.88-1.01x (off) | 0.38-0.78x / 1.05-1.32x |
+  | `eigvalsh` (lazy with grad only, n <= 16) | 0.16-0.28x / 0.7-0.9x (off) | 0.67-0.69x / 1.05-1.67x |
   | `pinv` (n = 16) | 4.0x / 1.4x | 2.4x / 3.6x |
   | `matrix_exp` | 1.0x / 1.3x (n = 16; composite 0.2-0.4x, off) | 1.0-2.1x / 1.7-4.0x |
   | `householder_product` (with grad only) | 0.2-0.3x / 10-19x | 0.35-0.54x / 13-28x |
@@ -279,7 +285,8 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
 - complex64 linear algebra on the card (`hpu_complex/linalg.py`, needs `hpu_ops.enable()` for its TPC kernels):
   `solve`, `inv`, `cholesky`, `cholesky_solve`, `cholesky_inverse`, `pinv`, `matrix_exp` (and `householder_product`,
   `lstsq` when a gradient is computed; `solve_triangular` and `eigvalsh` in lazy mode when a gradient is computed) run
-  as the real problem on float pairs, eager and lazy, where measured not slower than the CPU route (table below;
+  as the real problem on float pairs, eager and lazy, where measured at about parity or faster than the CPU route (some
+  sizes slower, see the table; everything on the card comes first;
   `HPU_COMPLEX_LINALG=all` takes every op the module has, `=0` none); `hpu_complex.linalg.hpd_slogdet` / `hpd_logdet`
   for HPD input (1.5-4.8x). Still on the CPU (warned): `svd`, `eig`, `det`, `slogdet`, `qr` (the module's, through
   Habana's real qr, is 0.45-0.85x eager and 0.1-4 s per call lazy: off by default), `eigh` (the module's `eigh`,
