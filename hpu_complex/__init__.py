@@ -533,6 +533,9 @@ def enable(enter_mode: bool = False):
         _complex_nodes_run_eagerly()
         _pickle_complex128_through_the_cpu()
         _deepcopy_complex128_in_host_memory()
+        from . import linalg as _linalg  # complex64 linalg on the card from real ops (HPU_COMPLEX_LINALG=0: off)
+
+        _linalg.install()
     elif not hasattr(torch, "hpu") and importlib.util.find_spec("habana_frameworks") is not None:
         warnings.warn("hpu_complex: habana_frameworks is installed but torch.hpu is not loaded, so the "
                       "extension is not enabled; import habana_frameworks.torch.core before "
