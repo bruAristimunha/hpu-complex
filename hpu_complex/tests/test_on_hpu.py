@@ -267,19 +267,18 @@ def test_real_eig_and_eigvals_on_hpu():
         assert fwd_rel < 1e-4, (name, "fwd", fwd_rel)
         assert bwd_rel < 1e-4, (name, "bwd", bwd_rel)
 
-    # float64 -> complex128 remains unsupported on HPU (Issue #6).
+    # float64 -> complex128 on HPU (Issue #6): host memory, computed on the CPU in float64. The reference input is
+    # the float64 tensor as the card holds it (float32 precision), so results match exactly.
     x64 = torch.randn(4, 4, dtype=torch.float64, device=hpu)
+    x64_held = x64.cpu()
     for name, fn in (
-        ("eig(f64)", lambda: torch.linalg.eig(x64)),
-        ("eigvals(f64)", lambda: torch.linalg.eigvals(x64)),
+        ("eig(f64)", lambda t: torch.linalg.eig(t)[0]),
+        ("eigvals(f64)", lambda t: torch.linalg.eigvals(t)),
     ):
-        try:
-            fn()
-        except RuntimeError as exc:
-            assert "Complex datatype is not supported on HPU device." in str(exc), (name, str(exc))
-        else:
-            raise AssertionError(f"Expected RuntimeError for {name}")
-    print("real float32 eig/eigvals fwd+bwd & float64 RuntimeError: OK")
+        wh, wc = fn(x64), fn(x64_held)
+        assert wh.dtype == torch.complex128 and wh.device.type == "hpu", (name, wh.dtype, wh.device)
+        assert _max_err(wh, wc) < 1e-12, (name, _max_err(wh, wc))
+    print("real float32 eig/eigvals fwd+bwd & float64 -> complex128: OK")
 
 
 def test_complex_d2h_nondense_and_h2d_broadcast_copy_on_hpu():
