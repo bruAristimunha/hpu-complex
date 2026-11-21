@@ -142,8 +142,12 @@ def test_exp_edge_values_like_c99():
     assert torch.equal(gp.isnan(), rp.isnan()), (got, ref)
     same(got.nan_to_num(), ref.nan_to_num(), rtol=1e-5)
     # a real-valued input keeps an exactly zero (signed) imaginary part, as C99 cexp
+    # (torch's own exp too, except torch 2.6's x86 kernel at inf + 0j, where it gives nan: there the sign is C99's)
     real = EDGE[EDGE.imag == 0]
-    assert torch.equal(torch.signbit(exp_pairs(real).imag), torch.signbit(torch.exp(real).imag))
+    torch_im = torch.exp(real).imag
+    x86_inf = torch_im.isnan() & (real.real == INF)
+    assert not torch_im[~x86_inf].isnan().any()
+    assert torch.equal(torch.signbit(exp_pairs(real).imag), torch.signbit(torch.where(x86_inf, real.imag, torch_im)))
 
 
 def test_exp_of_large_imaginary_parts():
@@ -222,13 +226,20 @@ def test_vector_norm_green_wavelet_normalization():
     same(vector_norm_pairs(w, 2, -1, True), torch.linalg.norm(w, dim=-1, keepdim=True), atol=1e-5, rtol=1e-6)
 
 
-@pytest.mark.parametrize("dtype,expected", [(torch.float32, torch.complex64), (torch.bfloat16, torch.complex64),
+BF16_COMPLEX = getattr(torch, "bcomplex32", torch.complex64)  # later torch has a bfloat16 complex: bf16 x 2j gives it
+
+
+@pytest.mark.parametrize("dtype,expected", [(torch.float32, torch.complex64), (torch.bfloat16, BF16_COMPLEX),
                                             (torch.float64, torch.complex128), (torch.int64, torch.complex64),
                                             (torch.bool, torch.complex64), (torch.float16, torch.complex32)])
 def test_complex_scalar_promotion_rule(dtype, expected):
     """x * 2j: the real HPU operand becomes torch's result type before the op (complex32 raises on the HPU)."""
     x = torch.ones(3, dtype=dtype)
-    assert promoted(x, 2j) == expected == (x * 2j).dtype
+    assert promoted(x, 2j) == expected
+    try:
+        assert (x * 2j).dtype == expected
+    except NotImplementedError as e:  # torch's CPU kernels do not compute in bcomplex32 (experimental in torch)
+        assert expected is BF16_COMPLEX is not torch.complex64 and "BComplex32" in str(e), e
     assert promoted(x, torch.tensor(2j)) == expected
 
 
