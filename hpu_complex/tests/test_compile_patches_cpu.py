@@ -10,7 +10,10 @@ import types
 
 import pytest
 import torch
-from torch._prims_common import is_non_overlapping_and_dense
+try:
+    from torch._prims_common import is_non_overlapping_and_dense
+except ImportError:  # later torch keeps only the symbolic-shape form, the same answer on a concrete tensor
+    from torch._prims_common import is_non_overlapping_and_dense_or_false as is_non_overlapping_and_dense
 from torch.fx.experimental.proxy_tensor import make_fx
 
 import hpu_complex

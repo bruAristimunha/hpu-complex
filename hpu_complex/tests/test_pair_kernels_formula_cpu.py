@@ -111,6 +111,52 @@ EDGE = torch.tensor([0j, -0.0 + 0j, 1 + 0j, -2.5 - 0j, 3j, -1 - 1j, 88 + 0.5j, -
                     dtype=torch.complex64)
 
 
+# C99 Annex G.6.3.1 cexp at its special values, (input, expected, signs specified). The table is the reference, not
+# the platform's torch.exp (torch 2.6's x86 kernel gives exp(inf + 0j) = inf + nan j, its arm64 one inf + 0j).
+# cexp(conj(z)) = conj(cexp(z)); -inf + iy gives +0 cis(y), +inf + iy (y finite, nonzero) +inf cis(y). Where C99 leaves
+# the signs unspecified (the last four infinite cases), the kernel's choice is listed and only magnitudes are checked.
+C99_CEXP = [
+    (complex(0.0, 0.0), complex(1.0, 0.0), True),
+    (complex(-0.0, 0.0), complex(1.0, 0.0), True),
+    (complex(0.0, -0.0), complex(1.0, -0.0), True),
+    (complex(-0.0, -0.0), complex(1.0, -0.0), True),
+    (complex(INF, 0.0), complex(INF, 0.0), True),
+    (complex(INF, -0.0), complex(INF, -0.0), True),
+    (complex(-INF, 0.0), complex(0.0, 0.0), True),
+    (complex(-INF, -0.0), complex(0.0, -0.0), True),
+    (complex(-INF, 1.0), complex(0.0, 0.0), True),      # +0 (cos 1 + i sin 1)
+    (complex(-INF, -2.0), complex(-0.0, -0.0), True),   # +0 (cos -2 + i sin -2): both negative
+    (complex(INF, 1.0), complex(INF, INF), True),
+    (complex(INF, 3.0), complex(-INF, INF), True),      # cos 3 < 0, sin 3 > 0
+    (complex(NAN, 0.0), complex(NAN, 0.0), True),
+    (complex(NAN, -0.0), complex(NAN, -0.0), True),
+    (complex(NAN, 1.0), complex(NAN, NAN), True),
+    (complex(1.0, INF), complex(NAN, NAN), True),
+    (complex(0.0, INF), complex(NAN, NAN), True),
+    (complex(1.0, NAN), complex(NAN, NAN), True),
+    (complex(0.0, NAN), complex(NAN, NAN), True),
+    (complex(NAN, NAN), complex(NAN, NAN), True),
+    (complex(-INF, INF), complex(0.0, 0.0), False),
+    (complex(-INF, NAN), complex(0.0, 0.0), False),
+    (complex(INF, INF), complex(INF, NAN), False),
+    (complex(INF, NAN), complex(INF, NAN), False),
+]
+
+
+def check_c99_cexp(exp):
+    """exp (complex64 tensor -> complex64 tensor) against C99_CEXP: NaN exactly where C99 has NaN, every other part
+    bit-equal (signs included) where C99 specifies the sign, equal in magnitude where it leaves the sign open."""
+    z = torch.tensor([v for v, _, _ in C99_CEXP], dtype=torch.complex64)
+    got = torch.view_as_real(exp(z)).contiguous()
+    want = torch.view_as_real(torch.tensor([w for _, w, _ in C99_CEXP], dtype=torch.complex64))
+    signed = torch.tensor([s for _, _, s in C99_CEXP])[:, None].expand_as(want)
+    nan = want.isnan()
+    assert torch.equal(got.isnan(), nan), (z, got)
+    exact = signed & ~nan
+    assert torch.equal(got[exact].view(torch.int32), want[exact].view(torch.int32)), (z, got)
+    assert torch.equal(got[~signed & ~nan].abs(), want[~signed & ~nan].abs()), (z, got)
+
+
 def same(got, ref, atol=2e-6, rtol=2e-6):
     torch.testing.assert_close(got, ref, atol=atol, rtol=rtol, equal_nan=True)
 
@@ -123,8 +169,8 @@ def test_exp_matches_torch(shape):
 
 
 def test_exp_edge_values_like_c99():
-    """C99 cexp (cmath): torch 2.6's own CPU kernel gives exp(inf + 0j) = inf + nan j on the Gaudi image's x86 build
-    and the C99 inf + 0j on an ARM Mac build (both measured), so cmath is the reference."""
+    """C99 cexp (Annex G), not torch: torch 2.6's own CPU kernel gives exp(inf + 0j) = inf + nan j on x86 builds (the
+    Gaudi image's, Linux CI) and the C99 inf + 0j on arm64 (both measured)."""
     def c99(v):  # C99 Annex G cexp (cmath raises at these points instead)
         x, y = v.real, v.imag
         if y == 0:
@@ -141,10 +187,10 @@ def test_exp_edge_values_like_c99():
     gp, rp = torch.view_as_real(got), torch.view_as_real(ref)
     assert torch.equal(gp.isnan(), rp.isnan()), (got, ref)
     same(got.nan_to_num(), ref.nan_to_num(), rtol=1e-5)
-    # a real-valued input keeps an exactly zero (signed) imaginary part, as C99 cexp
-    real = EDGE[EDGE.imag == 0]
-    assert torch.equal(torch.signbit(exp_pairs(real).imag), torch.signbit(torch.exp(real).imag))
-
+    check_c99_cexp(exp_pairs)
+    # a finite real-valued input keeps its exactly zero (signed) imaginary part: e^x cis(+-0) = e^x +- 0i
+    real = EDGE[(EDGE.imag == 0) & EDGE.real.isfinite()]
+    assert torch.equal(exp_pairs(real).imag.view(torch.int32), real.imag.contiguous().view(torch.int32))
 
 def test_exp_of_large_imaginary_parts():
     z = torch.tensor([1e4j, -3e5j, 1 + 1e6j], dtype=torch.complex64)
@@ -222,13 +268,20 @@ def test_vector_norm_green_wavelet_normalization():
     same(vector_norm_pairs(w, 2, -1, True), torch.linalg.norm(w, dim=-1, keepdim=True), atol=1e-5, rtol=1e-6)
 
 
-@pytest.mark.parametrize("dtype,expected", [(torch.float32, torch.complex64), (torch.bfloat16, torch.complex64),
+BF16_COMPLEX = getattr(torch, "bcomplex32", torch.complex64)  # later torch has a bfloat16 complex: bf16 x 2j gives it
+
+
+@pytest.mark.parametrize("dtype,expected", [(torch.float32, torch.complex64), (torch.bfloat16, BF16_COMPLEX),
                                             (torch.float64, torch.complex128), (torch.int64, torch.complex64),
                                             (torch.bool, torch.complex64), (torch.float16, torch.complex32)])
 def test_complex_scalar_promotion_rule(dtype, expected):
     """x * 2j: the real HPU operand becomes torch's result type before the op (complex32 raises on the HPU)."""
     x = torch.ones(3, dtype=dtype)
-    assert promoted(x, 2j) == expected == (x * 2j).dtype
+    assert promoted(x, 2j) == expected
+    try:
+        assert (x * 2j).dtype == expected
+    except NotImplementedError as e:  # torch's CPU kernels do not compute in bcomplex32 (experimental in torch)
+        assert expected is BF16_COMPLEX is not torch.complex64 and "BComplex32" in str(e), e
     assert promoted(x, torch.tensor(2j)) == expected
 
 

@@ -232,6 +232,9 @@ def test_matrix_exp_real_composite(scale):
     M = torch.randn(4, 8, 8, generator=torch.Generator().manual_seed(1)) * scale / 8
     ref = torch.linalg.matrix_exp(M.double())
     got = _expm_real_composite(M)
+    if ref.abs().max() > torch.finfo(torch.float32).max:  # no float32 answer; inf or NaN depending on BLAS
+        assert not torch.isfinite(got).all()  # overflow shows as inf or NaN, never a wrong finite value
+        return
     f32 = torch.linalg.matrix_exp(M)
     bar = (f32.double() - ref).abs().max() / ref.abs().max()
     assert (got.double() - ref).abs().max() / ref.abs().max() <= 10 * bar + 1e-6

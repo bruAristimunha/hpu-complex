@@ -233,7 +233,8 @@ _ENV = """
 import pathlib, sys, types, torch
 from torch.utils.cpp_extension import load
 stub = types.ModuleType("torch.hpu"); stub._lazy_init = lambda: None; stub.is_available = lambda: False
-sys.modules["torch.hpu"] = stub
+stub.is_current_stream_capturing = lambda: False
+sys.modules["torch.hpu"] = torch.hpu = stub
 from hpu_complex.extension import load_extension
 load_extension()
 load(name="hpu_guard_stub", sources=[{stub!r}], is_python_module=False)

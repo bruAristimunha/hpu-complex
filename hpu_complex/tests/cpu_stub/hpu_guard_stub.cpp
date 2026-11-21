@@ -1,6 +1,7 @@
 // CPU tests only: a fake HPU backend for stock (CPU) torch, so the extension's C++ kernels run without a Gaudi.
 //
 // - A no-op HPU device guard: stock torch accepts device="hpu" tensors.
+// - HPU hooks: torch's accelerator API reports the fake HPU (autograd asks it for streams of HPU gradients).
 // - HPU factories (empty.memory_format, empty_strided) allocate host memory that reports the HPU device (hpu:N kept).
 // - HPU views and restrides are ATen's own TensorImpl kernels (as_strided, view, _reshape_alias, unfold, resize_,
 //   set_), so views of a fake HPU tensor alias it as on the card.
@@ -12,7 +13,11 @@
 // formulas, storages, out= handling and checks run for real; Habana-specific behavior (lazy mode, its float32 GEMM,
 // its layout bugs) does not, and stays with the card checks (pu1_check.py, lazy_check.py, ...).
 #include <ATen/ATen.h>
+#include <ATen/Context.h>
 #include <ATen/EmptyTensor.h>
+#include <ATen/detail/CUDAHooksInterface.h>
+#include <ATen/detail/HPUHooksInterface.h>
+#include <ATen/detail/MPSHooksInterface.h>
 #include <ATen/native/Resize.h>
 #include <ATen/ops/as_strided_native.h>
 #include <ATen/ops/resize_native.h>
@@ -23,13 +28,113 @@
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 #include <c10/core/impl/alloc_cpu.h>
 #include <torch/library.h>
+#include <torch/version.h>
 
 #include <algorithm>
 #include <cstring>
 #include <map>
 #include <vector>
 
-C10_REGISTER_GUARD_IMPL(HPU, c10::impl::NoOpDeviceGuardImpl<c10::DeviceType::HPU>);
+namespace {
+
+// A no-op HPU device guard with no-op streams and events: once torch's accelerator API reports the HPU (the hooks
+// below), autograd records and waits on events of HPU streams. Streams name the device they were asked for (the stock
+// no-op guard says device -1, which the engine would use as an index into its per-device streams).
+struct FakeHpuGuardImpl final : c10::impl::DeviceGuardImplInterface {
+  static c10::Device indexed(c10::Device d) {
+    return c10::Device(c10::DeviceType::HPU, d.has_index() ? d.index() : 0);
+  }
+  c10::DeviceType type() const override {
+    return c10::DeviceType::HPU;
+  }
+  c10::Device exchangeDevice(c10::Device) const override {
+    return c10::Device(c10::DeviceType::HPU, 0);
+  }
+  c10::Device getDevice() const override {
+    return c10::Device(c10::DeviceType::HPU, 0);
+  }
+  void setDevice(c10::Device) const override {}
+  void uncheckedSetDevice(c10::Device) const noexcept override {}
+  c10::Stream getStream(c10::Device d) const noexcept override {
+    return c10::Stream(c10::Stream::DEFAULT, indexed(d));
+  }
+  c10::Stream getNewStream(c10::Device d, int = 0) const override {
+    return c10::Stream(c10::Stream::DEFAULT, indexed(d));
+  }
+  c10::Stream exchangeStream(c10::Stream s) const noexcept override {
+    return c10::Stream(c10::Stream::DEFAULT, indexed(s.device()));
+  }
+  c10::DeviceIndex deviceCount() const noexcept override {
+    return 1;
+  }
+  // Host memory, one default stream: work is done when it is issued, so an event is always complete.
+  void record(void**, const c10::Stream&, const c10::DeviceIndex, const c10::EventFlag) const override {}
+  void block(void*, const c10::Stream&) const override {}
+  bool queryEvent(void*) const override {
+    return true;
+  }
+  void destroyEvent(void*, const c10::DeviceIndex) const noexcept override {}
+  void synchronizeEvent(void*) const override {}
+  bool queryStream(const c10::Stream&) const override {
+    return true;
+  }
+  void synchronizeStream(const c10::Stream&) const override {}
+  void recordDataPtrOnStream(const c10::DataPtr&, const c10::Stream&) const override {}
+};
+
+}  // namespace
+
+C10_REGISTER_GUARD_IMPL(HPU, FakeHpuGuardImpl);
+
+namespace {
+
+// HPU hooks, so torch's accelerator API (at::accelerator::getAccelerator) finds the fake HPU as the habana bridge's
+// hooks make it find the card. Autograd routes gradients of accelerator tensors (HPU is one) through
+// at::accelerator::getCurrentStream, which throws "Cannot access accelerator device when none is available" when no
+// accelerator answers. Where torch already has one (MPS on macOS, CUDA), the fake HPU stays undetected, since torch
+// refuses two accelerators at once and its streams then stand in for the HPU's no-op ones.
+bool other_accelerator() {
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 8)
+  return at::detail::getCUDAHooks().isBuilt() || at::detail::getMPSHooks().isBuilt();
+#else
+  return at::hasCUDA() || at::hasMPS();
+#endif
+}
+
+struct FakeHpuHooks final : at::HPUHooksInterface {
+  explicit FakeHpuHooks(at::HPUHooksArgs) {}
+  void init() const override {}
+  bool hasHPU() const override {
+    return !other_accelerator();
+  }
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 8)
+  bool isBuilt() const override {
+    return !other_accelerator();
+  }
+  bool isAvailable() const override {
+    return !other_accelerator();
+  }
+#endif
+  c10::DeviceIndex deviceCount() const override {
+    return 1;
+  }
+  c10::DeviceIndex getCurrentDevice() const override {
+    return 0;
+  }
+  bool hasPrimaryContext(c10::DeviceIndex) const override {
+    return true;
+  }
+  bool isPinnedPtr(const void*) const override {
+    return false;
+  }
+};
+
+}  // namespace
+
+namespace at {
+// at::detail::getHPUHooks() creates the "HPUHooks" entry (REGISTER_HPU_HOOKS would key it by the class name)
+C10_REGISTER_TYPED_CLASS(HPUHooksRegistry, "HPUHooks", FakeHpuHooks);
+}  // namespace at
 
 namespace {
 

@@ -36,8 +36,10 @@ def extension():
     stub = types.ModuleType("torch.hpu")  # torch's device lazy-init imports torch.hpu for device="hpu"
     stub._lazy_init = lambda: None
     stub.is_available = lambda: False
-    saved = sys.modules.get("torch.hpu")
+    stub.is_current_stream_capturing = lambda: False
+    saved, saved_attr = sys.modules.get("torch.hpu"), getattr(torch, "hpu", None)
     sys.modules["torch.hpu"] = stub
+    torch.hpu = stub  # torch.get_device_module("hpu"), which later torch's optimizers reach through torch.accelerator
     try:
         load_extension()
         load(name="hpu_guard_stub", sources=[str(HERE / "cpu_stub" / "hpu_guard_stub.cpp")], is_python_module=False)
@@ -49,6 +51,10 @@ def extension():
             sys.modules.pop("torch.hpu", None)
         else:
             sys.modules["torch.hpu"] = saved
+        if saved_attr is None:
+            del torch.hpu
+        else:
+            torch.hpu = saved_attr
 
 
 HPU = torch.device("hpu")
