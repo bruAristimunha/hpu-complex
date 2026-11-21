@@ -32,21 +32,26 @@
 #include <ATen/ops/_reshape_alias_native.h>
 #include <ATen/ops/as_strided_native.h>
 #include <ATen/ops/view_native.h>
+#include <ATen/ops/view_as_complex_native.h>
+#include <ATen/MemoryOverlap.h>
 #include <ATen/native/CPUFallback.h>
 #include <ATen/native/Resize.h>
 #include <c10/core/InferenceMode.h>
 #include <c10/core/impl/LocalDispatchKeySet.h>
 #include <c10/util/FunctionRef.h>
 
-#include <cmath>
-#include <limits>
-#include <mutex>
 #include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdlib>
+#include <limits>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <set>
 #include <string>
+#include <string_view>
 #include <tuple>
-#include <map>
 
 namespace {
 
@@ -82,12 +87,12 @@ at::Tensor view_of(const at::Tensor& base, DispatchKeySet keys, caffe2::TypeMeta
   return result;
 }
 
-// A real view of base's storage for Habana's kernels. Habana misreads a non-contiguous view of rank 6 or more built
-// as a bare TensorImpl (view_of) or with as_strided, its own tensors' too, e.g. the float pair of a permuted 5-D complex
-// tensor; it reads the same layout right as a permute of a contiguous view. So a dense one (a permuted contiguous
-// block) is built that way. Other layouts of rank 6 or more go through Habana's as_strided on a contiguous 2-D base
-// over the whole storage, which it reads right for some of them. Lower ranks and expanded views stay bare: Habana
-// reads them right, and rejects some expanded views as strided views (synStatus 1 in strided_view / strided_insert).
+// A real view of base's storage for Habana's kernels. Habana misreads a bare TensorImpl (view_of) whenever its
+// storage_offset is nonzero or its layout is non-contiguous/expanded (Synapse treats sizes as the physical buffer
+// bounds and rejects out-of-bounds offsets or strides with synStatus 1 in strided_view / strided_insert). It also
+// misreads as_strided views of rank 6 or more, so dense rank-6+ layouts are built via narrow + view + permute on a
+// zero-offset full-storage view_of, while lower-rank / non-dense / expanded layouts go through Habana's as_strided
+// over the full storage.
 at::Tensor habana_view(const at::Tensor& base, caffe2::TypeMeta dtype, c10::IntArrayRef sizes, c10::IntArrayRef strides,
                        int64_t storage_offset) {
   auto view = view_of(base, hpu_float_keys(), dtype, sizes, strides, storage_offset);
@@ -95,10 +100,11 @@ at::Tensor habana_view(const at::Tensor& base, caffe2::TypeMeta dtype, c10::IntA
   for (size_t i = 0; i < sizes.size(); ++i) {
     expanded |= sizes[i] > 1 && strides[i] == 0;
   }
-  if (view.dim() < 6 || view.is_contiguous() || expanded) {
+  if (storage_offset == 0 && view.is_contiguous() && !expanded) {
     return view;
   }
-  if (view.is_non_overlapping_and_dense()) {
+  const auto base_numel = static_cast<int64_t>(base.storage().nbytes() / dtype.itemsize());
+  if (view.dim() >= 6 && !expanded && view.is_non_overlapping_and_dense()) {
     // The dims from the largest stride to the smallest, as a contiguous block, permuted back.
     const auto n = static_cast<int64_t>(sizes.size());
     std::vector<int64_t> order(n), block(n), block_strides(n, 1), dims(n);
@@ -111,25 +117,56 @@ at::Tensor habana_view(const at::Tensor& base, caffe2::TypeMeta dtype, c10::IntA
     for (int64_t k = n - 2; k >= 0; --k) {
       block_strides[k] = block_strides[k + 1] * block[k + 1];
     }
-    return view_of(base, hpu_float_keys(), dtype, block, block_strides, storage_offset).permute(dims);
+    if (storage_offset == 0) {
+      return view_of(base, hpu_float_keys(), dtype, block, block_strides, 0).permute(dims);
+    }
+    const int64_t view_numel = view.numel();
+    const int64_t off = view_numel == 0 ? std::min(storage_offset, base_numel) : storage_offset;
+    return view_of(base, hpu_float_keys(), dtype, {base_numel}, {1}, 0)
+        .narrow(0, off, view_numel)
+        .view(block)
+        .permute(dims);
   }
-  const auto numel = static_cast<int64_t>(base.storage().nbytes() / dtype.itemsize());
-  const int64_t inner = numel % 2 == 0 ? 2 : 1;
-  return at::as_strided(view_of(base, hpu_float_keys(), dtype, {numel / inner, inner}, {inner, 1}, 0), sizes, strides,
-                        storage_offset);
+  const int64_t inner = base_numel % 2 == 0 ? 2 : 1;
+  return at::as_strided(view_of(base, hpu_float_keys(), dtype, {base_numel / inner, inner}, {inner, 1}, 0), sizes,
+                        strides, storage_offset);
+}
+
+// t with contiguous strides. Habana's own contiguous() misreads a dense, permuted HPU tensor of rank 6 or more
+// that is the output of one of its ops on a permuted view (e.g. x.permute(...) * 1 or > 0; reproduced without
+// hpu_complex, Gaudi2, bridge 1.21.4: repro/rank6_permuted_contiguous.py), while its elementwise ops, its D2H copy and a
+// permute view over the same storage (habana_view) read it right: such a tensor is copied through that view.
+at::Tensor dense_copy(const at::Tensor& t) {
+  if (t.is_contiguous()) {
+    return t;
+  }
+  if (t.is_hpu() && t.dim() >= 6 && t.is_non_overlapping_and_dense()) {
+    return habana_view(t, t.dtype(), t.sizes(), t.strides(), t.storage_offset()).contiguous();
+  }
+  return t.contiguous();
 }
 
 // float HPU [..., k, 2] (last stride 1) -> tagged complex64 [..., k], same storage.
 at::Tensor complex_view(const at::Tensor& pair) {
-  TORCH_CHECK(pair.scalar_type() == at::kFloat && pair.size(-1) == 2 && pair.stride(-1) == 1,
+  TORCH_CHECK(pair.scalar_type() == at::kFloat && pair.size(-1) == 2 && (pair.stride(-1) == 1 || pair.numel() == 0),
               "hpu_complex: a complex view needs float32 [..., 2] with last stride 1");
   auto sizes = pair.sizes().vec();
-  auto strides = pair.strides().vec();
   sizes.pop_back();
+  if (pair.numel() == 0) {  // no element to address: the strides are free, kept contiguous
+    return view_of(pair, complex_keys(), caffe2::TypeMeta::Make<c10::complex<float>>(), sizes,
+                   c10::contiguous_strides(sizes), 0);
+  }
+  auto strides = pair.strides().vec();
   strides.pop_back();
-  for (auto& s : strides) {
-    TORCH_CHECK(s % 2 == 0, "hpu_complex: odd float stride cannot be a complex stride");
-    s /= 2;
+  for (size_t i = 0; i < strides.size(); ++i) {
+    // A size-1 dim's stride addresses nothing, and contiguous() keeps an odd one (a transposed [..., 1, 2] is
+    // already contiguous): any complex stride will do there.
+    if (sizes[i] == 1 && strides[i] % 2 != 0) {
+      strides[i] = 1;
+      continue;
+    }
+    TORCH_CHECK(strides[i] % 2 == 0, "hpu_complex: odd float stride cannot be a complex stride");
+    strides[i] /= 2;
   }
   TORCH_CHECK(pair.storage_offset() % 2 == 0, "hpu_complex: odd storage offset");
   return view_of(pair, complex_keys(), caffe2::TypeMeta::Make<c10::complex<float>>(), sizes, strides,
@@ -161,14 +198,12 @@ at::Tensor pair_view(const at::Tensor& c) {
   return raw_pair(c);
 }
 
-// The pair of c's values as an operand of Habana's compute kernels. Their result keeps a non-contiguous operand's
-// strides, and Habana copies a tensor of rank 6 or more with such strides as if it were contiguous, its own too
-// ((x.permute(0, 2, 1, 3, 4, 5) * 2).contiguous()); they also misread some of habana_view's as_strided views. The
-// operand's own copy is right, so such a pair is made contiguous first (complex_result covers results whose layout
-// comes from elsewhere).
+// The pair of c's values as an operand of Habana's compute kernels. Non-contiguous / expanded pair views are
+// materialized contiguous so Habana compute ops (and their output stride propagation) never receive strided or
+// stride-0 views.
 at::Tensor operand_pair(const at::Tensor& c) {
   auto p = pair_view(c);
-  return p.dim() >= 6 && !p.is_contiguous() ? p.contiguous() : p;
+  return p.is_contiguous() ? p : p.contiguous();
 }
 
 at::Tensor make_complex_empty(c10::IntArrayRef size, c10::IntArrayRef stride, at::Device device) {
@@ -192,13 +227,44 @@ bool complex_on_hpu(std::optional<at::ScalarType> dtype, DispatchKeySet ks) {
   return dtype.has_value() && *dtype == at::kComplexFloat && ks.highestPriorityTypeId() == DispatchKey::HPU;
 }
 
+std::atomic<int>& lazy_mode_flag() {
+  static std::atomic<int> flag{-1};
+  return flag;
+}
+
+void set_lazy_mode(bool enabled) {
+  lazy_mode_flag().store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+bool is_lazy_mode() {
+  const int flag = lazy_mode_flag().load(std::memory_order_relaxed);
+  if (flag >= 0) {
+    return flag != 0;
+  }
+  const char* env = std::getenv("PT_HPU_LAZY_MODE");
+  return env != nullptr && std::string_view(env) != "0";
+}
+
+void check_not_lazy(const at::Device& device, const char* op) {
+  TORCH_CHECK(
+      !(device.is_hpu() && is_lazy_mode()),
+      "hpu_complex: ", op,
+      " is not supported in Habana lazy mode (PT_HPU_LAZY_MODE=1): "
+      "HbLazyTensor cannot wrap PrivateUse1 complex64 views. "
+      "Run in eager mode (PT_HPU_LAZY_MODE=0) -- optionally with "
+      "torch.compile(model, backend=\"hpu_backend\") for simple models -- "
+      "or use the float-pair API (hpu_complex.rfft / hpu_complex.stft).");
+}
+
 at::Tensor empty_backend_select(c10::SymIntArrayRef size, std::optional<at::ScalarType> dtype,
                                 std::optional<at::Layout> layout, std::optional<at::Device> device,
                                 std::optional<bool> pin_memory, std::optional<at::MemoryFormat> memory_format) {
   auto ks = factory_keys(dtype, layout, device);
   if (complex_on_hpu(dtype, ks)) {
+    const auto dev = device ? *device : at::Device(at::kHPU);
+    check_not_lazy(dev, "complex64 tensor creation on HPU");
     auto sizes = C10_AS_INTARRAYREF_SLOW(size);
-    return make_complex_empty(sizes, c10::contiguous_strides(sizes), *device);
+    return make_complex_empty(sizes, c10::contiguous_strides(sizes), dev);
   }
   return at::_ops::empty_memory_format::redispatch(ks, size, dtype, layout, device, pin_memory, memory_format);
 }
@@ -208,7 +274,9 @@ at::Tensor empty_strided_backend_select(c10::SymIntArrayRef size, c10::SymIntArr
                                         std::optional<at::Device> device, std::optional<bool> pin_memory) {
   auto ks = factory_keys(dtype, layout, device);
   if (complex_on_hpu(dtype, ks)) {
-    return make_complex_empty(C10_AS_INTARRAYREF_SLOW(size), C10_AS_INTARRAYREF_SLOW(stride), *device);
+    const auto dev = device ? *device : at::Device(at::kHPU);
+    check_not_lazy(dev, "complex64 tensor creation on HPU");
+    return make_complex_empty(C10_AS_INTARRAYREF_SLOW(size), C10_AS_INTARRAYREF_SLOW(stride), dev);
   }
   return at::_ops::empty_strided::redispatch(ks, size, stride, dtype, layout, device, pin_memory);
 }
@@ -315,6 +383,7 @@ void check_last_dim(const at::Tensor& self, c10::IntArrayRef dim) {
 // ---- FFT ------------------------------------------------------------------------------
 
 at::Tensor fft_r2c_hpu(const at::Tensor& self, c10::IntArrayRef dim, int64_t normalization, bool onesided) {
+  check_not_lazy(self.device(), "torch.fft.rfft");
   HPU_COMPLEX_NO_AUTOCAST;
   check_last_dim(self, dim);
   const int64_t n = self.size(-1);
@@ -348,8 +417,28 @@ at::Tensor fft_c2r_pu1(const at::Tensor& self, c10::IntArrayRef dim, int64_t nor
   return out.view(sizes);
 }
 
+// The public entry rejects what torch rejects (rank 0, last dim not 2 or not stride 1, an odd stride or offset,
+// with torch's messages): torch's own kernel computes and checks the layout, which is then tagged. complex_view,
+// lenient about size-1 and empty dims, stays for the extension's own results.
 at::Tensor view_as_complex_hpu(const at::Tensor& self) {
-  return complex_view(self);
+  check_not_lazy(self.device(), "torch.view_as_complex");
+  auto v = at::native::view_as_complex(self);
+  TORCH_CHECK(self.scalar_type() == at::kFloat, "hpu_complex: view_as_complex on HPU supports float32 (complex64) "
+              "only, got ", self.scalar_type());
+  return view_of(self, complex_keys(), v.dtype(), v.sizes(), v.strides(), v.storage_offset());
+}
+
+// x.view(torch.complex64) of a real HPU tensor: torch's view_dtype (CompositeExplicitAutograd) would keep the HPU
+// keys on a complex dtype, a tensor no kernel here sees ("Complex datatype is not supported on HPU device" at its
+// first op). Its layout, checked by torch, is tagged instead; real-to-real views are torch's.
+at::Tensor view_dtype_hpu(const at::Tensor& self, at::ScalarType dtype) {
+  if (!c10::isComplexType(dtype) || self.is_complex()) {
+    return at::native::view_dtype(self, dtype);
+  }
+  check_not_lazy(self.device(), "Tensor.view(complex dtype)");
+  TORCH_CHECK(dtype == at::kComplexFloat, "hpu_complex: complex64 only on HPU, got ", dtype);
+  auto v = at::native::view_dtype(self, dtype);
+  return view_of(self, complex_keys(), v.dtype(), v.sizes(), v.strides(), v.storage_offset());
 }
 
 at::Tensor view_as_real_pu1(const at::Tensor& self) {
@@ -382,10 +471,11 @@ at::Tensor neg_view_pu1(const at::Tensor& self) {
 // rejects strided views (BENCHMARKS.md), and a select or an expand is one.
 at::Tensor stack_pair(const at::Tensor& re, const at::Tensor& im) {
   auto parts = at::broadcast_tensors({re, im});
-  return at::stack({parts[0].contiguous(), parts[1].contiguous()}, -1);
+  return at::stack({dense_copy(parts[0]), dense_copy(parts[1])}, -1);
 }
 
 at::Tensor complex_hpu(const at::Tensor& real, const at::Tensor& imag) {
+  check_not_lazy(real.is_hpu() ? real.device() : imag.device(), "torch.complex");
   return complex_view(stack_pair(real.to(at::kFloat), imag.to(at::kFloat)));
 }
 
@@ -393,7 +483,9 @@ at::Tensor complex_hpu(const at::Tensor& real, const at::Tensor& imag) {
 
 // A real operand as float32 on the HPU (CPU 0-dim tensors are Python numbers).
 at::Tensor hpu_float(const at::Tensor& t, const at::Device& device) {
-  return t.to(device, at::kFloat);
+  auto src = t.dim() >= 5 ? dense_copy(t) : t;
+  auto r = src.to(device, at::kFloat);
+  return r.dim() >= 5 ? dense_copy(r) : r;
 }
 
 // [..., 2] float32 pair of an operand: complex -> its pair (on the HPU), real -> nullopt.
@@ -523,29 +615,127 @@ at::Tensor as_pair(const at::Tensor& t, const at::Device& device) {
 at::Tensor where_pu1(const at::Tensor& cond, const at::Tensor& a, const at::Tensor& b) {
   HPU_COMPLEX_NO_AUTOCAST;
   const auto device = hpu_device_of(a, b);
-  return complex_result(at::where(cond.to(device).unsqueeze(-1), as_pair(a, device), as_pair(b, device)));
+  auto cond_dev = (cond.dim() >= 5 ? dense_copy(cond) : cond).to(device);
+  if (cond_dev.dim() >= 5) {
+    cond_dev = dense_copy(cond_dev);
+  }
+  return complex_result(at::where(cond_dev.unsqueeze(-1), as_pair(a, device), as_pair(b, device)));
+}
+
+// ---- matrix products (PrivateUse1) ----------------------------------------------------------
+
+// Below this many complex multiply-adds a product runs faster on the CPU, one copy each way, than as the card's
+// GEMM and its layout copies (launch-bound, ~0.3-1 ms; Gaudi2, bridge 1.21.4: tests/cmatmul_bench.py --sweep).
+std::atomic<int64_t>& matmul_cpu_below() {
+  static std::atomic<int64_t> macs{int64_t{1} << 22};
+  return macs;
+}
+
+void set_matmul_cpu_threshold(int64_t macs) {
+  TORCH_CHECK(macs >= 0, "hpu_complex: the threshold is a count of multiply-adds, got ", macs);
+  matmul_cpu_below().store(macs, std::memory_order_relaxed);
+}
+
+// a @ b (mm / bmm shapes) of two complex64 tensors, as one real GEMM on the card:
+// [ar | ai] @ [[br, bi], [-bi, br]] = [ar br - ai bi | ar bi + ai br] = [cr | ci]. The operand layouts are copied
+// contiguous first (Habana GEMMs mis-handle strided inputs, see the rfft backward). Mixed dtypes raise, as in torch.
+at::Tensor matmul_pu1(const at::Tensor& a, const at::Tensor& b) {
+  HPU_COMPLEX_NO_AUTOCAST;
+  TORCH_CHECK(a.scalar_type() == b.scalar_type(), "expected m1 and m2 to have the same dtype, but got: ",
+              a.scalar_type(), " != ", b.scalar_type());
+  TORCH_CHECK(a.device() == b.device(), "Expected all tensors to be on the same device, but found at least two "
+              "devices, ", a.device(), " and ", b.device(), "!");
+  const auto device = hpu_device_of(a, b);
+  const int64_t macs = a.numel() * b.size(-1);  // batch * m * k * n
+  if (macs < matmul_cpu_below().load(std::memory_order_relaxed)) {
+    TORCH_WARN_ONCE("hpu_complex: complex mm/bmm below the CPU threshold (default 2^22 multiply-adds; first one: ",
+                    macs, ") runs on the CPU, where it is faster than the card's GEMM "
+                    "(hpu_complex.set_matmul_cpu_threshold(0) keeps every product on the card)");
+    return at::matmul(a.to(at::kCPU), b.to(at::kCPU)).to(device);
+  }
+  // (..., r, c) complex -> (..., r, 2c) float = [re | im] per row. mm/bmm fall through the Conjugate key (BLAS folds
+  // the conjugation in), so a conjugate view arrives unresolved: raw_pair gives its stored values, and the
+  // imaginary half is negated here.
+  auto rows = [&](const at::Tensor& t) {
+    auto p = raw_pair(t);
+    p = p.device() == device && p.scalar_type() == at::kFloat ? p : p.to(device, at::kFloat);
+    auto s = p.sizes().vec();
+    s.pop_back();
+    const int64_t c = s.back();
+    s.back() = 2 * c;
+    auto r = p.transpose(-1, -2).contiguous().view(s);
+    return t.is_conj() ? at::cat({r.narrow(-1, 0, c), r.narrow(-1, c, c).neg()}, -1) : r;
+  };
+  const int64_t n = b.size(-1);
+  auto top = rows(b);                                                                   // [br | bi]
+  auto bottom = at::cat({top.narrow(-1, n, n).neg(), top.narrow(-1, 0, n)}, -1);        // [-bi | br]
+  auto out = at::matmul(rows(a), at::cat({top, bottom}, -2));                           // (..., m, 2n) = [cr | ci]
+  auto os = out.sizes().vec();
+  os.back() = n;
+  os.insert(os.end() - 1, 2);  // (..., m, 2, n)
+  return complex_result(out.view(os).transpose(-1, -2).contiguous());
+}
+
+at::Tensor mm_pu1(const at::Tensor& a, const at::Tensor& b) {
+  TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && a.size(1) == b.size(0), "hpu_complex: mm shapes ", a.sizes(), " @ ",
+              b.sizes());
+  return matmul_pu1(a, b);
+}
+
+at::Tensor bmm_pu1(const at::Tensor& a, const at::Tensor& b) {
+  TORCH_CHECK(a.dim() == 3 && b.dim() == 3 && a.size(0) == b.size(0) && a.size(2) == b.size(1),
+              "hpu_complex: bmm shapes ", a.sizes(), " @ ", b.sizes());
+  return matmul_pu1(a, b);
 }
 
 // out variants: compute, then resize and copy into out (complex or real).
 at::Tensor& copy_into(at::Tensor& out, const at::Tensor& value);
 
+// An out= tensor as torch checks it: no two of its elements at one address (an expanded out). mm.out/bmm.out
+// (strict, matrix_mm=true) also need out on the operands' device and of their dtype: copy_into would write the real
+// part into a float out, or copy a result across devices. The elementwise out= variants keep no device check: their
+// value can be computed next to a CPU complex scalar operand (Habana's mul.out of x_hpu * 2j) and is copied into out.
+void check_out(const at::Tensor& out, const at::Tensor& value, bool matrix_mm) {
+  at::assert_no_internal_overlap(out);
+  if (!matrix_mm) {
+    return;
+  }
+  TORCH_CHECK(out.device() == value.device(), "Expected all tensors to be on the same device, but found at least two "
+              "devices, ", value.device(), " and ", out.device(), "!");
+  TORCH_CHECK(out.scalar_type() == value.scalar_type(), "Expected out tensor to have dtype ", value.dtype(),
+              ", but got ", out.dtype(), " instead");
+}
+
+at::Tensor& write_out(at::Tensor& out, const at::Tensor& value, bool matrix_mm = false) {
+  check_out(out, value, matrix_mm);
+  at::native::resize_output_check(out, value.sizes());  // torch's warning when a non-empty out changes shape
+  return copy_into(out, value);
+}
+
+at::Tensor& mm_out_pu1(const at::Tensor& a, const at::Tensor& b, at::Tensor& out) {
+  return write_out(out, mm_pu1(a, b), /*matrix_mm=*/true);
+}
+at::Tensor& bmm_out_pu1(const at::Tensor& a, const at::Tensor& b, at::Tensor& out) {
+  return write_out(out, bmm_pu1(a, b), /*matrix_mm=*/true);
+}
+
 at::Tensor& mul_out_pu1(const at::Tensor& a, const at::Tensor& b, at::Tensor& out) {
-  return copy_into(out, mul_pu1(a, b));
+  return write_out(out, mul_pu1(a, b));
 }
 at::Tensor& div_out_pu1(const at::Tensor& a, const at::Tensor& b, at::Tensor& out) {
-  return copy_into(out, div_pu1(a, b));
+  return write_out(out, div_pu1(a, b));
 }
 at::Tensor& add_out_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha, at::Tensor& out) {
-  return copy_into(out, add_pu1(a, b, alpha));
+  return write_out(out, add_pu1(a, b, alpha));
 }
 at::Tensor& sub_out_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha, at::Tensor& out) {
-  return copy_into(out, sub_pu1(a, b, alpha));
+  return write_out(out, sub_pu1(a, b, alpha));
 }
 at::Tensor& abs_out_pu1(const at::Tensor& self, at::Tensor& out) {
-  return copy_into(out, abs_pu1(self));
+  return write_out(out, abs_pu1(self));
 }
 at::Tensor& sgn_out_pu1(const at::Tensor& self, at::Tensor& out) {
-  return copy_into(out, sgn_pu1(self));
+  return write_out(out, sgn_pu1(self));
 }
 // In-place variants: the result must keep self's shape and fit its dtype, as TensorIterator enforces; copy_into
 // would otherwise resize self (detaching a view from its base) or drop an imaginary part.
@@ -566,33 +756,86 @@ at::Tensor& add__pu1(at::Tensor& self, const at::Tensor& other, const at::Scalar
 // ---- copies and fills (PrivateUse1) ------------------------------------------------------
 
 at::Tensor& copy_pu1(at::Tensor& self, const at::Tensor& src, bool non_blocking) {
+  // torch's copy_ checks (TensorIterator): self has no internal overlap, and src covers self's memory fully or not
+  // at all; a partial overlap would read values already overwritten.
+  at::assert_no_internal_overlap(self);
+  at::assert_no_partial_overlap(self, src);
   if (self.is_complex()) {
     auto dst = raw_pair(self);
     if (src.is_complex()) {
-      dst.copy_(raw_pair(src), non_blocking);
+      auto src_pair = raw_pair(src);
+      if (!src_pair.is_contiguous()) {
+        src_pair = src_pair.contiguous();
+      }
+      if (!self.is_hpu() && (!dst.is_contiguous() || !src_pair.sizes().equals(dst.sizes()))) {
+        // Habana D2H copy_ fails on non-dense CPU targets and does not broadcast smaller HPU sources; stage via CPU.
+        auto cpu_src = src_pair.to(at::kCPU);
+        if (self.is_conj() != src.is_conj()) {
+          cpu_src.select(-1, 1).neg_();
+        }
+        dst.copy_(cpu_src);
+        return self;
+      }
+      if (self.is_hpu() && !src.is_hpu() && !src_pair.sizes().equals(dst.sizes())) {
+        // Habana H2D copy_ does not broadcast smaller CPU tensors across dst; stage to HPU first.
+        src_pair = src_pair.to(dst.scalar_type()).to(dst.device(), non_blocking);
+      }
+      dst.copy_(src_pair, non_blocking && (self.is_hpu() || self.is_conj() == src.is_conj()));
       if (self.is_conj() != src.is_conj()) {  // the stored values differ by one conjugation
         dst.select(-1, 1).neg_();
       }
     } else {  // real -> complex: imaginary part 0
-      dst.select(-1, 0).copy_(src, non_blocking);
+      auto src_f = src.dim() >= 5 ? dense_copy(src) : src;
+      auto dst_re = dst.select(-1, 0);
+      if (!self.is_hpu()) {
+        if (src_f.is_hpu()) {
+          src_f = src_f.to(at::kCPU);
+        }
+        dst_re.copy_(src_f);
+        dst.select(-1, 1).zero_();
+        return self;
+      }
+      if (!src_f.is_hpu() && !src_f.sizes().equals(dst_re.sizes())) {
+        src_f = src_f.to(dst_re.scalar_type()).to(dst_re.device(), non_blocking);
+      }
+      dst_re.copy_(src_f, non_blocking);
       dst.select(-1, 1).zero_();
     }
     return self;
   }
   // complex -> real keeps the real part, as torch does (it warns there).
   TORCH_WARN_ONCE("hpu_complex: casting complex values to real discards the imaginary part");
-  self.copy_(raw_pair(src).select(-1, 0), non_blocking);
+  auto src_pair = raw_pair(src);
+  if (!src_pair.is_contiguous()) {
+    src_pair = src_pair.contiguous();
+  }
+  auto real_part = src_pair.select(-1, 0);
+  if (real_part.is_hpu() && (real_part.dim() >= 5 || !self.is_hpu()) && !real_part.is_contiguous()) {
+    real_part = real_part.contiguous();
+  }
+  if (!self.is_hpu() && (!self.is_contiguous() || !real_part.sizes().equals(self.sizes()))) {
+    self.copy_(real_part.to(at::kCPU));
+    return self;
+  }
+  self.copy_(real_part, non_blocking);
   return self;
 }
 
-// Resize a tagged complex tensor in place: fresh contiguous storage, as resize_ does when it grows.
+// Resize a tagged complex tensor in place, as resize_ does: contiguous strides at the same offset, in the same
+// storage; one too small grows in place (a new allocation of the same StorageImpl, so every view of it sees the
+// result; the old contents are not kept: callers overwrite them all).
 void resize_complex(at::Tensor& t, c10::IntArrayRef sizes) {
   auto strides = c10::contiguous_strides(sizes);
-  auto fresh = make_complex_empty(sizes, strides, t.device());
-  auto* impl = t.unsafeGetTensorImpl();
-  impl->set_storage_keep_dtype(fresh.storage());
-  impl->set_sizes_and_strides(sizes, strides);
-  impl->set_storage_offset(0);
+  const auto needed = static_cast<size_t>(
+      at::detail::computeStorageNbytes(sizes, strides, sizeof(c10::complex<float>), t.storage_offset()));
+  auto storage = t.storage();
+  if (storage.nbytes() < needed) {
+    auto* allocator = storage.allocator();
+    TORCH_CHECK(allocator != nullptr && storage.resizable(), "Trying to resize storage that is not resizable");
+    storage.set_data_ptr_noswap(allocator->allocate(needed));
+    storage.set_nbytes(needed);
+  }
+  t.unsafeGetTensorImpl()->set_sizes_and_strides(sizes, strides);
 }
 
 at::Tensor& copy_into(at::Tensor& out, const at::Tensor& value) {
@@ -639,7 +882,7 @@ at::Tensor sum_pu1(const at::Tensor& self, at::OptionalIntArrayRef dim, bool kee
 
 at::Tensor& sum_out_pu1(const at::Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,
                         std::optional<at::ScalarType> dtype, at::Tensor& out) {
-  return copy_into(out, sum_pu1(self, dim, keepdim, dtype));
+  return write_out(out, sum_pu1(self, dim, keepdim, dtype));
 }
 
 at::Tensor& fill_pu1(at::Tensor& self, const at::Scalar& value) {
@@ -746,6 +989,13 @@ void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
 
 }  // namespace
 
+TORCH_LIBRARY(hpu_complex, m) {
+  m.def("set_lazy_mode(bool enabled) -> ()");
+  m.impl("set_lazy_mode", &set_lazy_mode);
+  m.def("set_matmul_cpu_threshold(int macs) -> ()");
+  m.impl("set_matmul_cpu_threshold", &set_matmul_cpu_threshold);
+}
+
 TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
   m.fallback(torch::CppFunction::makeFromBoxedFunction<&cpu_fallback>());
 }
@@ -763,6 +1013,7 @@ TORCH_LIBRARY_IMPL(aten, HPU, m) {
   // Real HPU inputs only: these produce the tagged complex tensors.
   m.impl("_fft_r2c", &fft_r2c_hpu);
   m.impl("view_as_complex", &view_as_complex_hpu);
+  m.impl("view.dtype", &view_dtype_hpu);  // real -> complex64 views get the complex key
   m.impl("complex", &complex_hpu);
   m.impl("_neg_view", &neg_view_hpu);  // reached only from complex code (imag of a conjugate view)
 }
@@ -792,6 +1043,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("sub.Tensor", &sub_pu1);
   m.impl("sub.out", &sub_out_pu1);
   m.impl("where.self", &where_pu1);
+  m.impl("mm", &mm_pu1);
+  m.impl("mm.out", &mm_out_pu1);
+  m.impl("bmm", &bmm_pu1);
+  m.impl("bmm.out", &bmm_out_pu1);
   m.impl("sum.dim_IntList", &sum_pu1);
   m.impl("sum.IntList_out", &sum_out_pu1);
   m.impl("_copy_from_and_resize", &copy_from_and_resize_pu1);

@@ -338,8 +338,530 @@ for label, case in {
     "permuted 6-D complex (rank-7 pair)": lambda d: z6.to(d).permute(0, 2, 1, 3, 5, 4) * 2,
     "permuted 6-D complex .view(float32)": lambda d: z6.to(d).permute(0, 2, 1, 3, 4, 5).view(torch.float32).contiguous(),
     "expanded 6-D complex * 2": lambda d: z5.to(d).unsqueeze(1).expand(2, 3, 5, 3, 4, 6) * 2,
+    "fill_ on offset permuted 5-D": lambda d: written(d, lambda b: b[1:].permute(0, 2, 1, 3, 4).fill_(3 + 4j)),
 }.items():
     check(f"rank-6 pairs: {label}", lambda case=case: err(case(hpu), case("cpu")), 1e-5)
+
+cond_scalar = torch.tensor(True)
+for label, case in {
+    "z6.to(float32)": lambda d: z6.to(d).to(torch.float32),
+    "r6.copy_(z6)": lambda d: torch.empty(z6.shape, dtype=torch.float32, device=d).copy_(z6.to(d)),
+    "where((x5 > 0).permute(...), z5, 0)": lambda d: torch.where(
+        (x5.to(d) > 0).permute(0, 1, 4, 2, 3), z5.to(d), 0),
+    "where(cond_scalar.expand(2, 3, 4, 5, 6), c5, 0)": lambda d: torch.where(
+        cond_scalar.to(d).expand(2, 3, 4, 5, 6), c5.to(d), 0),
+    "where(cond_scalar.expand(2, 5, 3, 4, 6), z5, 0)": lambda d: torch.where(
+        cond_scalar.to(d).expand(2, 5, 3, 4, 6), z5.to(d), 0),
+}.items():
+    check(f"rank-6+ exact: {label}", lambda case=case: err(case(hpu), case("cpu")), 0)
+
+# <6D strided views (slices, transposes, diagonals, stepped, expanded/stride=0) & in-place storage mutation.
+z3, r3, s3 = cplx(3, 5, 5), torch.randn(3, 5, 5), cplx(3, 1, 5)
+z2 = cplx(3, 5)
+for vname, view_fn in (
+    ("slice offset", lambda t: t[1:, 1:, 1:]),
+    ("transpose", lambda t: t.transpose(1, 2)),
+    ("mH", lambda t: t.mH),
+    ("diagonal", lambda t: t.diagonal(dim1=-2, dim2=-1)),
+    ("stepped", lambda t: t[::2, 1::2, ::2]),
+):
+    check(f"<6D {vname}: mul/div/add/sub/abs/sgn/view_as_real", lambda vf=view_fn: worst(
+        err(vf(z3.to(hpu)) * vf(z3.to(hpu)), vf(z3) * vf(z3)),
+        err(vf(z3.to(hpu)) / (vf(z3.to(hpu)).abs() + 1), vf(z3) / (vf(z3).abs() + 1)),
+        err(vf(z3.to(hpu)) + 1.5, vf(z3) + 1.5),
+        err(vf(z3.to(hpu)) - vf(z3.to(hpu)), vf(z3) - vf(z3)),
+        err(vf(z3.to(hpu)).abs(), vf(z3).abs()),
+        err(vf(z3.to(hpu)).sgn(), vf(z3).sgn()),
+        err(torch.view_as_real(vf(z3.to(hpu)).resolve_conj()).contiguous(),
+            torch.view_as_real(vf(z3).resolve_conj())),
+    ), 1e-5)
+
+    def inplace_view(vf=view_fn):
+        errors = []
+        for mutate in (
+            lambda b: vf(b).fill_(1.25 - 0.75j),
+            lambda b: vf(b).zero_(),
+            lambda b: vf(b).mul_(2.0 + 0.5j),
+            lambda b: vf(b).add_(0.5 - 1.0j),
+            lambda b: vf(b).copy_(vf(z3.to(b.device)).conj()),
+            lambda b: vf(b).copy_(torch.ones_like(vf(b).real)),
+        ):
+            bc, bh = z3.clone(), z3.to(hpu)
+            mutate(bc)
+            mutate(bh)
+            errors.append(err(bh, bc))
+        return worst(*errors)
+
+    check(f"<6D {vname}: inplace fill_/zero_/mul_/add_/copy_", inplace_view, 1e-5)
+
+check("<6D expanded (offset, stride=0): ops & view_as_real", lambda: worst(
+    err(s3[1:].to(hpu).expand(2, 5, 5) * 2.0, s3[1:].expand(2, 5, 5) * 2.0),
+    err(s3[1:].to(hpu).expand(2, 5, 5) + z3[1:].to(hpu), s3[1:].expand(2, 5, 5) + z3[1:]),
+    err(s3[1:].to(hpu).expand(2, 5, 5).abs(), s3[1:].expand(2, 5, 5).abs()),
+    err(s3[1:].to(hpu).expand(2, 5, 5).sgn(), s3[1:].expand(2, 5, 5).sgn()),
+    err(torch.view_as_real(s3[1:].to(hpu).expand(2, 5, 5)).contiguous(),
+        torch.view_as_real(s3[1:].expand(2, 5, 5))),
+), 1e-5)
+
+check("<6D real stride-0 / diag / 5D-perm with complex", lambda: worst(
+    err(z3.to(hpu) * torch.ones((), device=hpu).expand(3, 5, 5), z3 * torch.ones(()).expand(3, 5, 5)),
+    err(z3.to(hpu) / torch.full((), 2.0, device=hpu).expand(3, 5, 5), z3 / torch.full((), 2.0).expand(3, 5, 5)),
+    err(torch.full((), 2.0, device=hpu).expand(3, 5, 5) / (z3.to(hpu) + 10),
+        torch.full((), 2.0).expand(3, 5, 5) / (z3 + 10)),
+    err(z2.to(hpu) * r3.to(hpu).diagonal(dim1=-2, dim2=-1), z2 * r3.diagonal(dim1=-2, dim2=-1)),
+    err(c5.to(hpu).permute(0, 2, 1, 3, 4) * r5.to(hpu).permute(0, 2, 1, 3, 4),
+        c5.permute(0, 2, 1, 3, 4) * r5.permute(0, 2, 1, 3, 4)),
+    err(torch.where(torch.tensor(True, device=hpu).expand(3, 5, 5), z3.to(hpu), r3.to(hpu)),
+        torch.where(torch.tensor(True).expand(3, 5, 5), z3, r3)),
+    err(z3.to(hpu)[2, 3].sum(), z3[2, 3].sum()),
+), 1e-5)
+
+# Issue #4: complex64 linalg forward + backward gradient accuracy vs CPU (with .sum() / sliced / .real.sum() losses).
+def linalg_grad_err(loss_fn, make_inp):
+    xc = make_inp().requires_grad_()
+    xh = xc.detach().clone().to(hpu).requires_grad_()
+    yc, yh = loss_fn(xc), loss_fn(xh)
+    yc.backward()
+    yh.backward()
+    return worst(
+        err(yh, yc) / max(yc.detach().abs().max().item(), 1.0),
+        err(xh.grad, xc.grad) / max(xc.grad.abs().max().item(), 1e-12),
+    )
+
+
+mk_herm = lambda: (lambda a: (a @ a.mH + 8 * torch.eye(8, dtype=torch.complex64)).detach())(cplx(4, 8, 8))  # noqa: E731
+mk_sq = lambda: cplx(4, 8, 8)  # noqa: E731
+mk_rect = lambda: cplx(4, 8, 6)  # noqa: E731
+
+for label, loss_fn, mk in (
+    ("linalg.eigh (w.sum + V.abs.sum)",
+     lambda t: (lambda w, V: w.sum() + V.abs().sum())(*torch.linalg.eigh(t)), mk_herm),
+    ("linalg.eigh (sliced gauge-inv V @ V.mH)",
+     lambda t: (lambda w, V: w[:, :4].sum() + (V[:, :4, :4] @ V[:, :4, :4].mH).real.sum())(*torch.linalg.eigh(t)),
+     mk_herm),
+    ("linalg.svd (U.abs + S + Vh.abs)",
+     lambda t: (lambda U, S, Vh: U.abs().sum() + S.sum() + Vh.abs().sum())(
+         *torch.linalg.svd(t, full_matrices=False)), mk_rect),
+    ("linalg.svd (sliced gauge-inv U @ U.mH + S)",
+     lambda t: (lambda U, S, Vh: (U[:, :4, :4] @ U[:, :4, :4].mH).real.sum() + S[:, :4].sum())(
+         *torch.linalg.svd(t, full_matrices=False)), mk_rect),
+    ("linalg.qr (Q.abs + R.abs)",
+     lambda t: (lambda Q, R: Q.abs().sum() + R.abs().sum())(*torch.linalg.qr(t)), mk_rect),
+    ("linalg.qr (Q.real + R[:, :2].abs)",
+     lambda t: (lambda Q, R: Q.real.sum() + R[:, :2].abs().sum())(*torch.linalg.qr(t)), mk_rect),
+    ("linalg.eig (w.abs + V.abs)",
+     lambda t: (lambda w, V: w.abs().sum() + V.abs().sum())(*torch.linalg.eig(t)), mk_sq),
+    ("linalg.eig (w.real + gauge-inv V*V.conj)",
+     lambda t: (lambda w, V: w[:, :4].real.sum() + (V[:, :4, :4] * V[:, :4, :4].conj()).real.sum())(
+         *torch.linalg.eig(t)), mk_sq),
+    ("linalg.matrix_exp (abs.sum)", lambda t: torch.linalg.matrix_exp(t).abs().sum(), mk_sq),
+    ("linalg.matrix_exp (real.sum & slice)",
+     lambda t: torch.linalg.matrix_exp(t).real.sum() + torch.linalg.matrix_exp(t)[:, :2, :2].abs().sum(), mk_sq),
+    ("linalg.matrix_exp (mH input)", lambda t: torch.linalg.matrix_exp(t.mH).abs().sum(), mk_sq),
+):
+    check(f"{label} fwd+bwd (rel)", lambda lf=loss_fn, mk=mk: linalg_grad_err(lf, mk), 1e-4)
+
+
+def hh_grad_err(slice_real=False):
+    # Reflectors from geqrf: with a random tau the product is ill-conditioned, and two float32 runs differ by
+    # their summation order alone (CPU complex64 vs complex128: 5e-05 relative already).
+    a0, t0 = torch.geqrf(cplx(4, 8, 6))
+    ac, tc = a0.requires_grad_(), t0.requires_grad_()
+    ah = ac.detach().clone().to(hpu).requires_grad_()
+    th = tc.detach().clone().to(hpu).requires_grad_()
+    loss_fn = (lambda a, t: torch.linalg.householder_product(a, t)[:, :4, :4].real.sum()) if slice_real else (
+        lambda a, t: torch.linalg.householder_product(a, t).abs().sum())
+    yc, yh = loss_fn(ac, tc), loss_fn(ah, th)
+    yc.backward()
+    yh.backward()
+    return worst(
+        err(yh, yc) / max(yc.detach().abs().max().item(), 1.0),
+        err(ah.grad, ac.grad) / max(ac.grad.abs().max().item(), 1e-12),
+        err(th.grad, tc.grad) / max(tc.grad.abs().max().item(), 1e-12),
+    )
+
+
+check("linalg.householder_product (abs.sum) fwd+bwd (rel)", lambda: hh_grad_err(False), 5e-4)
+check("linalg.householder_product (slice real.sum) fwd+bwd (rel)", lambda: hh_grad_err(True), 5e-4)
+
+# Issue #5: real float32 linalg.eig / linalg.eigvals (+ complex64 eigvals) fwd + bwd vs CPU.
+# Use an isolated Generator so existing checks above/below keep their exact RNG sequence.
+_eig_gen = torch.Generator().manual_seed(42)
+_eig_f32_2d = torch.randn(8, 8, generator=_eig_gen)
+_eig_f32_3d = torch.randn(4, 8, 8, generator=_eig_gen)
+_eig_f32_32 = torch.randn(32, 22, 22, generator=_eig_gen)
+_eig_f32_4d = torch.randn(2, 3, 6, 6, generator=_eig_gen)
+_eig_c64_3d = torch.complex(torch.randn(4, 8, 8, generator=_eig_gen),
+                            torch.randn(4, 8, 8, generator=_eig_gen))
+
+
+def real_eig_fwd_err(base, view_fn=lambda t: t, eigvals_only=False):
+    xc = view_fn(base)
+    xh = view_fn(base.detach().clone().to(hpu))
+    with torch.no_grad():
+        if eigvals_only:
+            wc = torch.linalg.eigvals(xc)
+            wh = torch.linalg.eigvals(xh)
+            assert wh.dtype == torch.complex64 and tagged(wh), (wh.dtype, torch._C._dispatch_keys(wh))
+            return err(wh, wc)
+        wc, Vc = torch.linalg.eig(xc)
+        wh, Vh = torch.linalg.eig(xh)
+    assert wh.dtype == torch.complex64 and Vh.dtype == torch.complex64, (wh.dtype, Vh.dtype)
+    assert tagged(wh) and tagged(Vh), (torch._C._dispatch_keys(wh), torch._C._dispatch_keys(Vh))
+    return worst(err(wh, wc), err(Vh, Vc))
+
+
+def real_eig_bwd_err(loss_fn, base, view_fn=lambda t: t):
+    bc = base.detach().clone().requires_grad_()
+    bh = base.detach().clone().to(hpu).requires_grad_()
+    yc, yh = loss_fn(view_fn(bc)), loss_fn(view_fn(bh))
+    yc.backward()
+    yh.backward()
+    assert bh.grad.dtype == torch.float32, bh.grad.dtype
+    assert not tagged(bh.grad), torch._C._dispatch_keys(bh.grad)
+    return worst(
+        err(yh, yc) / max(yc.detach().abs().max().item(), 1.0),
+        err(bh.grad, bc.grad) / max(bc.grad.abs().max().item(), 1e-12),
+    )
+
+
+for label, base, vf in (
+    ("2D (8, 8)", _eig_f32_2d, lambda t: t),
+    ("3D (4, 8, 8)", _eig_f32_3d, lambda t: t),
+    ("3D (32, 22, 22)", _eig_f32_32, lambda t: t),
+    ("4D (2, 3, 6, 6)", _eig_f32_4d, lambda t: t),
+    (".mT", _eig_f32_3d, lambda t: t.mT),
+    ("[:, 1:7, 1:7]", _eig_f32_3d, lambda t: t[:, 1:7, 1:7]),
+):
+    check(f"real f32 linalg.eig fwd {label}", lambda b=base, vf=vf: real_eig_fwd_err(b, vf), 1e-4)
+
+for label, loss_fn, base, vf in (
+    ("3D (w.abs + V.abs)", lambda t: (lambda w, V: w.abs().sum() + V.abs().sum())(*torch.linalg.eig(t)),
+     _eig_f32_3d, lambda t: t),
+    ("3D (gauge-inv)", lambda t: (lambda w, V: w[:, :4].real.sum() + (V[:, :4, :4] * V[:, :4, :4].conj()).real.sum())(
+        *torch.linalg.eig(t)), _eig_f32_3d, lambda t: t),
+    ("3D (w.abs only)", lambda t: torch.linalg.eig(t)[0].abs().sum(), _eig_f32_3d, lambda t: t),
+    ("3D (V.abs only)", lambda t: torch.linalg.eig(t)[1].abs().sum(), _eig_f32_3d, lambda t: t),
+    ("2D (8, 8)", lambda t: (lambda w, V: w.abs().sum() + V.abs().sum())(*torch.linalg.eig(t)),
+     _eig_f32_2d, lambda t: t),
+    ("4D (2, 3, 6, 6)", lambda t: (lambda w, V: w.abs().sum() + V.abs().sum())(*torch.linalg.eig(t)),
+     _eig_f32_4d, lambda t: t),
+    (".mT", lambda t: (lambda w, V: w.abs().sum() + V.abs().sum())(*torch.linalg.eig(t)),
+     _eig_f32_3d, lambda t: t.mT),
+    ("[:, 1:7, 1:7]", lambda t: (lambda w, V: w.abs().sum() + V.abs().sum())(*torch.linalg.eig(t)),
+     _eig_f32_3d, lambda t: t[:, 1:7, 1:7]),
+    ("V.permute(1, 0, 2) grad_V",
+     lambda t: (lambda w, V: w.abs().sum() + V.permute(1, 0, 2).abs().sum())(*torch.linalg.eig(t)),
+     _eig_f32_3d, lambda t: t),
+):
+    check(f"real f32 linalg.eig {label} fwd+bwd (rel)",
+          lambda lf=loss_fn, b=base, vf=vf: real_eig_bwd_err(lf, b, vf), 1e-4)
+
+for label, base, vf in (
+    ("2D (8, 8)", _eig_f32_2d, lambda t: t),
+    ("3D (4, 8, 8)", _eig_f32_3d, lambda t: t),
+    (".mT", _eig_f32_3d, lambda t: t.mT),
+    ("[:, 1:7, 1:7]", _eig_f32_3d, lambda t: t[:, 1:7, 1:7]),
+):
+    check(f"real f32 linalg.eigvals fwd {label}",
+          lambda b=base, vf=vf: real_eig_fwd_err(b, vf, eigvals_only=True), 1e-4)
+
+for label, base, vf in (
+    ("2D (8, 8)", _eig_f32_2d, lambda t: t),
+    ("3D (4, 8, 8)", _eig_f32_3d, lambda t: t),
+    ("4D (2, 3, 6, 6)", _eig_f32_4d, lambda t: t),
+    (".mT", _eig_f32_3d, lambda t: t.mT),
+    ("[:, 1:7, 1:7]", _eig_f32_3d, lambda t: t[:, 1:7, 1:7]),
+):
+    check(f"real f32 linalg.eigvals {label} fwd+bwd (rel)",
+          lambda b=base, vf=vf: real_eig_bwd_err(lambda t: torch.linalg.eigvals(t).abs().sum(), b, vf), 1e-4)
+
+def c64_eigvals_fwd_err():
+    with torch.no_grad():
+        wc = torch.linalg.eigvals(_eig_c64_3d)
+        wh = torch.linalg.eigvals(_eig_c64_3d.detach().clone().to(hpu))
+    assert wh.dtype == torch.complex64 and tagged(wh), (wh.dtype, torch._C._dispatch_keys(wh))
+    return err(wh, wc)
+
+
+check("complex64 linalg.eigvals fwd (4, 8, 8)", c64_eigvals_fwd_err, 1e-4)
+check("linalg.eigvals (w.abs.sum) fwd+bwd (rel)",
+      lambda: linalg_grad_err(lambda t: torch.linalg.eigvals(t).abs().sum(), lambda: _eig_c64_3d.detach().clone()), 1e-4)
+
+# Complex mm / bmm on the card (one real GEMM): complex x complex, real x complex, complex x real, conjugate and
+# strided operands, matmul broadcasting, gradients through @ and .mH.
+_mm_gen = torch.Generator().manual_seed(7)
+_mc = lambda *s: torch.complex(torch.randn(*s, generator=_mm_gen), torch.randn(*s, generator=_mm_gen))  # noqa: E731
+_A, _B, _R = _mc(5, 7, 4), _mc(5, 4, 3), torch.randn(5, 4, 3, generator=_mm_gen)
+_A2, _B2 = _mc(7, 4), _mc(4, 3)
+def _empty_or_zero_err(got, ref):
+    """err() for results that may hold no element: shape, dtype and tag must match; values when there are any."""
+    if got.shape != ref.shape or got.dtype != ref.dtype or not tagged(got):
+        return math.inf
+    return err(got, ref) if ref.numel() else 0.0
+
+
+def _mixed_dtype_raises():
+    try:
+        torch.bmm(_A.to(hpu), _R.to(hpu))
+    except RuntimeError as e:
+        return 0.0 if "same dtype" in str(e) else 1.0, str(e)[:60]
+    return 1.0, "no error"
+
+
+check("complex bmm with a float32 operand raises, as on the CPU", _mixed_dtype_raises, 0)
+
+
+def _float_out_raises():
+    """mm.out / bmm.out into a float32 out raise on the CPU (dtype check); they must not write the real part here."""
+    msgs = []
+    for name, fn, a, b, shape in (("mm", torch.mm, _A2, _B2, (7, 3)), ("bmm", torch.bmm, _A, _B, (5, 7, 3))):
+        try:
+            fn(a.to(hpu), b.to(hpu), out=torch.empty(*shape, device=hpu))
+        except RuntimeError as e:
+            if "Expected out tensor to have dtype" not in str(e):
+                return 1.0, f"{name}: {str(e)[:60]}"
+            msgs.append(name)
+            continue
+        return 1.0, f"{name}: no error"
+    return 0.0, "raised: " + ", ".join(msgs)
+
+
+for _route, _threshold in (("card", 0), ("CPU<2^22", 1 << 22)):
+    hpu_complex.set_matmul_cpu_threshold(_threshold)
+    check(f"complex mm.out / bmm.out into a float32 out raise, as on the CPU {_route}", _float_out_raises, 0)
+# Both routes: every product on the card's GEMM (threshold 0), then the default (these small ones on the CPU).
+for _route, _threshold in (("card", 0), ("CPU<2^22", 1 << 22)):
+    hpu_complex.set_matmul_cpu_threshold(_threshold)
+    check(f"complex bmm / mm / matmul (incl. cast, conj, strided, broadcast) {_route}", lambda: worst(
+        err(torch.bmm(_A.to(hpu), _B.to(hpu)), torch.bmm(_A, _B)),
+        err(torch.mm(_A2.to(hpu), _B2.to(hpu)), torch.mm(_A2, _B2)),
+        err(_A.to(hpu) @ _R.to(hpu).to(torch.complex64), _A @ _R.to(torch.complex64)),
+        err(_A.to(hpu) @ _A.to(hpu).mH, _A @ _A.mH),
+        err(_A.to(hpu).conj() @ _B.to(hpu), _A.conj() @ _B),
+        err(_A.to(hpu)[:, 1:6:2] @ _B.to(hpu)[:, :, 1:], _A[:, 1:6:2] @ _B[:, :, 1:]),
+        err(_A.to(hpu) @ _B2.to(hpu), _A @ _B2),
+        err(_A2.to(hpu) @ _A2.to(hpu)[0], _A2 @ _A2[0]),
+        err(torch.bmm(_A.to(hpu), _B.to(hpu), out=torch.empty(5, 7, 3, dtype=torch.complex64, device=hpu)),
+            torch.bmm(_A, _B)),
+        (lambda u, v: err(u.to(hpu) @ v.to(hpu), u @ v))(_mc(1, 1, 1), _mc(1, 1, 1)),
+        (lambda u, v: err(u.to(hpu) @ v.to(hpu), u @ v))(_mc(3, 4, 5), _mc(3, 5, 1)),
+        (lambda u, v: err(u.to(hpu) @ v.to(hpu), u @ v))(_mc(3, 1, 5), _mc(3, 5, 4)),
+        (lambda u, v: _empty_or_zero_err(u.to(hpu) @ v.to(hpu), u @ v))(_mc(0, 4, 5), _mc(0, 5, 2)),
+        (lambda u, v: _empty_or_zero_err(u.to(hpu) @ v.to(hpu), u @ v))(_mc(4, 0), _mc(0, 3)),
+    ), 1e-5)
+    check(f"complex matmul X Xᴴ fwd+bwd (rel) {_route}", lambda: grad_err(lambda t: (t @ t.mH).abs(), _A, relative=True), 1e-5)
+    check(f"complex matmul complex@cast(real) fwd+bwd (rel) {_route}",
+          lambda: grad_err(lambda r: (_A.to(r.device) @ r.to(torch.complex64)).abs(), _R, relative=True), 1e-5)
+
+# Adversarial: extreme values through the card GEMM (NaN/inf propagate as on the CPU, overflow to inf), a
+# compiled product (complex nodes run eagerly on these kernels), and one large enough for the default card route.
+hpu_complex.set_matmul_cpu_threshold(0)
+_X = _mc(3, 4, 5)
+_X[0, 1, 2] = complex(float("inf"), 0.0)
+_X[1, 0, 0] = complex(float("nan"), 1.0)
+_X[2] *= 1e30
+_Y = _mc(3, 5, 2)
+_Y[2, :, 0] *= 1e10  # batch 2, column 0: |products| ~ 1e40 overflow float32 to inf
+
+
+def _extreme_rel_err():
+    """Elementwise |got - ref| / max(|ref|, 1) where finite; NaN unless the same entries are non-finite and the NaN
+    input's row is NaN. Overflowing sums are not compared by kind (CPU NaN, card +-inf here): Habana's own float32
+    GEMM treats overflowing intermediates differently from the CPU (measured: [3e38, -3e38] @ [10, 10] is 0.0 on the
+    card, inf on the CPU), while an explicit inf - inf is NaN on both."""
+    got, ref = torch.view_as_real((_X.to(hpu) @ _Y.to(hpu)).cpu()), torch.view_as_real(_X @ _Y)
+    same = torch.equal(got.isfinite(), ref.isfinite()) and bool(got[1, 0].isnan().all())
+    if not same:
+        return math.nan
+    fin = ref.isfinite()
+    return ((got[fin] - ref[fin]).abs() / ref[fin].abs().clamp_min(1)).max().item()
+
+
+check("complex bmm card: inf / NaN / overflow as on the CPU (rel)", _extreme_rel_err, 1e-5)
+hpu_complex.set_matmul_cpu_threshold(1 << 22)
+
+
+def _compiled_matmul_err():
+    f = torch.compile(lambda t: (t @ t.mH).abs().sum(-1), backend="hpu_backend")
+    return grad_err(f, _A, relative=True, reference=lambda t: (t @ t.mH).abs().sum(-1))
+
+
+check("compiled (t @ t.mH).abs() fwd+bwd (rel)", _compiled_matmul_err, 1e-5)
+
+
+# Compiled linalg backward (hpu_backend): eigenvector strides traced by the fake tensors (contiguous) differ from the
+# real ones (column-major), and the qr backward reads a strided float view of complex storage in a fused graph; both
+# gave wrong gradients with no error before hpu_complex patched the two passes.
+def _compiled_grad_err(f, x):
+    torch._dynamo.reset()
+    return grad_err(torch.compile(f, backend="hpu_backend"), x, relative=True, reference=f)
+
+
+_eig_real = torch.randn(3, 5, 5, generator=torch.Generator().manual_seed(8))
+_eig_cplx = cplx(3, 5, 5)
+for label, f, x in (
+    ("eigvals(real).abs()", lambda t: torch.linalg.eigvals(t).abs(), _eig_real),
+    ("eigvals(complex).abs()", lambda t: torch.linalg.eigvals(t).abs(), _eig_cplx),
+    ("eig(real) w.abs()", lambda t: torch.linalg.eig(t)[0].abs(), _eig_real),
+    ("eigvals(complex) (w * w.conj()).real", lambda t: (lambda w: (w * w.conj()).real)(torch.linalg.eigvals(t)),
+     _eig_cplx),
+    ("qr(complex) Q.abs()", lambda t: torch.linalg.qr(t)[0].abs(), _eig_cplx),
+    ("qr(complex) R.abs()", lambda t: torch.linalg.qr(t)[1].abs(), _eig_cplx),
+):
+    check(f"compiled {label} fwd+bwd (rel)", lambda f=f, x=x: _compiled_grad_err(f, x), 1e-4)
+_Big = _mc(64, 22, 300)
+check("complex X Xᴴ above the threshold (card route, 64x22x300x22) (rel)",
+      lambda: err(_Big.to(hpu) @ _Big.to(hpu).mH, _Big @ _Big.mH) / (_Big @ _Big.mH).abs().max().item(), 1e-5)
+
+x6_cpu = torch.randn(2, 3, 2, 4, 3, 5)
+c6_cpu_perm = (x6_cpu > 0).permute(0, 2, 4, 1, 3, 5)
+c6_cpu_off_perm = (x6_cpu > 0)[1:].permute(0, 2, 4, 1, 3, 5)
+f6_cpu_perm = x6_cpu.permute(0, 2, 4, 1, 3, 5)
+z6_perm_shape = cplx(*f6_cpu_perm.shape)
+x7_cpu = torch.randn(2, 2, 2, 3, 2, 3, 2)
+c7_cpu_perm = (x7_cpu > 0).permute(1, 0, 2, 3, 4, 5, 6)
+z7_perm_shape = cplx(*c7_cpu_perm.shape)
+for label, case in {
+    "where(6D CPU perm cond, z6_hpu, 0)": lambda d: torch.where(c6_cpu_perm, z6_perm_shape.to(d), 0),
+    "where(6D CPU offset perm cond, z6_hpu[1:], 0)": lambda d: torch.where(
+        c6_cpu_off_perm, z6_perm_shape.to(d)[1:], 0),
+    "where(7D CPU perm cond, z7_hpu, 0)": lambda d: torch.where(c7_cpu_perm, z7_perm_shape.to(d), 0),
+}.items():
+    check(f"rank-6+ CPU exact: {label}", lambda case=case: err(case(hpu), case("cpu")), 0)
+
+c6_hpu_perm = (x6_cpu.to(hpu) > 0).permute(0, 2, 4, 1, 3, 5)
+for label, hpu_fn, cpu_fn in (
+    ("z6_hpu * f6_cpu_perm", lambda: z6_perm_shape.to(hpu) * f6_cpu_perm, lambda: z6_perm_shape * f6_cpu_perm),
+    ("z6_hpu + f6_cpu_perm", lambda: z6_perm_shape.to(hpu) + f6_cpu_perm, lambda: z6_perm_shape + f6_cpu_perm),
+    ("z6_hpu - f6_cpu_perm", lambda: z6_perm_shape.to(hpu) - f6_cpu_perm, lambda: z6_perm_shape - f6_cpu_perm),
+    ("z6_hpu / (f6_cpu_perm.abs() + 1)", lambda: z6_perm_shape.to(hpu) / (f6_cpu_perm.abs() + 1),
+     lambda: z6_perm_shape / (f6_cpu_perm.abs() + 1)),
+    ("where(cond6_hpu, z6_hpu, f6_cpu_perm)", lambda: torch.where(c6_hpu_perm, z6_perm_shape.to(hpu), f6_cpu_perm),
+     lambda: torch.where(c6_cpu_perm, z6_perm_shape, f6_cpu_perm)),
+    ("z6_hpu * f6_cpu_perm.double()", lambda: z6_perm_shape.to(hpu) * f6_cpu_perm.double(),
+     lambda: z6_perm_shape * f6_cpu_perm.double()),
+    ("z6_hpu.copy_(z6_cpu_perm.cdouble())", lambda: torch.zeros_like(z6_perm_shape, device=hpu).copy_(
+        z6.cdouble().permute(0, 2, 4, 1, 3, 5)),
+     lambda: z6.cdouble().permute(0, 2, 4, 1, 3, 5).to(torch.complex64)),
+    ("f6_cpu_perm.double().to(hpu, complex64)", lambda: f6_cpu_perm.double().to(device=hpu, dtype=torch.complex64),
+     lambda: f6_cpu_perm.double().to(torch.complex64)),
+):
+    check(f"rank-6+ CPU float/copy: {label}", lambda hf=hpu_fn, cf=cpu_fn: err(hf(), cf()), 1e-5)
+
+# A real HPU operand of rank 6 with permuted strides that is the OUTPUT of a Habana op on a permuted view: Habana's
+# own contiguous() misreads it (also without hpu_complex), so the kernels must not call it on such an operand.
+_x8 = torch.randn(2, 2, 3, 2, 2, 3, 2, 2)
+_sel = lambda t: t[1, 1:].permute(0, 2, 1, 3, 4, 5, 6)[..., 0]  # noqa: E731  rank 6, offset, non-dense
+_r6h, _r6c = _sel(_x8.to(hpu)) * 1, _sel(_x8) * 1  # strides (72, 12, 24, 6, 2, 1) on both
+_z6p = cplx(*_r6c.shape)
+_x7 = cplx(2, 2, 3, 2, 2, 3, 2)
+_v7 = lambda t: t[1, 1:].permute(0, 2, 1, 3, 4, 5)  # noqa: E731
+for label, hpu_fn, cpu_fn in (
+    ("z6 * r6", lambda: _z6p.to(hpu) * _r6h, lambda: _z6p * _r6c),
+    ("z6 + r6", lambda: _z6p.to(hpu) + _r6h, lambda: _z6p + _r6c),
+    ("r6 / z6", lambda: _r6h / (_z6p.to(hpu) + 3), lambda: _r6c / (_z6p + 3)),
+    ("where(r6 > 0, z6, 0)", lambda: torch.where(_r6h > 0, _z6p.to(hpu), 0), lambda: torch.where(_r6c > 0, _z6p, 0)),
+    ("where(r6 > 0, z6, r6)", lambda: torch.where(_r6h > 0, _z6p.to(hpu), _r6h),
+     lambda: torch.where(_r6c > 0, _z6p, _r6c)),
+    ("z6.clone().copy_(r6)", lambda: _z6p.to(hpu).clone().copy_(_r6h), lambda: _z6p.clone().copy_(_r6c)),
+    ("torch.complex(r6, r6)", lambda: torch.complex(_r6h, _r6h), lambda: torch.complex(_r6c, _r6c)),
+    ("r6.to(complex64)", lambda: _r6h.to(torch.complex64), lambda: _r6c.to(torch.complex64)),
+    ("offset permuted v: where(v.real > 0, v, 0)", lambda: torch.where(_v7(_x7.to(hpu)).real > 0, _v7(_x7.to(hpu)), 0),
+     lambda: torch.where(_v7(_x7).real > 0, _v7(_x7), 0)),
+):
+    exact = "/" not in label  # the division rounds differently on the card (1.2e-7 measured)
+    check(f"rank-6 permuted Habana result{' (exact)' if exact else ''}: {label}",
+          lambda hf=hpu_fn, cf=cpu_fn: err(hf(), cf()), 0 if exact else 1e-6)
+
+
+def _mixed_device_raises():
+    """torch.mm / bmm of an HPU and a CPU complex operand raise on the device check, as torch does."""
+    for name, fn, a, b in (("mm", torch.mm, _A2, _B2), ("bmm", torch.bmm, _A, _B)):
+        for u, v in ((a.to(hpu), b), (a, b.to(hpu))):
+            try:
+                fn(u, v)
+            except RuntimeError as e:
+                if "same device" not in str(e):
+                    return 1.0, f"{name}: {str(e)[:60]}"
+                continue
+            return 1.0, f"{name}: no error"
+    return 0.0, "raised for mm and bmm, both orders"
+
+
+for _route, _threshold in (("card", 0), ("CPU<2^22", 1 << 22)):
+    hpu_complex.set_matmul_cpu_threshold(_threshold)
+    check(f"complex mm / bmm of HPU and CPU operands raise {_route}", _mixed_device_raises, 0)
+hpu_complex.set_matmul_cpu_threshold(1 << 22)
+
+# D2H copy_ into non-dense CPU targets (sentinel-filled) and 5-D complex->real D2H.
+def d2h_nondense_copy(view_fn, src_conj=False, dst_conj=False, real_dst=False):
+    if real_dst:
+        ref = torch.full_like(r3, 99.0)
+        got = torch.full_like(r3, 99.0)
+        src_c = view_fn(z3).conj() if src_conj else view_fn(z3)
+        src_h = view_fn(z3.to(hpu)).conj() if src_conj else view_fn(z3.to(hpu))
+        view_fn(ref).copy_(src_c.real)
+        view_fn(got).copy_(src_h)
+        return err(got, ref)
+    ref = torch.full_like(z3, 99.0 + 99.0j)
+    got = torch.full_like(z3, 99.0 + 99.0j)
+    dst_c = view_fn(ref).conj() if dst_conj else view_fn(ref)
+    dst_h = view_fn(got).conj() if dst_conj else view_fn(got)
+    src_c = view_fn(z3).conj() if src_conj else view_fn(z3)
+    src_h = view_fn(z3.to(hpu)).conj() if src_conj else view_fn(z3.to(hpu))
+    dst_c.copy_(src_c)
+    dst_h.copy_(src_h)
+    return err(got, ref)
+
+
+for vname, vf in (
+    ("diagonal", lambda t: t.diagonal(dim1=-2, dim2=-1)),
+    ("narrow", lambda t: t.narrow(-1, 1, 3)),
+    ("step", lambda t: t[:, ::2, 1::2]),
+):
+    check(f"D2H cplx<-cplx {vname}", lambda vf=vf: d2h_nondense_copy(vf), 0)
+    check(f"D2H cplx<-cplx {vname} (src conj)", lambda vf=vf: d2h_nondense_copy(vf, src_conj=True), 0)
+    check(f"D2H cplx<-cplx {vname} (dst conj)", lambda vf=vf: d2h_nondense_copy(vf, dst_conj=True), 0)
+    check(f"D2H real<-cplx {vname}", lambda vf=vf: d2h_nondense_copy(vf, real_dst=True), 0)
+
+check("D2H 5-D real<-cplx (contig & diagonal)", lambda: worst(
+    err(torch.full_like(z5.real, 99.0).copy_(z5.to(hpu)), torch.full_like(z5.real, 99.0).copy_(z5.real)),
+    err((lambda b: (b.diagonal(-2, -1).copy_(z5.to(hpu).diagonal(-2, -1)), b)[1])(torch.full_like(z5.real, 99.0)),
+        (lambda b: (b.diagonal(-2, -1).copy_(z5.diagonal(-2, -1).real), b)[1])(torch.full_like(z5.real, 99.0))),
+), 0)
+
+sc_cplx, sc_real = torch.tensor(1.5 - 2.25j), torch.tensor(3.25)
+v1_cplx, v1_real = cplx(5), torch.randn(5)
+check("D2H broadcast smaller HPU->CPU (cplx & real)", lambda: worst(
+    err(torch.full_like(z3, 99.0 + 99.0j).copy_(sc_cplx.to(hpu)), torch.full_like(z3, 99.0 + 99.0j).copy_(sc_cplx)),
+    err((lambda b: (b.diagonal(-2, -1).copy_(sc_cplx.to(hpu).conj()), b)[1])(torch.full_like(z3, 99.0 + 99.0j)),
+        (lambda b: (b.diagonal(-2, -1).copy_(sc_cplx.conj()), b)[1])(torch.full_like(z3, 99.0 + 99.0j))),
+    err(torch.full_like(r3, 99.0).copy_(sc_cplx.to(hpu)), torch.full_like(r3, 99.0).copy_(sc_cplx.real)),
+), 0)
+
+# H2D copy_ from broadcast-smaller CPU tensors.
+def h2d_broadcast_copy(make_target, src):
+    bc = make_target("cpu")
+    bh = make_target(hpu)
+    (bc[1:] if bc.shape == z3.shape else bc).copy_(src)
+    (bh[1:] if bh.shape == z3.shape else bh).copy_(src)
+    return err(bh, bc)
+
+
+check("H2D broadcast-smaller CPU->HPU copies", lambda: worst(
+    err(torch.zeros_like(z3, device=hpu).copy_(sc_cplx), torch.zeros_like(z3).copy_(sc_cplx)),
+    h2d_broadcast_copy(lambda d: torch.zeros_like(z3, device=d), sc_cplx),
+    err((lambda b: (b.diagonal(-2, -1).copy_(sc_cplx.conj()), b)[1])(torch.zeros_like(z3, device=hpu)),
+        (lambda b: (b.diagonal(-2, -1).copy_(sc_cplx.conj()), b)[1])(torch.zeros_like(z3))),
+    err(torch.zeros_like(z3, device=hpu).copy_(sc_real), torch.zeros_like(z3).copy_(sc_real)),
+    h2d_broadcast_copy(lambda d: torch.zeros_like(z3, device=d), sc_real),
+    h2d_broadcast_copy(lambda d: torch.zeros_like(z3, device=d), v1_cplx),
+    h2d_broadcast_copy(lambda d: torch.zeros_like(z3, device=d), v1_real),
+    err((lambda b: (b.diagonal(-2, -1).copy_(sc_cplx), b)[1])(torch.zeros_like(z6, device=hpu)),
+        (lambda b: (b.diagonal(-2, -1).copy_(sc_cplx), b)[1])(torch.zeros_like(z6))),
+), 0)
+
 passed = sum(results)
 print(f"PU1_CHECK {passed}/{len(results)} passed", flush=True)
 sys.exit(0 if passed == len(results) else 1)
