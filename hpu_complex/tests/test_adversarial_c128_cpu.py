@@ -4,7 +4,7 @@ Same CPU stand-in as test_complex128_cpu.py (the extension + a no-op HPU guard).
 until the fix round removed it with its fix: unfold (registered at PrivateUse1 as ATen's view), conv1d (aten::convolution
 and convolution_backward take host_fallback), set_(source) (ATen's set_tensor_), inference_mode (host tensors made
 without autograd keys) and the gradient through z.real[1:] (slice_backward and diagonal_backward take host_fallback).
-The cases that need Habana tensors (bool masks, float32 HPU operands, lazy mode) are in tests/probe_adversarial_j.py.
+The cases that need Habana tensors (bool masks, float32 HPU operands, lazy mode) are in hpu_complex/tests/c128_adversarial_check.py.
 
 python -m pytest hpu_complex/tests/test_adversarial_c128_cpu.py -q
 """
