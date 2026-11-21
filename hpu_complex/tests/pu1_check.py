@@ -727,6 +727,51 @@ for label, hpu_fn, cpu_fn in (
 ):
     check(f"rank-6+ CPU float/copy: {label}", lambda hf=hpu_fn, cf=cpu_fn: err(hf(), cf()), 1e-5)
 
+# A real HPU operand of rank 6 with permuted strides that is the OUTPUT of a Habana op on a permuted view: Habana's
+# own contiguous() misreads it (also without hpu_complex), so the kernels must not call it on such an operand.
+_x8 = torch.randn(2, 2, 3, 2, 2, 3, 2, 2)
+_sel = lambda t: t[1, 1:].permute(0, 2, 1, 3, 4, 5, 6)[..., 0]  # noqa: E731  rank 6, offset, non-dense
+_r6h, _r6c = _sel(_x8.to(hpu)) * 1, _sel(_x8) * 1  # strides (72, 12, 24, 6, 2, 1) on both
+_z6p = cplx(*_r6c.shape)
+_x7 = cplx(2, 2, 3, 2, 2, 3, 2)
+_v7 = lambda t: t[1, 1:].permute(0, 2, 1, 3, 4, 5)  # noqa: E731
+for label, hpu_fn, cpu_fn in (
+    ("z6 * r6", lambda: _z6p.to(hpu) * _r6h, lambda: _z6p * _r6c),
+    ("z6 + r6", lambda: _z6p.to(hpu) + _r6h, lambda: _z6p + _r6c),
+    ("r6 / z6", lambda: _r6h / (_z6p.to(hpu) + 3), lambda: _r6c / (_z6p + 3)),
+    ("where(r6 > 0, z6, 0)", lambda: torch.where(_r6h > 0, _z6p.to(hpu), 0), lambda: torch.where(_r6c > 0, _z6p, 0)),
+    ("where(r6 > 0, z6, r6)", lambda: torch.where(_r6h > 0, _z6p.to(hpu), _r6h),
+     lambda: torch.where(_r6c > 0, _z6p, _r6c)),
+    ("z6.clone().copy_(r6)", lambda: _z6p.to(hpu).clone().copy_(_r6h), lambda: _z6p.clone().copy_(_r6c)),
+    ("torch.complex(r6, r6)", lambda: torch.complex(_r6h, _r6h), lambda: torch.complex(_r6c, _r6c)),
+    ("r6.to(complex64)", lambda: _r6h.to(torch.complex64), lambda: _r6c.to(torch.complex64)),
+    ("offset permuted v: where(v.real > 0, v, 0)", lambda: torch.where(_v7(_x7.to(hpu)).real > 0, _v7(_x7.to(hpu)), 0),
+     lambda: torch.where(_v7(_x7).real > 0, _v7(_x7), 0)),
+):
+    exact = "/" not in label  # the division rounds differently on the card (1.2e-7 measured)
+    check(f"rank-6 permuted Habana result{' (exact)' if exact else ''}: {label}",
+          lambda hf=hpu_fn, cf=cpu_fn: err(hf(), cf()), 0 if exact else 1e-6)
+
+
+def _mixed_device_raises():
+    """torch.mm / bmm of an HPU and a CPU complex operand raise on the device check, as torch does."""
+    for name, fn, a, b in (("mm", torch.mm, _A2, _B2), ("bmm", torch.bmm, _A, _B)):
+        for u, v in ((a.to(hpu), b), (a, b.to(hpu))):
+            try:
+                fn(u, v)
+            except RuntimeError as e:
+                if "same device" not in str(e):
+                    return 1.0, f"{name}: {str(e)[:60]}"
+                continue
+            return 1.0, f"{name}: no error"
+    return 0.0, "raised for mm and bmm, both orders"
+
+
+for _route, _threshold in (("card", 0), ("CPU<2^22", 1 << 22)):
+    hpu_complex.set_matmul_cpu_threshold(_threshold)
+    check(f"complex mm / bmm of HPU and CPU operands raise {_route}", _mixed_device_raises, 0)
+hpu_complex.set_matmul_cpu_threshold(1 << 22)
+
 # D2H copy_ into non-dense CPU targets (sentinel-filled) and 5-D complex->real D2H.
 def d2h_nondense_copy(view_fn, src_conj=False, dst_conj=False, real_dst=False):
     if real_dst:

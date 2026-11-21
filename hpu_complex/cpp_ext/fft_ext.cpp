@@ -130,6 +130,20 @@ at::Tensor habana_view(const at::Tensor& base, caffe2::TypeMeta dtype, c10::IntA
                         strides, storage_offset);
 }
 
+// t with contiguous strides. Habana's own contiguous() misreads a dense, permuted HPU tensor of rank 6 or more
+// that is the output of one of its ops on a permuted view (e.g. x.permute(...) * 1 or > 0; reproduced without
+// hpu_complex, Gaudi2, bridge 1.21.4: tests/probe_adv_c_rank6.py), while its elementwise ops, its D2H copy and a
+// permute view over the same storage (habana_view) read it right: such a tensor is copied through that view.
+at::Tensor dense_copy(const at::Tensor& t) {
+  if (t.is_contiguous()) {
+    return t;
+  }
+  if (t.is_hpu() && t.dim() >= 6 && t.is_non_overlapping_and_dense()) {
+    return habana_view(t, t.dtype(), t.sizes(), t.strides(), t.storage_offset()).contiguous();
+  }
+  return t.contiguous();
+}
+
 // float HPU [..., k, 2] (last stride 1) -> tagged complex64 [..., k], same storage.
 at::Tensor complex_view(const at::Tensor& pair) {
   TORCH_CHECK(pair.scalar_type() == at::kFloat && pair.size(-1) == 2 && (pair.stride(-1) == 1 || pair.numel() == 0),
@@ -436,7 +450,7 @@ at::Tensor neg_view_pu1(const at::Tensor& self) {
 // rejects strided views (BENCHMARKS.md), and a select or an expand is one.
 at::Tensor stack_pair(const at::Tensor& re, const at::Tensor& im) {
   auto parts = at::broadcast_tensors({re, im});
-  return at::stack({parts[0].contiguous(), parts[1].contiguous()}, -1);
+  return at::stack({dense_copy(parts[0]), dense_copy(parts[1])}, -1);
 }
 
 at::Tensor complex_hpu(const at::Tensor& real, const at::Tensor& imag) {
@@ -448,9 +462,9 @@ at::Tensor complex_hpu(const at::Tensor& real, const at::Tensor& imag) {
 
 // A real operand as float32 on the HPU (CPU 0-dim tensors are Python numbers).
 at::Tensor hpu_float(const at::Tensor& t, const at::Device& device) {
-  auto src = !t.is_hpu() && t.dim() >= 5 && !t.is_contiguous() ? t.contiguous() : t;
+  auto src = t.dim() >= 5 ? dense_copy(t) : t;
   auto r = src.to(device, at::kFloat);
-  return r.dim() >= 5 && !r.is_contiguous() ? r.contiguous() : r;
+  return r.dim() >= 5 ? dense_copy(r) : r;
 }
 
 // [..., 2] float32 pair of an operand: complex -> its pair (on the HPU), real -> nullopt.
@@ -580,10 +594,9 @@ at::Tensor as_pair(const at::Tensor& t, const at::Device& device) {
 at::Tensor where_pu1(const at::Tensor& cond, const at::Tensor& a, const at::Tensor& b) {
   HPU_COMPLEX_NO_AUTOCAST;
   const auto device = hpu_device_of(a, b);
-  auto cond_src = !cond.is_hpu() && cond.dim() >= 5 && !cond.is_contiguous() ? cond.contiguous() : cond;
-  auto cond_dev = cond_src.to(device);
-  if (cond_dev.dim() >= 5 && !cond_dev.is_contiguous()) {
-    cond_dev = cond_dev.contiguous();
+  auto cond_dev = (cond.dim() >= 5 ? dense_copy(cond) : cond).to(device);
+  if (cond_dev.dim() >= 5) {
+    cond_dev = dense_copy(cond_dev);
   }
   return complex_result(at::where(cond_dev.unsqueeze(-1), as_pair(a, device), as_pair(b, device)));
 }
@@ -609,6 +622,8 @@ at::Tensor matmul_pu1(const at::Tensor& a, const at::Tensor& b) {
   HPU_COMPLEX_NO_AUTOCAST;
   TORCH_CHECK(a.scalar_type() == b.scalar_type(), "expected m1 and m2 to have the same dtype, but got: ",
               a.scalar_type(), " != ", b.scalar_type());
+  TORCH_CHECK(a.device() == b.device(), "Expected all tensors to be on the same device, but found at least two "
+              "devices, ", a.device(), " and ", b.device(), "!");
   const auto device = hpu_device_of(a, b);
   const int64_t macs = a.numel() * b.size(-1);  // batch * m * k * n
   if (macs < matmul_cpu_below().load(std::memory_order_relaxed)) {
@@ -734,10 +749,7 @@ at::Tensor& copy_pu1(at::Tensor& self, const at::Tensor& src, bool non_blocking)
         dst.select(-1, 1).neg_();
       }
     } else {  // real -> complex: imaginary part 0
-      auto src_f = src;
-      if (src_f.dim() >= 5 && !src_f.is_contiguous()) {
-        src_f = src_f.contiguous();
-      }
+      auto src_f = src.dim() >= 5 ? dense_copy(src) : src;
       auto dst_re = dst.select(-1, 0);
       if (!self.is_hpu()) {
         if (src_f.is_hpu()) {
