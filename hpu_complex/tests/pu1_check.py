@@ -862,6 +862,23 @@ check("H2D broadcast-smaller CPU->HPU copies", lambda: worst(
         (lambda b: (b.diagonal(-2, -1).copy_(sc_cplx), b)[1])(torch.zeros_like(z6))),
 ), 0)
 
+sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
+from green_ops_check import add_checks  # noqa: E402
+
+add_checks(check, err, grad_err, worst)
+
+
+def _compiled_complex_scalar():
+    # fake tensors keep torch's path (the AutogradHPU kernel once broke this trace); exp/cat/norm run eagerly here
+    # exp(a * (1 + 2j)), not exp(a * 2j): |exp(2j a)| = 1 has a zero gradient, a relative error of rounding noise
+    fns = [lambda a: torch.exp(a * (1 + 2j)).abs(), lambda a: torch.cat([a * 1j, 1j - a]).real,
+           lambda a: torch.linalg.vector_norm(torch.exp(a * 2j) * a, dim=0)]
+    return worst(*[grad_err(torch.compile(f, backend="hpu_backend"), torch.randn(3, 4), relative=True, reference=f)
+                   for f in fns])
+
+
+check("compiled exp(x * (1+2j)), cat(x * 1j, 1j - x), norm fwd+bwd (rel)", _compiled_complex_scalar, 1e-5)
+
 passed = sum(results)
 print(f"PU1_CHECK {passed}/{len(results)} passed", flush=True)
 sys.exit(0 if passed == len(results) else 1)

@@ -8,8 +8,13 @@ Verifies:
 2. Real-only float32 lazy ops (fwd + bwd + mark_step) work cleanly.
 3. Device-agnostic float-pair API (hpu_complex.rfft, hpu_complex.stft) works in lazy mode.
 4. CPU complex64 ops still work while lazy mode is enabled.
-5. All complex64 / torch.fft / linalg.eig(float32) HPU paths raise clean RuntimeErrors
-   without process aborts.
+5. complex64 runs in lazy mode (lazy views of the Habana tensor behind each complex storage): factories, .to,
+   view_as_complex, torch.complex, torch.fft, eigvals, products, in-place writes through .real, against the CPU.
+6. What lazy mode still refuses raises a clean RuntimeError (no process abort): complex64 under
+   torch.inference_mode, and permuted complex64 tensors of rank 5 or more.
+7. green_ops_check.py in lazy mode: a real tensor times a Python complex scalar (x * 2j used to abort the process
+   inside Habana), complex cat / exp / neg / masked_fill_ / linalg.vector_norm, with gradients.
+8. The Habana tensors held by lazy complex storages are released (no growth over 100 steps).
 """
 import sys
 import warnings
@@ -70,38 +75,186 @@ def check_cpu_complex_ops_unaffected():
     print("lazy_check cpu_complex_ops_unaffected: OK")
 
 
-def check_lazy_complex_guards():
-    hpu = torch.device("hpu")
-    real_pair = torch.randn(4, 4, 2, device=hpu)
-    real_re = torch.randn(4, 4, device=hpu)
-    real_im = torch.randn(4, 4, device=hpu)
-    real_sig = torch.randn(8, 22, 512, device=hpu)
-    real_mat = torch.randn(4, 4, device=hpu)
-    cpu_c64 = torch.randn(4, 4, dtype=torch.complex64)
-    htcore.mark_step()
+def _err(a, b):
+    a, b = a.detach().cpu(), b.detach().cpu()
+    assert a.shape == b.shape and a.dtype == b.dtype, (a.shape, b.shape, a.dtype, b.dtype)
+    if a.is_complex():
+        a, b = torch.view_as_real(a.resolve_conj()), torch.view_as_real(b.resolve_conj())
+    return (a.double() - b.double()).abs().max().item() if a.numel() else 0.0
 
+
+def check_lazy_complex64_runs():
+    """complex64 in lazy mode: the entry points the old guard refused now compute on lazy views, against the CPU."""
+    hpu = torch.device("hpu")
+    torch.manual_seed(0)
+    pair, re, im = torch.randn(4, 4, 2), torch.randn(4, 4), torch.randn(4, 4)
+    sig, mat, c64 = torch.randn(8, 22, 512), torch.randn(4, 4), torch.randn(4, 4, dtype=torch.complex64)
     cases = [
-        ("zeros_c64", lambda: torch.zeros(4, 4, dtype=torch.complex64, device=hpu)),
-        ("ones_c64", lambda: torch.ones(4, 4, dtype=torch.complex64, device=hpu)),
-        ("to_hpu_then_cpu", lambda: cpu_c64.to(hpu).cpu()),
-        ("view_as_complex", lambda: torch.view_as_complex(real_pair)),
-        ("torch.complex", lambda: torch.complex(real_re, real_im)),
-        ("torch.fft.rfft", lambda: torch.fft.rfft(real_sig)),
-        ("torch.linalg.eig(f32)", lambda: torch.linalg.eig(real_mat)),
-        ("torch.linalg.eigvals(f32)", lambda: torch.linalg.eigvals(real_mat)),
-        ("real.to(complex64)", lambda: real_mat.to(torch.complex64)),
-        ("real.view(complex64)", lambda: real_pair.view(torch.complex64)),
-        ("torch.polar", lambda: torch.polar(real_re.abs(), real_im)),
+        ("zeros_c64", lambda d: torch.zeros(4, 4, dtype=torch.complex64, device=d), 0),
+        ("ones_c64", lambda d: torch.ones(4, 4, dtype=torch.complex64, device=d), 0),
+        ("full_c64", lambda d: torch.full((2, 3), 1 - 2j, dtype=torch.complex64, device=d), 0),
+        ("scalar_tensor_c64", lambda d: torch.scalar_tensor(1 + 2j, dtype=torch.complex64, device=d), 0),
+        ("to_hpu_then_cpu", lambda d: c64.to(d), 0),
+        ("view_as_complex", lambda d: torch.view_as_complex(pair.to(d)), 0),
+        ("torch.complex", lambda d: torch.complex(re.to(d), im.to(d)), 0),
+        ("torch.fft.rfft", lambda d: torch.fft.rfft(sig.to(d)), 2e-4),
+        ("irfft(rfft)", lambda d: torch.fft.irfft(torch.fft.rfft(sig.to(d)), n=512), 1e-5),
+        ("torch.linalg.eigvals(f32).abs", lambda d: torch.linalg.eigvals(mat.to(d)).abs().sort(-1).values, 1e-5),
+        ("real.to(complex64)", lambda d: mat.to(d).to(torch.complex64), 0),
+        ("real.view(complex64)", lambda d: pair.to(d).view(torch.complex64), 0),
+        ("torch.polar", lambda d: torch.polar(re.to(d).abs(), im.to(d)), 1e-6),
+        # entries ~1.3e5 (257 bins of |X|^2 ~ 512): scaled to compare relatively
+        ("complex @ complex.mH (card GEMM), relative", lambda d: (lambda z: z @ z.mH / 1.3e5)(torch.fft.rfft(sig.to(d))[:4]),
+         1e-6),
+        ("z.real written in place", lambda d: (lambda z: (z.real.mul_(2), z)[1])(c64.to(d).clone()), 0),
+        ("torch.no_grad() rfft().real", lambda d: _no_grad(lambda: torch.fft.rfft(sig.to(d)).real), 2e-4),
     ]
-    for name, fn in cases:
+    for name, fn, tol in cases:
+        got = fn(hpu)
+        htcore.mark_step()
+        e = _err(got, fn("cpu"))
+        assert e <= tol, (name, e)
+        print(f"lazy_check runs {name}: OK (max|err| {e:.1e})")
+
+
+def _no_grad(fn):
+    with torch.no_grad():
+        return fn()
+
+
+def check_lazy_complex_guards():
+    """What lazy mode still refuses, with a clean RuntimeError (no process abort)."""
+    hpu = torch.device("hpu")
+    sig = torch.randn(8, 512, device=hpu)
+    z5 = torch.randn(2, 3, 4, 5, 6, dtype=torch.complex64).to(hpu)
+    htcore.mark_step()
+    cases = [
+        ("complex64 under torch.inference_mode", lambda: _inference(lambda: torch.fft.rfft(sig).real.sum()),
+         "torch.no_grad()"),
+        ("permuted 5-D complex64", lambda: z5.permute(0, 2, 1, 3, 4) * 2, "rank 5 or more"),
+    ]
+    for name, fn, match in cases:
         try:
             fn()
+            htcore.mark_step()
         except RuntimeError as exc:
             msg = str(exc)
-            assert "PT_HPU_LAZY_MODE=0" in msg, (name, msg)
-            print(f"lazy_check guard {name}: OK ({msg.splitlines()[0]})")
+            assert match in msg and "PT_HPU_LAZY_MODE=0" in msg, (name, msg)
+            print(f"lazy_check guard {name}: OK ({msg.splitlines()[0][:120]})")
         else:
             raise AssertionError(f"Expected RuntimeError for {name} in lazy mode")
+
+
+def _inference(fn):
+    with torch.inference_mode():
+        return fn()
+
+
+def check_green_ops():
+    """The eager card checks of green_ops_check.py, in lazy mode (real x complex scalar, cat/exp/neg/masked_fill_/norm)."""
+    import math
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from green_ops_check import add_checks
+
+    failed = []
+
+    def check(name, fn, atol):
+        try:
+            e = fn()
+            htcore.mark_step()
+            ok = e <= atol
+        except Exception as exc:  # noqa: BLE001
+            e, ok = f"{type(exc).__name__}: {str(exc).splitlines()[0][:150]}", False
+        print(f"lazy_check green_ops {name}: {'OK' if ok else 'FAIL'} ({e})")
+        if not ok:
+            failed.append(name)
+
+    def worst(*errors):
+        return math.nan if any(math.isnan(x) for x in errors) else max(errors)
+
+    def grad_err(f, x, relative=False, reference=None):
+        xc, xh = x.clone().requires_grad_(), x.to("hpu").requires_grad_()
+        yc, yh = (reference or f)(xc), f(xh)
+        yc.backward(torch.ones_like(yc))
+        yh.backward(torch.ones_like(yh))
+        htcore.mark_step()
+        return worst(*(_err(g, r) / (r.detach().abs().max().item() if relative else 1.0)
+                       for g, r in ((yh, yc), (xh.grad, xc.grad))))
+
+    add_checks(check, _err, grad_err, worst, sync=htcore.mark_step)
+    assert not failed, failed
+
+
+def check_lazy_aliasing():
+    """A lazy complex tensor keeps its own alias of the Habana tensor; resize keeps the storage; overlap is checked."""
+    import io
+    hpu = torch.device("hpu")
+    # 1. the caller's tensor can be retargeted without retargeting z, and z keeps aliasing the storage
+    r = torch.randn(4, 2, device=hpu)
+    z = torch.view_as_complex(r)
+    ref = z.cpu().clone()
+    r.data = torch.zeros(4, 2, device=hpu)
+    htcore.mark_step()
+    assert torch.equal(z.cpu(), ref), "r.data = ... retargeted z"
+    r2 = torch.randn(4, 2, device=hpu)
+    z2 = torch.view_as_complex(r2)
+    ref2 = z2.cpu().clone()
+    r2.resize_(16)
+    htcore.mark_step()
+    assert torch.equal(z2.cpu(), ref2), "r.resize_ retargeted z"
+    # 2. writes reach the other side through Habana's views
+    r3 = torch.zeros(4, 2, device=hpu)
+    z3 = torch.view_as_complex(r3)
+    z3.add_(1j)
+    r3.add_(1)
+    htcore.mark_step()
+    assert torch.equal(z3.cpu(), torch.full((4,), 1 + 2j)) and torch.equal(r3.cpu()[:, 1], torch.full((4,), 2.0))
+    # 3. an out= resize keeps the StorageImpl: a view taken before sees the result, as in eager mode
+    out = torch.zeros(2, dtype=torch.complex64, device=hpu)
+    alias = out.view(-1)
+    torch.mul(torch.ones(6, device=hpu), 2j, out=out)
+    htcore.mark_step()
+    assert out.shape == (6,) and out.untyped_storage is not None
+    assert alias.data_ptr() == out.data_ptr(), "out= resize detached a view"
+    # 4. two view_as_complex of one tensor: torch's partial-overlap check still fires
+    r4 = torch.randn(5, 2, device=hpu)
+    a, b = torch.view_as_complex(r4), torch.view_as_complex(r4)
+    try:
+        a[1:].copy_(b[:-1])
+    except RuntimeError as exc:
+        assert "single memory location" in str(exc), str(exc)
+    else:
+        raise AssertionError("partial overlap of two view_as_complex views did not raise")
+    # 5. torch.save works; untyped_storage().cpu() raises (Habana: not in lazy flow), no crash
+    zs = torch.fft.rfft(torch.randn(8, device=hpu))
+    buf = io.BytesIO()
+    torch.save(zs, buf)
+    buf.seek(0)
+    assert _err(torch.load(buf), zs.cpu()) == 0
+    try:
+        zs.untyped_storage().cpu()
+    except RuntimeError as exc:
+        print(f"lazy_check untyped_storage().cpu() raises: {str(exc).splitlines()[0][:100]}")
+    else:
+        raise AssertionError("untyped_storage().cpu() of a lazy complex tensor did not raise")
+    print("lazy_check aliasing (r.data=, resize_, writes both ways, out= resize, overlap, save): OK")
+
+
+def check_lazy_storages_drain():
+    """Each lazy complex64 storage holds its Habana tensor; they are released with the complex tensors."""
+    x = torch.randn(4, 64, device="hpu")
+    before, peak = torch.ops.hpu_complex.lazy_storages_alive(), 0
+    for _ in range(100):
+        z = torch.fft.rfft(x) * (1 + 1j)
+        peak = max(peak, torch.ops.hpu_complex.lazy_storages_alive())
+        v = z.abs().sum()
+        del z
+        htcore.mark_step()
+    v.item()
+    after = torch.ops.hpu_complex.lazy_storages_alive()
+    assert peak > before and after == before, (before, peak, after)
+    print(f"lazy_check storages drain: OK ({before} -> {after} after 100 steps, {peak} alive at most)")
 
 
 def main():
@@ -111,7 +264,11 @@ def main():
     check_real_only_lazy_safety()
     check_float_pair_api_lazy()
     check_cpu_complex_ops_unaffected()
+    check_lazy_complex64_runs()
     check_lazy_complex_guards()
+    check_green_ops()
+    check_lazy_aliasing()
+    check_lazy_storages_drain()
     print("LAZY_CHECK_ALL_OK")
 
 

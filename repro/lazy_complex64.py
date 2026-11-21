@@ -11,9 +11,12 @@ Demonstrates three modes:
           cannot safely bridge PrivateUse1 storage views.
   --mode guarded    : With hpu_complex.enable() in PT_HPU_LAZY_MODE=1:
       Real-only float32 lazy ops and the float-pair API (hpu_complex.rfft /
-      hpu_complex.stft) pass cleanly, while complex64 / torch.fft.rfft /
-      torch.linalg.eig(float32) raise clean, actionable RuntimeErrors (zero
-      process aborts).
+      hpu_complex.stft) pass cleanly, and complex64 / torch.fft.rfft /
+      torch.linalg.eig(float32) compute right: each complex64 storage holds
+      the Habana tensor it lives in, and the kernels read it through Habana's
+      own views of that tensor (no set_, unlike (b) above). What lazy mode
+      still refuses (complex64 under torch.inference_mode) raises a clean
+      RuntimeError (zero process aborts).
   --mode workaround : In eager mode (PT_HPU_LAZY_MODE=0) with hpu_complex:
       complex64 ops, torch.fft.rfft fwd+bwd, and torch.compile(backend="hpu_backend")
       on simple complex+FFT modules pass cleanly. (Note: compiled spd_learn.models.Green
@@ -162,33 +165,36 @@ def run_guarded() -> None:
     assert torch.isfinite(sig.grad.cpu()).all()
     print("[guarded] real-only lazy fwd+bwd and hpu_complex.rfft/stft_magnitude: PASS")
 
-    # 3. All complex64 / torch.fft / linalg.eig(float32) HPU paths raise clean RuntimeErrors.
-    real_pair = torch.randn(4, 4, 2, device=hpu)
-    real_re = torch.randn(4, 4, device=hpu)
-    real_im = torch.randn(4, 4, device=hpu)
-    real_sig = torch.randn(4, 32, device=hpu)
-    real_mat = torch.randn(4, 4, device=hpu)
-    cpu_c64 = torch.randn(4, 4, dtype=torch.complex64)
-    htcore.mark_step()
-
-    guarded_ops = [
-        ("zeros_c64", lambda: torch.zeros(4, 4, dtype=torch.complex64, device=hpu)),
-        ("ones_c64", lambda: torch.ones(4, 4, dtype=torch.complex64, device=hpu)),
-        ("to_hpu_c64", lambda: cpu_c64.to(hpu)),
-        ("view_as_complex", lambda: torch.view_as_complex(real_pair)),
-        ("torch.complex", lambda: torch.complex(real_re, real_im)),
-        ("torch.fft.rfft", lambda: torch.fft.rfft(real_sig)),
-        ("torch.linalg.eig(f32)", lambda: torch.linalg.eig(real_mat)),
+    # 3. complex64 / torch.fft / linalg.eig(float32) compute in lazy mode, against the CPU.
+    torch.manual_seed(0)
+    pair, re, im = torch.randn(4, 4, 2), torch.randn(4, 4), torch.randn(4, 4)
+    sig, mat, c64 = torch.randn(4, 32), torch.randn(4, 4), torch.randn(4, 4, dtype=torch.complex64)
+    lazy_ops = [
+        ("zeros_c64", lambda d: torch.zeros(4, 4, dtype=torch.complex64, device=d)),
+        ("ones_c64", lambda d: torch.ones(4, 4, dtype=torch.complex64, device=d)),
+        ("to_hpu_c64", lambda d: c64.to(d)),
+        ("view_as_complex", lambda d: torch.view_as_complex(pair.to(d))),
+        ("torch.complex", lambda d: torch.complex(re.to(d), im.to(d))),
+        ("torch.fft.rfft", lambda d: torch.fft.rfft(sig.to(d))),
+        ("torch.linalg.eigvals(f32).abs", lambda d: torch.linalg.eigvals(mat.to(d)).abs().sort(-1).values),
+        ("real * 2j (aborted the process before)", lambda d: re.to(d) * 2j),
     ]
-    for name, fn in guarded_ops:
-        try:
-            fn()
-        except RuntimeError as exc:
-            msg = str(exc)
-            assert "PT_HPU_LAZY_MODE=0" in msg, (name, msg)
-            print(f"[guarded] {name} raised clean RuntimeError: {msg.splitlines()[0]}")
-        else:
-            raise AssertionError(f"Expected RuntimeError for {name} in lazy mode")
+    for name, fn in lazy_ops:
+        got = fn(hpu)
+        htcore.mark_step()
+        ref = fn("cpu")
+        diff = float((torch.view_as_real(got.cpu()) - torch.view_as_real(ref)).abs().max() if ref.is_complex()
+                     else (got.cpu() - ref).abs().max())
+        assert diff < 1e-4, (name, diff)
+        print(f"[guarded] {name} computes in lazy mode: max_diff={diff:.1e}")
+    try:
+        with torch.inference_mode():
+            torch.fft.rfft(sig.to(hpu))
+    except RuntimeError as exc:
+        assert "PT_HPU_LAZY_MODE=0" in str(exc), str(exc)
+        print(f"[guarded] complex64 under inference_mode raised clean RuntimeError: {str(exc).splitlines()[0]}")
+    else:
+        raise AssertionError("Expected RuntimeError for complex64 under inference_mode in lazy mode")
 
 
 def run_workaround() -> None:
