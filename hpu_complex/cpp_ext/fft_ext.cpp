@@ -1001,13 +1001,14 @@ at::Tensor smith_div(const at::Tensor& ar, const at::Tensor& ai, const at::Tenso
 
 // (ar + i ai) / (c + 0i): ar / c + i ai / c, plus torch's cross terms ai * (0 / c) and -ar * (0 / c), which are zeros
 // for a finite part and NaN for an infinite one: (inf + 1i) / 2 is inf + nan i in torch (c10::complex's Smith
-// division), where the per-part quotient gave inf + 0.5i. Three ops more than the per-part quotient: the exact form
+// division), where the per-part quotient gave inf + 0.5i. Two ops more than the per-part quotient: the exact form
 // (Smith with a zero imaginary part, 13 ops) cost lazy Green 18 ms a step (Gaudi2, bridge 1.21.4; Green divides its
 // wavelets by their norm, forward and backward). Left as before: zero signs where a quotient part is exactly 0, a
 // zero c next to an infinite other part (NaN here, torch inf), and the last ulp (torch multiplies by 1 / c).
+// The cross terms as (ai, ar) * 0: no constant tensor (its host-to-device copy synced every eager call: +30 ms an
+// eager Green step), at the cost of im + ar * 0 for torch's im - ar * 0, a zero sign (left as before, above).
 at::Tensor real_div(const at::Tensor& pair, const at::Tensor& c) {
-  const auto cross = at::tensor({0.0f, -0.0f}).to(pair.device());  // re + ai * 0, im - ar * 0
-  return pair / c.unsqueeze(-1) + pair.flip(-1) * cross;
+  return pair / c.unsqueeze(-1) + pair.flip(-1) * 0.0;
 }
 
 at::Tensor div_pu1(const at::Tensor& a, const at::Tensor& b) {
