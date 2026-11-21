@@ -64,6 +64,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 
 namespace {
 
@@ -83,6 +84,12 @@ DispatchKeySet hpu_float_keys() {
     return ks | c10::getAutogradRelatedKeySetFromBackend(ks.highestBackendKey());
   }();
   return keys;
+}
+
+// keys for a tensor over base's storage, as torch keys a view or a result: an inference tensor (no autograd keys) when
+// base is one (a view of it, or a fresh allocation under torch.inference_mode, which is one), else keys as given.
+DispatchKeySet keys_over(DispatchKeySet keys, const at::Tensor& base) {
+  return base.is_inference() ? keys - c10::autograd_dispatch_keyset_with_ADInplaceOrView : keys;
 }
 
 bool tagged(const at::Tensor& t) {
@@ -105,17 +112,6 @@ bool is_lazy_mode() {
   }
   const char* env = std::getenv("PT_HPU_LAZY_MODE");
   return env != nullptr && std::string_view(env) != "0";
-}
-
-// The lazy-mode guard. complex64 runs in lazy mode on lazy_view (the storage's Habana tensor), with one exception
-// that it raises for, cleanly instead of deep inside autograd: torch.inference_mode. Habana's views of tensors made
-// under it are inference tensors, and autograd's view tracking (view_as_real, .real of a complex tensor) cannot set
-// their version counter ("Cannot set version_counter for inference tensor", measured on Gaudi2, bridge 1.21.4).
-// torch.no_grad() works. lazy_view itself raises for a complex storage without a Habana tensor behind it.
-void check_lazy_inference(const char* op) {
-  TORCH_CHECK(!c10::InferenceMode::is_enabled(), "hpu_complex: ", op, " under torch.inference_mode is not supported "
-              "in Habana lazy mode (PT_HPU_LAZY_MODE=1): Habana's views of its tensors would be inference tensors, "
-              "which complex views cannot track. Use torch.no_grad() instead, or eager mode (PT_HPU_LAZY_MODE=0).");
 }
 
 // ---- lazy mode: the Habana tensor behind a complex storage -------------------------------
@@ -161,7 +157,6 @@ at::Tensor lazy_base(const at::Tensor& t) {
 // The lazy-mode habana_view: a view of base's storage made by Habana's own ops on the storage's Habana tensor.
 at::Tensor lazy_view(const at::Tensor& base, caffe2::TypeMeta dtype, c10::IntArrayRef sizes, c10::IntArrayRef strides,
                      int64_t storage_offset) {
-  check_lazy_inference("a complex64 HPU tensor");
   // A plain Habana tensor (dense_copy, complex_result of a float result) is its own owner.
   auto owner = tagged(base) ? lazy_base(base) : base;
   TORCH_CHECK(owner.defined(), "hpu_complex: in Habana lazy mode (PT_HPU_LAZY_MODE=1) this complex64 HPU tensor has no "
@@ -192,9 +187,10 @@ at::Tensor view_of(const at::Tensor& base, DispatchKeySet keys, caffe2::TypeMeta
 at::Tensor complex_of(const at::Tensor& base, c10::IntArrayRef sizes, c10::IntArrayRef strides, int64_t storage_offset) {
   const auto dtype = caffe2::TypeMeta::Make<c10::complex<float>>();
   if (!is_lazy_mode() || !base.is_hpu() || tagged(base)) {
-    return view_of(base, complex_keys(), dtype, sizes, strides, storage_offset);
+    return view_of(base, keys_over(complex_keys(), base), dtype, sizes, strides, storage_offset);
   }
-  auto result = at::detail::make_tensor<at::TensorImpl>(c10::TensorImpl::VIEW, lazy_storage(base), complex_keys(), dtype);
+  auto result = at::detail::make_tensor<at::TensorImpl>(c10::TensorImpl::VIEW, lazy_storage(base),
+                                                        keys_over(complex_keys(), base), dtype);
   auto* impl = result.unsafeGetTensorImpl();
   impl->set_sizes_and_strides(sizes, strides);
   impl->set_storage_offset(storage_offset);
@@ -211,7 +207,7 @@ at::Tensor habana_view(const at::Tensor& base, caffe2::TypeMeta dtype, c10::IntA
                        int64_t storage_offset) {
   // Lazy mode: the same layouts, built from the storage's Habana tensor (lazy_view); view_of only describes them.
   const bool lazy = is_lazy_mode() && base.is_hpu();
-  auto view = view_of(base, hpu_float_keys(), dtype, sizes, strides, storage_offset);
+  auto view = view_of(base, keys_over(hpu_float_keys(), base), dtype, sizes, strides, storage_offset);
   bool expanded = false;
   for (size_t i = 0; i < sizes.size(); ++i) {
     expanded |= sizes[i] > 1 && strides[i] == 0;
@@ -240,12 +236,12 @@ at::Tensor habana_view(const at::Tensor& base, caffe2::TypeMeta dtype, c10::IntA
       block_strides[k] = block_strides[k + 1] * block[k + 1];
     }
     if (storage_offset == 0 && !lazy) {
-      return view_of(base, hpu_float_keys(), dtype, block, block_strides, 0).permute(dims);
+      return view_of(base, keys_over(hpu_float_keys(), base), dtype, block, block_strides, 0).permute(dims);
     }
     const int64_t view_numel = view.numel();
     const int64_t off = view_numel == 0 ? std::min(storage_offset, base_numel) : storage_offset;
     return (lazy ? lazy_view(base, dtype, {base_numel}, {1}, 0)
-                 : view_of(base, hpu_float_keys(), dtype, {base_numel}, {1}, 0))
+                 : view_of(base, keys_over(hpu_float_keys(), base), dtype, {base_numel}, {1}, 0))
         .narrow(0, off, view_numel)
         .view(block)
         .permute(dims);
@@ -254,8 +250,9 @@ at::Tensor habana_view(const at::Tensor& base, caffe2::TypeMeta dtype, c10::IntA
     return lazy_view(base, dtype, sizes, strides, storage_offset);
   }
   const int64_t inner = base_numel % 2 == 0 ? 2 : 1;
-  return at::as_strided(view_of(base, hpu_float_keys(), dtype, {base_numel / inner, inner}, {inner, 1}, 0), sizes,
-                        strides, storage_offset);
+  return at::as_strided(
+      view_of(base, keys_over(hpu_float_keys(), base), dtype, {base_numel / inner, inner}, {inner, 1}, 0), sizes,
+      strides, storage_offset);
 }
 
 // t with contiguous strides. Habana's own contiguous() misreads a dense, permuted HPU tensor of rank 6 or more
@@ -558,12 +555,6 @@ bool complex128_on_hpu(std::optional<at::ScalarType> dtype, DispatchKeySet ks) {
   return dtype.has_value() && *dtype == at::kComplexDouble && ks.highestPriorityTypeId() == DispatchKey::HPU;
 }
 
-void check_not_lazy(const at::Device& device, const char* op) {
-  if (device.is_hpu() && is_lazy_mode()) {
-    check_lazy_inference(op);
-  }
-}
-
 at::Tensor empty_backend_select(c10::SymIntArrayRef size, std::optional<at::ScalarType> dtype,
                                 std::optional<at::Layout> layout, std::optional<at::Device> device,
                                 std::optional<bool> pin_memory, std::optional<at::MemoryFormat> memory_format) {
@@ -582,7 +573,6 @@ at::Tensor empty_backend_select(c10::SymIntArrayRef size, std::optional<at::Scal
     if (*dtype == at::kComplexDouble) {
       return make_host_empty(sizes, strides, caffe2::TypeMeta::Make<c10::complex<double>>(), dev);
     }
-    check_not_lazy(dev, "complex64 tensor creation on HPU");
     return make_complex_empty(sizes, strides, dev);
   }
   return at::_ops::empty_memory_format::redispatch(ks, size, dtype, layout, device, pin_memory, memory_format);
@@ -594,7 +584,6 @@ at::Tensor empty_strided_backend_select(c10::SymIntArrayRef size, c10::SymIntArr
   auto ks = factory_keys(dtype, layout, device);
   if (complex_on_hpu(dtype, ks)) {
     const auto dev = device ? *device : at::Device(at::kHPU);
-    check_not_lazy(dev, "complex64 tensor creation on HPU");
     return make_complex_empty(C10_AS_INTARRAYREF_SLOW(size), C10_AS_INTARRAYREF_SLOW(stride), dev);
   }
   if (complex128_on_hpu(dtype, ks)) {
@@ -614,7 +603,6 @@ at::Tensor scalar_tensor_backend_select(const at::Scalar& s, std::optional<at::S
     return at::scalar_tensor(s, at::TensorOptions().dtype(at::kComplexDouble)).to(*device);
   }
   if (complex_on_hpu(dtype, ks)) {  // lazy mode: Habana's own scalar_tensor kernel would get the complex dtype
-    check_not_lazy(*device, "complex64 tensor creation on HPU");
     auto t = make_complex_empty({}, {}, *device);
     auto pair = pair_view(t);
     const auto c = s.toComplexDouble();
@@ -727,7 +715,6 @@ void check_last_dim(const at::Tensor& self, c10::IntArrayRef dim) {
 // ---- FFT ------------------------------------------------------------------------------
 
 at::Tensor fft_r2c_hpu(const at::Tensor& self, c10::IntArrayRef dim, int64_t normalization, bool onesided) {
-  check_not_lazy(self.device(), "torch.fft.rfft");
   HPU_COMPLEX_NO_AUTOCAST;
   check_last_dim(self, dim);
   const int64_t n = self.size(-1);
@@ -773,12 +760,11 @@ at::Tensor fft_c2r_pu1(const at::Tensor& self, c10::IntArrayRef dim, int64_t nor
 at::Tensor view_as_complex_hpu(const at::Tensor& self) {
   if (self.scalar_type() == at::kDouble) {
     // Habana's float64 storage holds float32 values in its own layout: no complex128 view of it exists. The copy is
-    // host memory, so lazy mode is fine (check_not_lazy guards complex64 views only).
+    // host memory.
     TORCH_WARN_ONCE("hpu_complex: view_as_complex of a float64 HPU tensor returns a complex128 copy, not a view: "
                     "writes to it do not reach the float64 tensor");
     return from_cpu(at::view_as_complex(self.cpu()), self.device());
   }
-  check_not_lazy(self.device(), "torch.view_as_complex");
   auto v = at::native::view_as_complex(self);
   TORCH_CHECK(self.scalar_type() == at::kFloat, "hpu_complex: view_as_complex on HPU supports float32 (complex64) "
               "only, got ", self.scalar_type());
@@ -792,7 +778,6 @@ at::Tensor view_dtype_hpu(const at::Tensor& self, at::ScalarType dtype) {
   if (!c10::isComplexType(dtype) || self.is_complex()) {
     return at::native::view_dtype(self, dtype);
   }
-  check_not_lazy(self.device(), "Tensor.view(complex dtype)");
   TORCH_CHECK(dtype == at::kComplexFloat, "hpu_complex: complex64 only on HPU, got ", dtype);
   auto v = at::native::view_dtype(self, dtype);
   return complex_of(self, v.sizes(), v.strides(), v.storage_offset());
@@ -867,7 +852,6 @@ at::Tensor complex_hpu(const at::Tensor& real, const at::Tensor& imag) {
   if (real.scalar_type() == at::kDouble || imag.scalar_type() == at::kDouble) {  // complex128: torch's checks
     return from_cpu(at::complex(cpu_operand(real), cpu_operand(imag)), device_of(real, imag));
   }
-  check_not_lazy(real.is_hpu() ? real.device() : imag.device(), "torch.complex");
   return complex_view(stack_pair(real.to(at::kFloat), imag.to(at::kFloat)));
 }
 
@@ -1294,8 +1278,8 @@ at::Tensor& add__pu1(at::Tensor& self, const at::Tensor& other, const at::Scalar
 // result_type: complex64 for float32/bfloat16/int/bool, complex128 for float64), as a differentiable .to(), and the op
 // runs on the complex kernels with torch's own autograd formulas. In-place and out= forms with a real self/out raise
 // TensorIterator's message. Every other call goes on to torch's autograd kernel unchanged: through AutogradOther,
-// whose table entry is the same VariableType kernel (an AutogradHPU redispatch would come back here). Not covered: a
-// call that skips the autograd keys (torch.inference_mode, kernels below autograd) still reaches Habana.
+// whose table entry is the same VariableType kernel (an AutogradHPU redispatch would come back here). A call that skips
+// the autograd keys (torch.inference_mode, an inference tensor, kernels below autograd) is taken at BackendSelect.
 
 bool complex_cpu_scalar(const c10::IValue& v) {
   if (v.isTensor()) {
@@ -1402,7 +1386,8 @@ void check_like_torch(const c10::FunctionSchema& schema, c10::ArrayRef<c10::IVal
   }
 }
 
-void complex_scalar_autograd_hpu(const c10::OperatorHandle& op, DispatchKeySet ks, torch::jit::Stack* stack) {
+// below: the keys to hand every other call to (torch's autograd kernel at AutogradHPU, the backend at BackendSelect).
+void complex_scalar_promote(const c10::OperatorHandle& op, DispatchKeySet below, torch::jit::Stack* stack) {
   const auto& schema = op.schema();
   const auto n = schema.arguments().size();
   auto args = torch::jit::last(*stack, n);
@@ -1434,9 +1419,7 @@ void complex_scalar_autograd_hpu(const c10::OperatorHandle& op, DispatchKeySet k
                       : real_at == 0              ? promoted_type(real, args[1])
                                                   : at::result_type(args[0].toTensor(), real);
   if (real_at < 0 || !c10::isComplexType(result)) {
-    op.redispatchBoxed((ks & DispatchKeySet(DispatchKeySet::FULL_AFTER, DispatchKey::AutogradFunctionality)) |
-                           DispatchKeySet(DispatchKey::AutogradOther),
-                       stack);
+    op.redispatchBoxed(below, stack);
     return;
   }
   // In-place (self written) and out= forms: a complex result cannot be cast to a real self or out.
@@ -1462,6 +1445,75 @@ void complex_scalar_autograd_hpu(const c10::OperatorHandle& op, DispatchKeySet k
   (*stack)[stack->size() - n + real_at] = real.to(result);
   op.callBoxed(stack);
 }
+
+void complex_scalar_autograd_hpu(const c10::OperatorHandle& op, DispatchKeySet ks, torch::jit::Stack* stack) {
+  complex_scalar_promote(op,
+                         (ks & DispatchKeySet(DispatchKeySet::FULL_AFTER, DispatchKey::AutogradFunctionality)) |
+                             DispatchKeySet(DispatchKey::AutogradOther),
+                         stack);
+}
+
+// The same calls when they skip the autograd keys: under torch.inference_mode (TLS excludes them), with an inference
+// tensor (it has none), or from a kernel below autograd. BackendSelect is in every call's key set (TLS includes it by
+// default, inference mode keeps it), below autograd and above the backend (Habana's HPU kernels); with no kernel of
+// its own an op falls through it. The promoted call dispatches again with the caller's TLS: no autograd under
+// inference mode (inference-tensor results, as torch makes them), none below autograd either. A call that the
+// AutogradHPU kernel above already promoted arrives here with a complex operand and passes through.
+DispatchKeySet after_backend_select(DispatchKeySet ks) {
+  return ks & DispatchKeySet(DispatchKeySet::FULL_AFTER, DispatchKey::BackendSelect);
+}
+
+void complex_scalar_backend_select(const c10::OperatorHandle& op, DispatchKeySet ks, torch::jit::Stack* stack) {
+  complex_scalar_promote(op, after_backend_select(ks), stack);
+}
+
+// BackendSelect sees every call of these ops below autograd, on any device (CPU code too). Measured on the CPU: the
+// boxed kernel alone cost 0.6-1.2 us a call (x * y: 1.2 -> 1.8 us). The unboxed kernel below hands on at once a call
+// without both an HPU tensor and a complex scalar (a Python complex, a complex 0-d CPU tensor: what
+// complex_scalar_promote looks for), and boxes the rest (complex_scalar_backend_select).
+template <class T>
+bool on_hpu(const T& v) {
+  if constexpr (std::is_same_v<std::decay_t<T>, at::Tensor>) {
+    return v.defined() && v.is_hpu();
+  } else {
+    return false;
+  }
+}
+
+template <class T>
+bool complex_scalar_arg(const T& v) {
+  if constexpr (std::is_same_v<std::decay_t<T>, at::Tensor>) {
+    return v.defined() && v.is_cpu() && v.dim() == 0 && v.is_complex();
+  } else if constexpr (std::is_same_v<std::decay_t<T>, at::Scalar>) {
+    return v.isComplex();
+  } else {
+    return false;
+  }
+}
+
+// Written: the index of the argument an in-place (0, self) or out= (the last) form returns; -1 for a fresh result.
+template <class Op, int Written, class Schema = typename Op::schema>
+struct BackendSelectFast;
+
+template <class Op, int Written, class Ret, class... Args>
+struct BackendSelectFast<Op, Written, Ret(Args...)> {
+  static Ret call(DispatchKeySet ks, Args... args) {
+    if (!(on_hpu(args) || ...) || !(complex_scalar_arg(args) || ...)) {
+      return Op::redispatch(after_backend_select(ks), args...);
+    }
+    static const c10::OperatorHandle op =
+        c10::Dispatcher::singleton().findSchemaOrThrow(Op::name, Op::overload_name);
+    torch::jit::Stack stack;
+    stack.reserve(sizeof...(Args));
+    (torch::jit::push(stack, args), ...);
+    complex_scalar_promote(op, after_backend_select(ks), &stack);
+    if constexpr (Written >= 0) {
+      return std::get<Written>(std::forward_as_tuple(args...));
+    } else {
+      return std::move(stack.back()).template to<Ret>();
+    }
+  }
+};
 
 // ---- copies and fills (PrivateUse1) ------------------------------------------------------
 
@@ -2281,21 +2333,58 @@ TORCH_LIBRARY_IMPL(aten, AutogradHPU, m) {
   m.impl("_fft_r2c", &fft_r2c_autograd);
 }
 
+// A real HPU tensor and a complex scalar: promoted before Habana's float kernels see it (lazy mode aborts there).
+constexpr const char* kComplexScalarOps[] = {
+    "mul.Tensor", "mul.Scalar", "mul_.Tensor", "mul_.Scalar", "mul.out",
+    "add.Tensor", "add.Scalar", "add_.Tensor", "add_.Scalar", "add.out",
+    "sub.Tensor", "sub.Scalar", "sub_.Tensor", "sub_.Scalar", "sub.out",
+    "rsub.Tensor", "rsub.Scalar", "mul.Scalar_out", "add.Scalar_out", "sub.Scalar_out",
+    "div.Scalar_out", "div.Scalar_mode_out", "rsub.Tensor_out", "rsub.Scalar_out",
+    "div.Tensor", "div.Scalar", "div_.Tensor", "div_.Scalar", "div.out",
+    "div.Tensor_mode", "div.Scalar_mode", "div_.Tensor_mode", "div_.Scalar_mode",
+    "div.out_mode"};
+
 TORCH_LIBRARY_IMPL(aten, AutogradHPU, m) {
-  // A real HPU tensor and a complex scalar: promoted before Habana's float kernels see it (lazy mode aborts there).
-  for (const char* name : {"mul.Tensor", "mul.Scalar", "mul_.Tensor", "mul_.Scalar", "mul.out",
-                           "add.Tensor", "add.Scalar", "add_.Tensor", "add_.Scalar", "add.out",
-                           "sub.Tensor", "sub.Scalar", "sub_.Tensor", "sub_.Scalar", "sub.out",
-                           "rsub.Tensor", "rsub.Scalar", "mul.Scalar_out", "add.Scalar_out", "sub.Scalar_out",
-                           "div.Scalar_out", "div.Scalar_mode_out", "rsub.Tensor_out", "rsub.Scalar_out",
-                           "div.Tensor", "div.Scalar", "div_.Tensor", "div_.Scalar", "div.out",
-                           "div.Tensor_mode", "div.Scalar_mode", "div_.Tensor_mode", "div_.Scalar_mode",
-                           "div.out_mode"}) {
+  for (const char* name : kComplexScalarOps) {
     m.impl(name, torch::CppFunction::makeFromBoxedFunction<&complex_scalar_autograd_hpu>());
   }
 }
 
 TORCH_LIBRARY_IMPL(aten, BackendSelect, m) {
+  // the calls that skip AutogradHPU (torch.inference_mode, inference tensors); the hot overloads unboxed first
+#define HPU_COMPLEX_BS(op, written, name) m.impl(name, TORCH_FN((BackendSelectFast<at::_ops::op, written>::call)))
+  HPU_COMPLEX_BS(mul_Tensor, -1, "mul.Tensor");
+  HPU_COMPLEX_BS(mul_Scalar, -1, "mul.Scalar");
+  HPU_COMPLEX_BS(mul__Tensor, 0, "mul_.Tensor");
+  HPU_COMPLEX_BS(mul__Scalar, 0, "mul_.Scalar");
+  HPU_COMPLEX_BS(mul_out, 2, "mul.out");
+  HPU_COMPLEX_BS(add_Tensor, -1, "add.Tensor");
+  HPU_COMPLEX_BS(add_Scalar, -1, "add.Scalar");
+  HPU_COMPLEX_BS(add__Tensor, 0, "add_.Tensor");
+  HPU_COMPLEX_BS(add__Scalar, 0, "add_.Scalar");
+  HPU_COMPLEX_BS(add_out, 3, "add.out");
+  HPU_COMPLEX_BS(sub_Tensor, -1, "sub.Tensor");
+  HPU_COMPLEX_BS(sub_Scalar, -1, "sub.Scalar");
+  HPU_COMPLEX_BS(sub__Tensor, 0, "sub_.Tensor");
+  HPU_COMPLEX_BS(sub__Scalar, 0, "sub_.Scalar");
+  HPU_COMPLEX_BS(sub_out, 3, "sub.out");
+  HPU_COMPLEX_BS(div_Tensor, -1, "div.Tensor");
+  HPU_COMPLEX_BS(div_Scalar, -1, "div.Scalar");
+  HPU_COMPLEX_BS(div__Tensor, 0, "div_.Tensor");
+  HPU_COMPLEX_BS(div__Scalar, 0, "div_.Scalar");
+  HPU_COMPLEX_BS(div_out, 2, "div.out");
+  HPU_COMPLEX_BS(rsub_Tensor, -1, "rsub.Tensor");
+  HPU_COMPLEX_BS(rsub_Scalar, -1, "rsub.Scalar");
+  HPU_COMPLEX_BS(div_Tensor_mode, -1, "div.Tensor_mode");
+  HPU_COMPLEX_BS(div_Scalar_mode, -1, "div.Scalar_mode");
+  HPU_COMPLEX_BS(div__Tensor_mode, 0, "div_.Tensor_mode");
+  HPU_COMPLEX_BS(div__Scalar_mode, 0, "div_.Scalar_mode");
+#undef HPU_COMPLEX_BS
+  // the rarer out= forms: boxed
+  for (const char* name : {"mul.Scalar_out", "add.Scalar_out", "sub.Scalar_out", "div.Scalar_out",
+                           "div.Scalar_mode_out", "rsub.Tensor_out", "rsub.Scalar_out", "div.out_mode"}) {
+    m.impl(name, torch::CppFunction::makeFromBoxedFunction<&complex_scalar_backend_select>());
+  }
   m.impl("empty.memory_format", &empty_backend_select);
   m.impl("empty_strided", &empty_strided_backend_select);
   m.impl("scalar_tensor", &scalar_tensor_backend_select);

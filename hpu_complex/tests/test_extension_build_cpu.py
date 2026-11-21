@@ -22,7 +22,7 @@ ops = ["aten::view.dtype", "aten::view_as_complex", "aten::view_as_real", "aten:
        "aten::mul.Tensor", "aten::add_.Scalar", "aten::rsub.Tensor", "aten::div.out_mode",
        "aten::cat", "aten::cat.out", "aten::exp", "aten::exp.out", "aten::neg", "aten::neg.out",
        "aten::masked_fill_.Scalar", "aten::masked_fill_.Tensor", "aten::linalg_vector_norm",
-       "aten::linalg_vector_norm.out"]
+       "aten::linalg_vector_norm.out", "aten::mul.Scalar_out", "aten::div.Tensor_mode", "aten::add.out"]
 table = {op: [line.split(":")[0] for line in torch._C._dispatch_dump(op).splitlines() if "fft_ext" in line]
          for op in ops}
 # The complex-scalar kernels at AutogradHPU hand every other call to AutogradOther: its entry must be torch's
@@ -60,6 +60,14 @@ def test_complex_scalar_kernels_sit_at_autograd_hpu(registered):
     """x_hpu * 2j and friends are promoted at AutogradHPU, before Habana's float kernels (lazy mode aborts there)."""
     for op in ("aten::mul.Tensor", "aten::add_.Scalar", "aten::rsub.Tensor", "aten::div.out_mode"):
         assert "AutogradHPU" in registered[op], op
+
+
+def test_complex_scalar_kernels_also_sit_at_backend_select(registered):
+    """The same calls when they skip the autograd keys (torch.inference_mode, inference tensors) are taken at
+    BackendSelect, which every call's key set holds, below autograd and above Habana's HPU kernels."""
+    for op in ("aten::mul.Tensor", "aten::add_.Scalar", "aten::rsub.Tensor", "aten::div.out_mode",
+               "aten::mul.Scalar_out", "aten::div.Tensor_mode", "aten::add.out"):
+        assert "BackendSelect" in registered[op], op
 
 
 def test_other_calls_reach_torch_autograd_kernel_through_autograd_other(registered):

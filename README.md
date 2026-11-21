@@ -115,6 +115,14 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   `as_strided`, and torch's meta of `linalg_eig` gives contiguous
   eigenvectors where the kernel returns column-major ones. Without these two
   patches the compiled `eig`/`eigvals`/`qr` gradients were wrong with no error.
+  Three more, after AOT autograd (spd_learn's `Green`, compiled in eager mode, trained with wavelet gradients
+  up to 9x off before them, with no error): a graph with nodes that run eagerly here is partitioned by Habana's
+  Python partitioner, not its C++ one (with the same partitions, the C++ one's fused graph took three eager 0-d
+  gradients in another order and returned one doubled; `repro/compiled_green_bisect.py`); the backward of
+  `x * 2j` (`mul(grad, _conj(2j))`, a complex128 constant once traced) gets the conjugated Python scalar back,
+  so it stays complex64 on the card as in eager mode instead of going through complex128 host memory (and a
+  backward graph that still holds complex128 runs eagerly as a whole); and Habana's pass that drops the views
+  around a `bmm` leaves complex `bmm` nodes alone (they run on this 3-D kernel).
 - `complex128` (e.g. `torch.linalg.eig`/`eigvals` of a float64 matrix):
   Gaudi2 holds float64 at float32 precision (`1 + 1e-12` copied to the
   card and back is `1`), so a complex128 in Habana storage could not keep
@@ -155,6 +163,7 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
 | float32 `linalg.eig`/`eigvals` (complex output) forward + backward, incl. `.mT` and sliced inputs (relative) | ≤ 2.8e-06 |
 | spd_learn `Green` train step (22 channels, batch 32): gradients vs a CPU float64 run, next to the CPU's own float32 error (the card is about 7x float32's error, worst `spd_layers.0.shrinkage_logit`) | 1.1e-03 / 1.5e-04 |
 | spd_learn `Green` train step in lazy mode (`PT_HPU_LAZY_MODE=1`), same comparison; 53-80 ms/step, no hpu_complex CPU op | 1.2e-03 / 1.5e-04 |
+| spd_learn `Green` under `torch.compile(backend="hpu_backend")`, eager mode: loss and gradients vs the same model run eagerly on the card (`repro/compiled_green.py`; 9.4 on main) | 1.0e-04 |
 | real HPU tensor and a Python complex scalar (`*`, `+`, `-`, `/`, rsub, alpha, 0-d, strided; bf16/int/bool → complex64, float64 → complex128), eager and lazy (relative); in-place / `out=` into a real tensor raise as torch | ≤ 7.4e-08 |
 | complex `exp` (C99 edges: `exp(inf + 0j) = inf + 0j`), `neg`, `masked_fill_`, `cat` (real operands, conj, legacy empties), `linalg.vector_norm` (ord, dim, keepdim), with gradients, eager and lazy | ≤ 4.8e-07 |
 
@@ -231,12 +240,14 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   lazy storage gives wrong values: `repro/lazy_complex64.py`), so a complex64 tensor made in lazy mode gets a storage
   that holds the Habana float tensor it lives in, and the kernels compute on Habana's own `as_strided` views of that
   tensor; it is released with the last complex tensor over it. spd_learn's `Green` trains in lazy mode (below).
-  The guard now refuses, with a clear `RuntimeError` instead of a failure deep in Habana: complex64 under
-  `torch.inference_mode` (Habana's views would be inference tensors, which autograd's view tracking of
-  `view_as_real`/`.real` cannot take; `torch.no_grad()` works), and permuted complex64 tensors of rank 5 or more at
-  storage offset 0 (Habana's lazy graphs read their permute block wrong: errors up to 12; the same layouts at an
-  offset read right). Not caught: a real HPU tensor times a complex scalar under `torch.inference_mode` skips the
-  autograd keys where it is intercepted, so it still reaches Habana and aborts in lazy mode (use `torch.no_grad()`).
+  complex64 runs under `torch.inference_mode` too, eager and lazy: as torch makes them, complex64 tensors made
+  there (and their views) are inference tensors, like the Habana tensors they live in, so autograd never tracks a
+  view of an inference tensor (what made lazy mode refuse them before). A real HPU tensor times a complex scalar
+  (`x * 2j`) under `torch.inference_mode` skips the autograd keys, so it is also taken at BackendSelect, below
+  autograd and above Habana's kernels (`hpu_complex/tests/inference_check.py`, one process per case). The guard
+  still refuses, with a clear `RuntimeError` instead of a failure deep in Habana, permuted complex64 tensors of
+  rank 5 or more at storage offset 0 (Habana's lazy graphs read their permute block wrong: errors up to 12; the same
+  layouts at an offset read right).
   The complex tensor holds a detached alias of the Habana tensor (`r.data = ...`, `r.resize_()` on the tensor given
   to `view_as_complex` do not retarget it; writes through either side reach the other); an `out=` resize keeps the
   storage, so views taken before see the result, as in eager mode. `z.untyped_storage().cpu()` raises Habana's
@@ -327,6 +338,7 @@ python hpu_complex/tests/review4_check.py        # Gaudi: compiled float views o
 python hpu_complex/tests/r2c_grad_check.py       # Gaudi: rfft gradients vs CPU float64
 python hpu_complex/tests/run_on_hpu.py           # Gaudi: test_on_hpu.py without pytest
 python hpu_complex/tests/lazy_check.py           # Gaudi (PT_HPU_LAZY_MODE=1): complex64 in lazy mode, its guards, green_ops_check.py
+python hpu_complex/tests/inference_check.py      # Gaudi (eager and lazy): x * 2j and complex64 under inference_mode
                                                  #  (pu1_check.py runs green_ops_check.py in eager mode)
 python repro/lazy_complex64.py --mode all        # Gaudi: Issue #3 reproducer (habana-bug, guarded, workaround)
 python hpu_complex/tests/float_tax.py [--ext]    # Gaudi: float-only loop with/without the extension
