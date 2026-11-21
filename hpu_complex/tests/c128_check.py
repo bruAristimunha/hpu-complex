@@ -63,17 +63,16 @@ def err(got, ref):
         got, ref = torch.view_as_real(got.resolve_conj()), torch.view_as_real(ref.resolve_conj())
     if got.numel() == 0:
         return 0.0
+    if not got.is_floating_point():  # bit patterns, masks, indices: exact (float64 would merge adjacent int64 values)
+        return float((got != ref).sum().item())
     return (got.double() - ref.double()).abs().max().item()
 
 
 def check(name, fn, atol=ATOL, c64=False):
     """fn returns (outputs on HPU, references on the CPU): tensors or tuples of them.
 
-    c64: the check also needs complex64 on the card, which lazy mode does not support yet (hpu-complex #3): skipped there.
+    c64: the check also needs complex64 on the card (lazy mode runs it since PR #10; no longer skipped there).
     """
-    if c64 and LAZY:
-        print(f"{name:44s} SKIP (complex64 in lazy mode: hpu-complex #3)", flush=True)
-        return
     before = _fallback_count()
     try:
         with warnings.catch_warnings(record=True) as caught:

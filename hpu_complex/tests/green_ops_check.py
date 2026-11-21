@@ -12,12 +12,16 @@ hpu = torch.device("hpu")
 
 
 def _no_cpu_fallback(fn):
+    """fn's ops all ran on the card: no hpu_complex CPU-fallback call (counted per call: the warning is once per op and
+    process, so a later fallback of an op that warned before would pass unseen) and no such warning."""
     def wrapped():
+        before = torch.ops.hpu_complex.cpu_fallback_calls()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             out = fn()
         ran = [str(w.message)[:90] for w in caught if "runs on the CPU" in str(w.message)]
-        assert not ran, ran
+        calls = torch.ops.hpu_complex.cpu_fallback_calls() - before
+        assert not ran and calls == 0, (ran, calls)
         return out
     return wrapped
 
@@ -234,3 +238,111 @@ def add_checks(check, err, grad_err, worst, sync=lambda: None):
     check("complex masked_fill_ with -0.0 and -0j: signed zeros kept", lambda: worst(
         *[_nan_bits_err(z.to(hpu).masked_fill(mask.to(hpu), v), z.masked_fill(mask, v))
           for v in (-0.0, complex(-0.0, -0.0), complex(0.0, -0.0))]), 0)
+
+    # ---- fix/complex-review: CODEX_REVIEW findings of PRs #9/#10, on the card ------------------------------------
+    def rel128(fn, *args):
+        """fn on the card against the exact value (fn in complex128 on the CPU) rounded to the result's dtype, relative:
+        a part that overflows float32 is inf in both, a part that underflows is 0 in both."""
+        got = fn(*[a.to(hpu) if isinstance(a, torch.Tensor) else a for a in args])
+        sync()
+        ref = fn(*[a.to(torch.complex128 if a.is_complex() else torch.float64) for a in args])
+        g, r = got.detach().cpu(), ref.detach().to(got.dtype).to(ref.dtype)
+        g, r = (torch.view_as_real(g), torch.view_as_real(r)) if g.is_complex() else (g, r)
+        assert torch.equal(g.isnan(), r.isnan()) and torch.equal(g.isinf(), r.isinf()), (got, ref)
+        fin = r.isfinite()
+        return ((g[fin].double() - r[fin]).abs() / r[fin].abs().clamp_min(1e-300)).max().item() if fin.any() else 0.0
+
+    xd = torch.tensor([1.0, -2.0, 0.5])
+    # No subnormal result: the card flushes them to zero (1 / (3e37 + 1e37j) has a 1e-38 part, -0 there: Habana float32).
+    wd = torch.tensor([1e20j, 1e-30j, 3e36 + 1e36j, 1e-30 + 1e-30j, 3 + 4j, -2j], dtype=torch.complex64)
+    zd = torch.tensor([1 + 1j, -3e38 + 1j, 1e-30 - 2e-30j, 2.5, 1j, 7 - 7j], dtype=torch.complex64)
+    check("review #10: division (Smith): x / 1e20j, x / 1e-30j, z / w at extremes (relative)", _no_cpu_fallback(
+        lambda: worst(rel128(lambda x: x / 1e20j, xd), rel128(lambda x: x / 1e-30j, xd), rel128(torch.div, zd, wd),
+                      rel128(torch.div, xd[:1], wd))), 2e-6)
+    winf = torch.tensor([complex(inf, 0), complex(-inf, 2), complex(nan, 0), complex(0, inf)], dtype=torch.complex64)
+    zf = torch.tensor([1 + 1j, 2.0, -1j, 0.5], dtype=torch.complex64)
+    # Two complex card tensors with a real alpha stay pair arithmetic (speed; README Limits): not in this row.
+    check("review #10: add / sub with inf: NaN where torch puts it (scalar, real operand, alpha 1j, rsub)", lambda: worst(
+        *[_nan_bits_err(fn(*[t.to(hpu) for t in ts]), fn(*ts), signed_zeros=False) for fn, ts in (
+            (lambda p: p + complex(inf, 0), (zf,)), (lambda p: p - complex(-inf, 2), (zf,)),
+            (lambda p, q: torch.add(p, q, alpha=1j), (zf, winf)), (lambda p: complex(inf, 0) - p, (zf,)),
+            (lambda x: x + complex(inf, 0), (xd,)), (lambda p, q: p.real + q, (zf, winf)))]), 0)
+    check("review #10/medium: add(x, 1j, alpha=2j) = -1; sub(bool, 1j) / alpha=True raise like torch", lambda: worst(
+        err(torch.add(xd.to(hpu), 1j, alpha=2j), torch.add(xd, 1j, alpha=2j)),
+        _raises(lambda: torch.sub(xd.to(hpu) > 0, 1j), "bool tensor is not supported"),
+        _raises(lambda: torch.add(xd.to(hpu), 1j, alpha=True), "Boolean alpha")), 0)
+    c64v, f64v = torch.tensor([1 + 0.5j], dtype=torch.complex64), torch.tensor([1 + 2 ** -25], dtype=torch.float64)
+    def promoted_exact():
+        # The float64 HPU operand is a Habana float64 tensor (float32 precision on the card): the reference takes it
+        # as the card holds it. The point: the result is complex128, computed in complex128 (main: complex64).
+        zh, fh = c64v.to(hpu), f64v.to(hpu)
+        errs = []
+        for fn in (torch.add, torch.sub, torch.mul, torch.div, lambda p, q: q * p):
+            got = fn(zh, fh)
+            assert got.dtype == torch.complex128, got.dtype
+            errs.append(err(got, fn(c64v, fh.cpu())))
+        return worst(*errs)
+
+    check("review #8: complex64 (+ - * /) float64 is complex128, exact", promoted_exact, 0)
+    zn = {"tiny": [1e-30 + 0j], "huge": [3e19 + 3e19j], "mixed": [1e-30 + 0j, 3e19 + 0j, 1 + 1j],
+          "small": [1e-25 + 1e-25j, 2e-25j]}
+    check("review #11: vector_norm at extremes, ord 2, 1, 3, -1, inf (relative to the exact norm)", _no_cpu_fallback(
+        lambda: worst(*[rel128(lambda t, o=o: torch.linalg.vector_norm(t, o), torch.tensor(v, dtype=torch.complex64))
+                        for v in zn.values() for o in (2, 1, 3, -1, inf)])), 2e-6)
+
+    def tiny_norm_grad():
+        t = torch.tensor([1e-30 + 0j], dtype=torch.complex64, device=hpu).requires_grad_()
+        torch.linalg.vector_norm(t).backward()
+        return err(t.grad, torch.tensor([1 + 0j]))
+
+    check("review #11: vector_norm gradient of [1e-30] is 1", tiny_norm_grad, 1e-6)
+
+    def cat_out():
+        out = torch.empty(2, dtype=torch.complex128, device=hpu)
+        torch.cat([a.to(hpu)[0, :1], torch.tensor([16777217], dtype=torch.int32, device=hpu)], out=out)
+        assert out.cpu()[1].real.item() == 16777217, out
+        _raises(lambda: torch.cat([a.to(hpu)], out=torch.empty(1, device=hpu)), "can't be cast")
+        zz = torch.tensor([1 + 2j], dtype=torch.complex128, device=hpu)
+        return _raises(lambda: torch.cat([zz], out=zz), "memory location")
+
+    check("review #12: cat.out in out's dtype (int32 16777217 exact), real out / out=input raise", cat_out, 0)
+    check("review medium: exp(88.75 + i pi/4) and exp(100 + i (pi/2 - 1e-7)) fit (relative)", _no_cpu_fallback(
+        lambda: rel128(torch.exp, torch.tensor([complex(88.75, math.pi / 4), complex(100.0, math.pi / 2 - 1e-7)],
+                                               dtype=torch.complex64))), 2e-6)
+
+    def masked_fill_cases():
+        _raises(lambda: torch.zeros(2, dtype=torch.complex64, device=hpu).masked_fill_(
+            torch.tensor([True, False], device=hpu), complex(-0.0, 1e40)), "without overflow")
+        base, ref = torch.tensor([1 + 1j, 5j], device=hpu), torch.tensor([1 + 1j, 5j])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            base[:1].expand(2).masked_fill_(torch.tensor([False, True], device=hpu), 2j)
+            ref[:1].expand(2).masked_fill_(torch.tensor([False, True]), 2j)
+        return err(base, ref)
+
+    check("review medium: masked_fill_ overflow raises, expanded self writes as torch", masked_fill_cases, 0)
+
+    def storage_cases():
+        # #5: partial overlap of an in-place add_ / mul_ raises
+        v = torch.tensor([1, 2, 3, 4, 5], dtype=torch.complex64, device=hpu)
+        _raises(lambda: v[1:].add_(v[:-1]), "memory location")
+        _raises(lambda: v[1:].mul_(v[:-1]), "memory location")
+        # #3: a growing out= keeps the values outside its range
+        base = torch.tensor([11, 22, 33], dtype=torch.complex64, device=hpu)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            torch.neg(torch.tensor([7, 8, 9, 10], dtype=torch.complex64, device=hpu), out=base[1:])
+        sync()
+        e = err(base, torch.tensor([11, -7, -8], dtype=torch.complex64))
+        # #4: set_() detaches; #1: a failed set_ leaves the tensor unchanged
+        y = torch.tensor([1, 2], dtype=torch.complex64, device=hpu)
+        alias = y.view(-1)
+        y.set_()
+        y.resize_(3).fill_(99)
+        x = torch.tensor([2 + 0j], device=hpu)
+        _raises(lambda: x.set_(torch.zeros(1, dtype=torch.complex64, device=hpu).untyped_storage(), 0, (2,), (1,)),
+                "out of bounds")
+        sync()
+        return worst(e, err(alias, torch.tensor([1, 2], dtype=torch.complex64)), err(x, torch.tensor([2 + 0j])))
+
+    check("review #1/#3/#4/#5: failed set_, growing out= prefix, set_() detach, overlapping add_/mul_", storage_cases, 0)

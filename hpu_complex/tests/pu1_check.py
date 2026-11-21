@@ -731,16 +731,26 @@ for label, case in {
     check(f"rank-6+ CPU exact: {label}", lambda case=case: err(case(hpu), case("cpu")), 0)
 
 c6_hpu_perm = (x6_cpu.to(hpu) > 0).permute(0, 2, 4, 1, 3, 5)
+
+
+def _raises_same_device():
+    """torch's device rule: a complex64 HPU tensor and a CPU tensor that is not 0-d raise (as CUDA does), whatever the
+    op; main moved the CPU operand to the card."""
+    n = 0
+    for fn in (lambda: z6_perm_shape.to(hpu) * f6_cpu_perm, lambda: z6_perm_shape.to(hpu) + f6_cpu_perm,
+               lambda: z6_perm_shape.to(hpu) - f6_cpu_perm, lambda: z6_perm_shape.to(hpu) / (f6_cpu_perm.abs() + 1),
+               lambda: z6_perm_shape.to(hpu) * f6_cpu_perm.double()):
+        try:
+            fn()
+        except RuntimeError as e:
+            n += "same device" in str(e)
+    return 0.0 if n == 5 else math.nan
+
+
+check("rank-6+ CPU float operand of z6_hpu * + - / raises (same device)", _raises_same_device, 0)
 for label, hpu_fn, cpu_fn in (
-    ("z6_hpu * f6_cpu_perm", lambda: z6_perm_shape.to(hpu) * f6_cpu_perm, lambda: z6_perm_shape * f6_cpu_perm),
-    ("z6_hpu + f6_cpu_perm", lambda: z6_perm_shape.to(hpu) + f6_cpu_perm, lambda: z6_perm_shape + f6_cpu_perm),
-    ("z6_hpu - f6_cpu_perm", lambda: z6_perm_shape.to(hpu) - f6_cpu_perm, lambda: z6_perm_shape - f6_cpu_perm),
-    ("z6_hpu / (f6_cpu_perm.abs() + 1)", lambda: z6_perm_shape.to(hpu) / (f6_cpu_perm.abs() + 1),
-     lambda: z6_perm_shape / (f6_cpu_perm.abs() + 1)),
     ("where(cond6_hpu, z6_hpu, f6_cpu_perm)", lambda: torch.where(c6_hpu_perm, z6_perm_shape.to(hpu), f6_cpu_perm),
      lambda: torch.where(c6_cpu_perm, z6_perm_shape, f6_cpu_perm)),
-    ("z6_hpu * f6_cpu_perm.double()", lambda: z6_perm_shape.to(hpu) * f6_cpu_perm.double(),
-     lambda: z6_perm_shape * f6_cpu_perm.double()),
     ("z6_hpu.copy_(z6_cpu_perm.cdouble())", lambda: torch.zeros_like(z6_perm_shape, device=hpu).copy_(
         z6.cdouble().permute(0, 2, 4, 1, 3, 5)),
      lambda: z6.cdouble().permute(0, 2, 4, 1, 3, 5).to(torch.complex64)),
