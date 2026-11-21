@@ -3,7 +3,7 @@
 Each case runs on CPU complex128 and on the HPU copy (host memory), compares to 1e-12, and checks that a case where
 torch raises also raises. Breaks are xfail(strict=True). Ops whose results Habana holds (bool predicates, int pivots:
 isfinite, ==, allclose, cholesky, inv, det, slogdet, solve, lstsq, a boolean mask, eig's double backward) cannot run on
-this stand-in; they are cases of tests/probe_adversarial_j.py on the card.
+this stand-in; they are cases of hpu_complex/tests/c128_adversarial_check.py on the card.
 
 python -m pytest hpu_complex/tests/test_adversarial2_c128_cpu.py -q -rxX
 """
