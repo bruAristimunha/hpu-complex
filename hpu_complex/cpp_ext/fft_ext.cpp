@@ -1468,12 +1468,24 @@ void complex_scalar_backend_select(const c10::OperatorHandle& op, DispatchKeySet
 }
 
 // BackendSelect sees every call of these ops below autograd, on any device (CPU code too). Measured on the CPU: the
-// boxed kernel alone cost 0.6-1.2 us a call (x * y: 1.2 -> 1.8 us). The unboxed kernel below hands a call without an
-// HPU tensor on at once, and boxes the rest (complex_scalar_backend_select).
+// boxed kernel alone cost 0.6-1.2 us a call (x * y: 1.2 -> 1.8 us). The unboxed kernel below hands on at once a call
+// without both an HPU tensor and a complex scalar (a Python complex, a complex 0-d CPU tensor: what
+// complex_scalar_promote looks for), and boxes the rest (complex_scalar_backend_select).
 template <class T>
 bool on_hpu(const T& v) {
   if constexpr (std::is_same_v<std::decay_t<T>, at::Tensor>) {
     return v.defined() && v.is_hpu();
+  } else {
+    return false;
+  }
+}
+
+template <class T>
+bool complex_scalar_arg(const T& v) {
+  if constexpr (std::is_same_v<std::decay_t<T>, at::Tensor>) {
+    return v.defined() && v.is_cpu() && v.dim() == 0 && v.is_complex();
+  } else if constexpr (std::is_same_v<std::decay_t<T>, at::Scalar>) {
+    return v.isComplex();
   } else {
     return false;
   }
@@ -1486,7 +1498,7 @@ struct BackendSelectFast;
 template <class Op, int Written, class Ret, class... Args>
 struct BackendSelectFast<Op, Written, Ret(Args...)> {
   static Ret call(DispatchKeySet ks, Args... args) {
-    if (!(on_hpu(args) || ...)) {
+    if (!(on_hpu(args) || ...) || !(complex_scalar_arg(args) || ...)) {
       return Op::redispatch(after_backend_select(ks), args...);
     }
     static const c10::OperatorHandle op =
