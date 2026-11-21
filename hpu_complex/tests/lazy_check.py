@@ -10,8 +10,8 @@ Verifies:
 4. CPU complex64 ops still work while lazy mode is enabled.
 5. complex64 runs in lazy mode (lazy views of the Habana tensor behind each complex storage): factories, .to,
    view_as_complex, torch.complex, torch.fft, eigvals, products, in-place writes through .real, against the CPU.
-6. What lazy mode still refuses raises a clean RuntimeError (no process abort): complex64 under
-   torch.inference_mode, and permuted complex64 tensors of rank 5 or more.
+6. What lazy mode still refuses raises a clean RuntimeError (no process abort): permuted complex64 tensors of rank 5
+   or more. complex64 under torch.inference_mode runs (inference tensors), against the CPU.
 7. green_ops_check.py in lazy mode: a real tensor times a Python complex scalar (x * 2j used to abort the process
    inside Habana), complex cat / exp / neg / masked_fill_ / linalg.vector_norm, with gradients.
 8. The Habana tensors held by lazy complex storages are released (no growth over 100 steps).
@@ -128,9 +128,14 @@ def check_lazy_complex_guards():
     sig = torch.randn(8, 512, device=hpu)
     z5 = torch.randn(2, 3, 4, 5, 6, dtype=torch.complex64).to(hpu)
     htcore.mark_step()
+    # complex64 under torch.inference_mode runs now: its tensors are inference tensors (the guard is lifted)
+    got = _inference(lambda: torch.fft.rfft(sig).real.sum(-1) + (sig * 2j).imag.sum(-1))
+    htcore.mark_step()
+    s = sig.cpu()
+    ref = torch.fft.rfft(s).real.sum(-1) + (s * 2j).imag.sum(-1)
+    assert got.is_inference() and (got.cpu() - ref).abs().max() < 1e-3 * ref.abs().max(), "inference_mode"
+    print("lazy_check complex64 under torch.inference_mode: OK")
     cases = [
-        ("complex64 under torch.inference_mode", lambda: _inference(lambda: torch.fft.rfft(sig).real.sum()),
-         "torch.no_grad()"),
         ("permuted 5-D complex64", lambda: z5.permute(0, 2, 1, 3, 4) * 2, "rank 5 or more"),
     ]
     for name, fn, match in cases:

@@ -62,6 +62,13 @@ def test_complex_scalar_kernels_sit_at_autograd_hpu(registered):
         assert "AutogradHPU" in registered[op], op
 
 
+def test_complex_scalar_kernels_also_sit_at_backend_select(registered):
+    """The same calls when they skip the autograd keys (torch.inference_mode, inference tensors) are taken at
+    BackendSelect, which every call's key set holds, below autograd and above Habana's HPU kernels."""
+    for op in ("aten::mul.Tensor", "aten::add_.Scalar", "aten::rsub.Tensor", "aten::div.out_mode"):
+        assert "BackendSelect" in registered[op], op
+
+
 def test_other_calls_reach_torch_autograd_kernel_through_autograd_other(registered):
     for op, line in registered["autograd_other"].items():
         assert "VariableType" in line and "fft_ext" not in line, (op, line)
