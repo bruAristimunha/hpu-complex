@@ -318,9 +318,9 @@ def test_eigh_upper_and_one_triangle(card_linalg):
 
 def test_eigvalsh(card_linalg):
     H = hermitian("random", 2, 6, seed=1)
-    calls = taken(card_linalg, "eigh")
+    calls = taken(card_linalg, "eigvalsh")
     w = torch.linalg.eigvalsh(H.to(C64).to(HPU))
-    assert taken(card_linalg, "eigh") > calls
+    assert taken(card_linalg, "eigvalsh") > calls
     torch.testing.assert_close(w.cpu().double(), torch.linalg.eigvalsh(H), atol=3e-5, rtol=0)
 
 
@@ -507,6 +507,13 @@ def test_default_routes(card_linalg, monkeypatch, lazy):
                     lambda: torch.linalg.householder_product(a.requires_grad_(), tau).abs().sum().backward())
     assert not taken_by("eigh", lambda: torch.linalg.eigh(H))
     assert not taken_by("solve_triangular", lambda: torch.linalg.solve_triangular(A, B, upper=True))
+    assert taken_by("solve_triangular", lambda: torch.linalg.solve_triangular(
+        A.clone().requires_grad_(), B, upper=True).abs().sum().backward()) == lazy  # lazy, with grad only
+    assert taken_by("cholesky_solve", lambda: torch.cholesky_solve(B, torch.linalg.cholesky(H)))
+    assert taken_by("cholesky_inverse", lambda: torch.cholesky_inverse(torch.linalg.cholesky(H)))
+    assert not taken_by("qr", lambda: torch.linalg.qr(A))
+    assert not taken_by("eigvalsh", lambda: torch.linalg.eigvalsh(H))
+    assert taken_by("eigvalsh", lambda: torch.linalg.eigvalsh(H.clone().requires_grad_()).sum().backward()) == lazy
     monkeypatch.setenv("HPU_COMPLEX_LINALG", "all")
     assert taken_by("eigh", lambda: torch.linalg.eigh(H))
 

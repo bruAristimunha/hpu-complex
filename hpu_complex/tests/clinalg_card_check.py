@@ -77,11 +77,35 @@ def cases(b, n):
         "eigh": (lambda A: _gauge_free(torch.linalg.eigh(A)), [_herm(b, n, 6)]),
         "eigvalsh": (lambda A: torch.linalg.eigvalsh(A), [_herm(b, n, 6)]),
         "pinv": (lambda A: torch.linalg.pinv(A), [rand(b, n, max(1, n - 2), seed=7)]),
+        "cholesky_inverse": (lambda L: torch.cholesky_inverse(L), [L]),
+        "cholesky_inverse_upper": (lambda U: torch.cholesky_inverse(U, upper=True), [L.mH.contiguous()]),
+        "cholesky_solve_upper": (lambda B, U: torch.cholesky_solve(B, U, upper=True),
+                                 [rand(b, n, 3, seed=2), L.mH.contiguous()]),
+        "solve_triangular_lower_left": (lambda A, B: torch.linalg.solve_triangular(A, B, upper=False),
+                                        [tri(b, n, 4), rand(b, n, 3, seed=2)]),
+        # qr: compared and differentiated through (Q Q^H, |R|), which do not depend on the signs of diag(R)
+        "qr": (lambda A: _qr_gauge_free(torch.linalg.qr(A)), [rand(b, n, n, seed=9)]),
+        "qr_tall": (lambda A: _qr_gauge_free(torch.linalg.qr(A)), [rand(b, n, max(1, n // 2), seed=9)]),
+        "hpd_slogdet": (_hpd_logabsdet, [hpd(b, n, 3)]),
         "lstsq": (lambda A, B: torch.linalg.lstsq(A, B).solution, [rand(b, n, max(1, n - 2), seed=7),
                                                                    rand(b, n, 3, seed=8)]),
     }
     del k
     return out
+
+
+def _qr_gauge_free(qr):
+    Q, R = qr
+    return Q @ Q.mH, R.abs()
+
+
+def _hpd_logabsdet(A):
+    """hpu_complex.linalg.hpd_slogdet on the card (installed); torch.linalg.slogdet elsewhere (CPU, CPU route)."""
+    import hpu_complex.linalg as L
+
+    if A.device.type == "hpu" and L._UNDO is not None:
+        return L.hpd_slogdet(A).logabsdet
+    return torch.linalg.slogdet(A).logabsdet
 
 
 def _herm(b, n, seed):
