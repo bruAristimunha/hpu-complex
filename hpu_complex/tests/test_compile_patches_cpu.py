@@ -71,6 +71,37 @@ def test_float_reader_of_a_complex_node_runs_eagerly(stub_passes):
     assert calls["placement"] == 1
 
 
+@pytest.mark.parametrize("fn", [
+    lambda t: torch.view_as_real(t.diagonal(0, -2, -1))[..., 0] * 0.5,   # select of view_as_real, then mul
+    lambda t: t.diagonal(0, -2, -1).real * 2,                            # .real traces to view_as_real + select
+    lambda t: torch.view_as_real(t)[..., 1].mT.unsqueeze(0) + 1,         # a longer float view chain
+])
+def test_every_reader_of_a_float_view_of_complex_storage_runs_eagerly(stub_passes, fn):
+    """The float views of complex storage are closed transitively: a view of such a view is one too, and the first
+    node that materializes (mul, add) reads one, so it runs eagerly; a reader of its fresh result is fusable."""
+    passes, _ = stub_passes
+    ctx = _ctx(lambda t: fn(t).exp(), torch.randn(3, 5, 5, dtype=torch.complex64))
+    passes.pass_mark_placement(ctx)
+    placement = {n.name: n.meta["placement"] for n in ctx.graph_module.graph.nodes if n.op == "call_function"}
+    materializing = [n for n in ctx.graph_module.graph.nodes if n.op == "call_function"
+                     and n.target in (torch.ops.aten.mul.Tensor, torch.ops.aten.add.Tensor)]
+    assert materializing and all(placement[n.name] == "eager" for n in materializing)
+    assert all(v == "eager" for k, v in placement.items() if not k.startswith("exp"))
+    assert placement[_node(ctx, "exp").name] == "hpu_cluster"
+
+
+def test_fuse_view_chains_skips_float_views_of_complex_storage(stub_passes):
+    """eig's V.real.mT.unsqueeze(0): the float chain after view_as_real addresses complex storage, whose strides the
+    fake tensors can get wrong; no chain may start on it (nor upstream of a complex view: x.view(...).view(c64))."""
+    passes, calls = stub_passes
+    ctx = _ctx(lambda t: t.real.mT.unsqueeze(0), torch.randn(3, 5, 5, dtype=torch.complex64))
+    passes.pass_fuse_view_chains(ctx)
+    assert not calls["fuse"], calls["fuse"]
+    ctx = _ctx(lambda x: x.view(4, 6).view(torch.complex64), torch.randn(24))
+    passes.pass_fuse_view_chains(ctx)
+    assert not calls["fuse"], calls["fuse"]
+
+
 def test_fresh_float_result_of_a_complex_node_stays_fusable(stub_passes):
     passes, _ = stub_passes
     ctx = _ctx(lambda t: t.abs().log1p().mean(), torch.randn(4, 6, dtype=torch.complex64))
@@ -135,3 +166,15 @@ def test_a_sliced_view_is_not_dense():
     permute block."""
     x = torch.randn(2, 2, 3, 2, 2, 3, 2, 2)
     assert not is_non_overlapping_and_dense(x[1, 1:].permute(0, 2, 1, 3, 4, 5, 6)[..., 0])
+
+
+def test_lazy_mode_defaults_to_lazy_without_the_bridge_query(monkeypatch):
+    """Without habana_frameworks' is_lazy(), an unset PT_HPU_LAZY_MODE counts as lazy (guards raise, no abort)."""
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch.utils.internal", None)  # import raises ImportError
+    monkeypatch.delenv("PT_HPU_LAZY_MODE", raising=False)
+    with pytest.warns(UserWarning, match="assuming lazy mode"):
+        assert hpu_complex._bridge_is_lazy() is True
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "0")
+    assert hpu_complex._bridge_is_lazy() is False
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
+    assert hpu_complex._bridge_is_lazy() is True
