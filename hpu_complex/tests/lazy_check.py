@@ -22,6 +22,7 @@ import warnings
 
 import habana_frameworks.torch.core as htcore
 import habana_frameworks.torch.hpu as hthpu
+from habana_frameworks.torch.hpu import metrics as hpu_metrics
 from habana_frameworks.torch.utils.internal import is_lazy
 import torch
 
@@ -224,6 +225,50 @@ def check_lazy_complex_guards():
     htcore.mark_step()
     assert _err(xh.grad, xc.grad) < 1e-5, _err(xh.grad, xc.grad)
     print(f"lazy_check perm5 MetaNeuromotorHand backward: OK (max|err| {_err(xh.grad, xc.grad):.1e})")
+
+    # 6. Zero bridge FallbackOps on rank-6 rfft, rank-5 abs/sgn/where/vector_norm, and rank-6 exp
+    def _fb_stats():
+        return dict(dict(hpu_metrics.metric_global("cpu_fallback").stats()).get("FallbackOps", {}) or {})
+
+    def _check_no_fb(name, fn, tol):
+        htcore.mark_step()
+        f0 = _fb_stats()
+        c0 = torch.ops.hpu_complex.cpu_fallback_calls()
+        got, ref = fn()
+        htcore.mark_step()
+        f1 = _fb_stats()
+        c1 = torch.ops.hpu_complex.cpu_fallback_calls()
+        delta = {k: f1[k] - f0.get(k, 0) for k in f1 if f1[k] - f0.get(k, 0) > 0}
+        assert delta == {} and c1 == c0, (name, delta, c1 - c0)
+        e = _err(got, ref)
+        assert e <= tol, (name, e)
+        print(f"lazy_check no-fallback {name}: OK (max|err| {e:.1e}, FallbackOps={{}})")
+
+    x6_cpu = torch.randn(2, 2, 2, 2, 2, 8)
+    x6_h = x6_cpu.to(hpu).requires_grad_()
+    x6_c = x6_cpu.clone().requires_grad_()
+    p5_h = z5.permute(4, 3, 2, 1, 0)
+    p5_c = z5_cpu.permute(4, 3, 2, 1, 0)
+    w5_h = (z5 + 0.5).permute(4, 3, 2, 1, 0)
+    w5_c = (z5_cpu + 0.5).permute(4, 3, 2, 1, 0)
+    c5_c = p5_c.real > 0
+    c5_h = c5_c.to(hpu)
+    p6_h = z6.permute(5, 4, 3, 2, 1, 0)
+    p6_c = z6_cpu.permute(5, 4, 3, 2, 1, 0)
+
+    def _rfft6_fwdbwd():
+        yh = torch.fft.rfft(x6_h)
+        (yh.abs() ** 2).sum().backward()
+        yc = torch.fft.rfft(x6_c)
+        (yc.abs() ** 2).sum().backward()
+        return x6_h.grad, x6_c.grad
+
+    _check_no_fb("rank-6 rfft fwd+bwd", _rfft6_fwdbwd, 1e-4)
+    _check_no_fb("rank-5 abs", lambda: (p5_h.abs(), p5_c.abs()), 1e-5)
+    _check_no_fb("rank-5 sgn", lambda: (torch.sgn(p5_h), torch.sgn(p5_c)), 1e-5)
+    _check_no_fb("rank-5 where", lambda: (torch.where(c5_h, p5_h, w5_h), torch.where(c5_c, p5_c, w5_c)), 1e-5)
+    _check_no_fb("rank-5 vector_norm", lambda: (torch.linalg.vector_norm(p5_h), torch.linalg.vector_norm(p5_c)), 1e-4)
+    _check_no_fb("rank-6 exp", lambda: (torch.exp(p6_h), torch.exp(p6_c)), 1e-4)
 
 
 def _inference(fn):

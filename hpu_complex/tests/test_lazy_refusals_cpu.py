@@ -207,3 +207,67 @@ def test_inference_mode_rfft_stft_fft_irfft_and_perm5_lazy():
         del sig_h, rfft_h, irfft_h, stft_h, p5_h, fft_h, mul_h
         gc.collect()
         assert torch.ops.hpu_complex.lazy_storages_alive() == alive0
+
+
+def test_rank6_rfft_and_high_rank_flattened_ops_lazy():
+    torch.manual_seed(4)
+    x6 = torch.randn(2, 2, 2, 2, 2, 8)
+    z5 = torch.randn(4, 2, 3, 2, 2, dtype=C64)
+    z6 = torch.randn(2, 2, 2, 3, 2, 2, dtype=C64)
+    with lazy_flag():
+        # Rank-6 rfft (normal + inference_mode + 0-element)
+        torch.testing.assert_close(
+            torch.view_as_real(torch.fft.rfft(x6.to(HPU)).cpu()),
+            torch.view_as_real(torch.fft.rfft(x6)),
+            rtol=1e-4, atol=1e-4,
+        )
+        with torch.inference_mode():
+            r6_inf = torch.fft.rfft(x6.to(HPU))
+            assert r6_inf.is_inference()
+        torch.testing.assert_close(
+            torch.view_as_real(r6_inf.cpu()),
+            torch.view_as_real(torch.fft.rfft(x6)),
+            rtol=1e-4, atol=1e-4,
+        )
+        e6 = torch.fft.rfft(torch.empty(2, 0, 2, 2, 2, 8, device=HPU))
+        assert e6.shape == (2, 0, 2, 2, 2, 5) and e6.numel() == 0
+
+        # Rank-5 abs, sgn, where (matched + broadcast), vector_norm (ord=2, ord=1, ord=0.5), masked_fill_(-0.0)
+        p5_c = z5.permute(4, 3, 2, 1, 0)
+        p5_h = z5.to(HPU).permute(4, 3, 2, 1, 0)
+        w5_c = (z5 + 0.5).permute(4, 3, 2, 1, 0)
+        w5_h = (z5 + 0.5).to(HPU).permute(4, 3, 2, 1, 0)
+        c5_c = p5_c.real > 0
+        c5_h = c5_c.to(HPU)
+
+        torch.testing.assert_close(p5_h.abs().cpu(), p5_c.abs(), rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(
+            torch.view_as_real(torch.sgn(p5_h).cpu()), torch.view_as_real(torch.sgn(p5_c)), rtol=1e-5, atol=1e-6
+        )
+        bits_equal(torch.where(c5_h, p5_h, w5_h), torch.where(c5_c, p5_c, w5_c))
+        bits_equal(
+            torch.where((p5_c.real[:1] > 0).to(HPU), p5_h, 0j),
+            torch.where(p5_c.real[:1] > 0, p5_c, 0j),
+        )
+        for ord_val, dim_val in ((2, None), (2, (0, 2)), (1, (0,)), (0.5, (0,))):
+            torch.testing.assert_close(
+                torch.linalg.vector_norm(p5_h, ord=ord_val, dim=dim_val).cpu(),
+                torch.linalg.vector_norm(p5_c, ord=ord_val, dim=dim_val),
+                rtol=1e-4, atol=1e-5,
+            )
+        mf_h, mf_c = p5_h.clone(), p5_c.clone()
+        mf_h.masked_fill_(c5_h, complex(-0.0, 0.0))
+        mf_c.masked_fill_(c5_c, complex(-0.0, 0.0))
+        bits_equal(mf_h, mf_c)
+
+        # Rank-6 exp and div
+        p6_c = z6.permute(5, 4, 3, 2, 1, 0)
+        p6_h = z6.to(HPU).permute(5, 4, 3, 2, 1, 0)
+        w6_c = (z6 + 1.5).permute(5, 4, 3, 2, 1, 0)
+        w6_h = (z6 + 1.5).to(HPU).permute(5, 4, 3, 2, 1, 0)
+        torch.testing.assert_close(
+            torch.view_as_real(torch.exp(p6_h).cpu()), torch.view_as_real(torch.exp(p6_c)), rtol=1e-4, atol=1e-5
+        )
+        torch.testing.assert_close(
+            torch.view_as_real((p6_h / w6_h).cpu()), torch.view_as_real(p6_c / w6_c), rtol=1e-5, atol=1e-5
+        )

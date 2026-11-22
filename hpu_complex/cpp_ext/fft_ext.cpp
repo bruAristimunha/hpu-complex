@@ -995,11 +995,14 @@ at::Tensor fft_r2c_hpu(const at::Tensor& self, c10::IntArrayRef dim, int64_t nor
   check_last_dim(self, dim);
   const int64_t n = self.size(-1);
   const int64_t k = onesided ? n / 2 + 1 : n;
-  auto x = dense_copy(self.to(at::kFloat));  // Habana GEMMs mis-handle strided batched inputs (stft frames)
-  auto out = at::matmul(x, r2c_basis(n, k, normalization, self.device()));
   auto sizes = self.sizes().vec();
   sizes.back() = k;
   sizes.push_back(2);
+  if (self.numel() == 0) {
+    return complex_view(at::empty(sizes, self.options().dtype(at::kFloat)));
+  }
+  auto x = dense_copy(self.to(at::kFloat));  // Habana GEMMs mis-handle strided batched inputs (stft frames)
+  auto out = at::matmul(x.view({-1, n}), r2c_basis(n, k, normalization, self.device()));
   return complex_view(out.view(sizes));
 }
 
@@ -1221,19 +1224,49 @@ at::Tensor mul_pu1(const at::Tensor& a, const at::Tensor& b) {
   return complex_result(pa ? *pa * hpu_float(b, device).unsqueeze(-1) : *pb * hpu_float(a, device).unsqueeze(-1));
 }
 
+// Habana falls back aten::where.self and aten::nan_to_num to CPU on rank >= 6 tensors: flatten to 1-D there.
+at::Tensor flat_where(const at::Tensor& cond, const at::Tensor& a, const at::Tensor& b) {
+  if (std::max({cond.dim(), a.dim(), b.dim()}) < 6) {
+    return at::where(cond, a, b);
+  }
+  if (cond.sizes() == a.sizes() && a.sizes() == b.sizes()) {
+    if (a.numel() == 0) {
+      return at::empty(a.sizes(), a.options().dtype(at::result_type(a, b)));
+    }
+    return at::where(dense_copy(cond).view({-1}), dense_copy(a).view({-1}), dense_copy(b).view({-1}))
+        .view(a.sizes());
+  }
+  auto bc = at::broadcast_tensors({dense_copy(cond), dense_copy(a), dense_copy(b)});
+  if (bc[1].numel() == 0) {
+    return at::empty(bc[1].sizes(), bc[1].options().dtype(at::result_type(a, b)));
+  }
+  return at::where(bc[0].contiguous().view({-1}), bc[1].contiguous().view({-1}), bc[2].contiguous().view({-1}))
+      .view(bc[1].sizes());
+}
+
+at::Tensor flat_nan_to_num(const at::Tensor& t, double nan, double posinf, double neginf) {
+  if (t.dim() < 6) {
+    return at::nan_to_num(t, nan, posinf, neginf);
+  }
+  if (t.numel() == 0) {
+    return at::empty(t.sizes(), t.options());
+  }
+  return at::nan_to_num(dense_copy(t).view({-1}), nan, posinf, neginf).view(t.sizes());
+}
+
 // a / b as torch's c10::complex division (Smith's algorithm, numpy's): the larger part of b is divided out first, so
 // |b|^2 is never formed (1 / 1e20j was 0 and 1 / 1e-30j nan - inf i with the |b|^2 form). A real operand is torch's
 // x + 0i, so NaN and signed-zero placement follow torch too; b = 0 gives a / 0 per part (complex inf or NaN).
 at::Tensor smith_div(const at::Tensor& ar, const at::Tensor& ai, const at::Tensor& br, const at::Tensor& bi) {
   const auto abs_r = br.abs(), abs_i = bi.abs();
   const auto real_major = abs_r >= abs_i;
-  const auto rat = at::where(real_major, bi / br, br / bi);
-  const auto scl = at::where(real_major, br + bi * rat, bi + br * rat).reciprocal();
-  auto re = at::where(real_major, ar + ai * rat, ar * rat + ai) * scl;
-  auto im = at::where(real_major, ai - ar * rat, ai * rat - ar) * scl;
+  const auto rat = flat_where(real_major, bi / br, br / bi);
+  const auto scl = flat_where(real_major, br + bi * rat, bi + br * rat).reciprocal();
+  auto re = flat_where(real_major, ar + ai * rat, ar * rat + ai) * scl;
+  auto im = flat_where(real_major, ai - ar * rat, ai * rat - ar) * scl;
   const auto zero = (abs_r == 0).logical_and(abs_i == 0);
-  re = at::where(zero, ar / abs_r, re);
-  im = at::where(zero, ai / abs_i, im);
+  re = flat_where(zero, ar / abs_r, re);
+  im = flat_where(zero, ai / abs_i, im);
   return at::stack({re, im}, -1);
 }
 
@@ -1260,6 +1293,14 @@ at::Tensor div_pu1(const at::Tensor& a, const at::Tensor& b) {
   }
   if (!pb) {  // complex / real: torch's (ar + i ai) / (c + 0i), Smith's algorithm with a zero imaginary part
     return complex_result(real_div(*pa, hpu_float(b, device)));
+  }
+  if (pa && pa->sizes() == pb->sizes() && pa->dim() >= 7) {
+    if (pa->numel() == 0) {
+      return complex_result(at::empty(pa->sizes(), pa->options()));
+    }
+    auto fa = pa->view({-1, 2}), fb = pb->view({-1, 2});
+    return complex_result(
+        smith_div(fa.select(-1, 0), fa.select(-1, 1), fb.select(-1, 0), fb.select(-1, 1)).view(pa->sizes()));
   }
   auto br = pb->select(-1, 0), bi = pb->select(-1, 1);
   if (!pa) {
@@ -1348,13 +1389,24 @@ at::Tensor sub_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& a
 // (|3e19 + 3e19j| = inf, |1e-30| = 0 on Gaudi2, bridge 1.21.4, where torch gives 4.2e19 and 1e-30). m = 0 gives 0;
 // an infinite part gives inf even next to a NaN (hypot(inf, nan) = inf, as torch's abs).
 at::Tensor modulus(const at::Tensor& pair, bool keepdim) {
-  auto mag = pair.abs();
+  auto out_sizes = pair.sizes().vec();
+  if (keepdim) {
+    out_sizes.back() = 1;
+  } else {
+    out_sizes.pop_back();
+  }
+  if (pair.numel() == 0) {
+    return at::empty(out_sizes, pair.options());
+  }
+  // Habana falls back aten::where.self on rank >= 6 tensors: flatten [..., 2] pairs to 2-D {-1, 2}.
+  const auto p = pair.dim() >= 6 ? dense_copy(pair).view({-1, 2}) : pair;
+  auto mag = p.abs();
   auto m = std::get<0>(mag.max(-1, /*keepdim=*/true));
   auto scale = at::where(m > 0, m, at::ones_like(m));
-  auto r = m * at::linalg_vector_norm(pair / scale, 2, at::IntArrayRef{-1}, /*keepdim=*/true);
+  auto r = m * at::linalg_vector_norm(p / scale, 2, at::IntArrayRef{-1}, /*keepdim=*/true);
   const auto inf = std::numeric_limits<float>::infinity();
   r = at::where((mag == inf).any(-1, /*keepdim=*/true), at::Scalar(inf), r);
-  return keepdim ? r : r.squeeze(-1);
+  return pair.dim() >= 6 ? r.view(out_sizes) : (keepdim ? r : r.squeeze(-1));
 }
 
 at::Tensor abs_pu1(const at::Tensor& self) {
@@ -1406,7 +1458,29 @@ at::Tensor where_pu1(const at::Tensor& cond, const at::Tensor& a, const at::Tens
   HPU_COMPLEX_NO_AUTOCAST;
   const auto device = hpu_device_of(a, b);
   auto cond_dev = hpu_float(cond, device, std::nullopt);
-  return complex_result(at::where(cond_dev.unsqueeze(-1), as_pair(a, device), as_pair(b, device)));
+  auto pa = as_pair(a, device);
+  auto pb = as_pair(b, device);
+  const int64_t out_dim = std::max({cond_dev.dim() + 1, pa.dim(), pb.dim()});
+  if (out_dim >= 6) {
+    if (pa.sizes() == pb.sizes() && cond_dev.dim() + 1 == pa.dim() &&
+        cond_dev.sizes() == pa.sizes().slice(0, pa.dim() - 1)) {
+      if (pa.numel() == 0) {
+        return complex_result(at::empty(pa.sizes(), pa.options()));
+      }
+      return complex_result(
+          at::where(dense_copy(cond_dev).view({-1, 1}), dense_copy(pa).view({-1, 2}), dense_copy(pb).view({-1, 2}))
+              .view(pa.sizes()));
+    }
+    auto bc = at::broadcast_tensors({cond_dev.unsqueeze(-1), pa, pb});
+    auto out_sizes = bc[1].sizes().vec();
+    if (bc[1].numel() == 0) {
+      return complex_result(at::empty(out_sizes, pa.options()));
+    }
+    return complex_result(at::where(bc[0].contiguous().view({-1}), bc[1].contiguous().view({-1}),
+                                    bc[2].contiguous().view({-1}))
+                              .view(out_sizes));
+  }
+  return complex_result(at::where(cond_dev.unsqueeze(-1), pa, pb));
 }
 
 // ---- matrix products (PrivateUse1) ----------------------------------------------------------
@@ -2360,7 +2434,12 @@ at::Tensor exp_pu1(const at::Tensor& self) {
   }
   HPU_COMPLEX_NO_AUTOCAST;
   auto pair = values_pair(self);
-  auto a = pair.select(-1, 0), b = pair.select(-1, 1);
+  const auto out_sizes = pair.sizes().vec();
+  if (pair.numel() == 0) {
+    return complex_result(at::empty(out_sizes, pair.options()));
+  }
+  const auto p = self.dim() >= 6 ? pair.view({-1, 2}) : pair;
+  auto a = p.select(-1, 0), b = p.select(-1, 1);
   auto ea = (a * 0.5).exp();  // e^(a/2): (e^(a/2) cos b) e^(a/2) overflows only where the result does
   auto re = ea * b.cos() * ea;
   // where(b != 0, ...), not where(b == 0, b, ...): the same values, and 6x faster on Gaudi2 eager (bridge 1.21.4:
@@ -2372,7 +2451,8 @@ at::Tensor exp_pu1(const at::Tensor& self) {
   auto special = a.isinf().logical_and(b.isfinite().logical_not());
   re = at::where(special, ea, re);
   im = at::where(special, ea - ea, im);
-  return complex_result(at::stack({re, im}, -1));
+  auto out = at::stack({re, im}, -1);
+  return complex_result(self.dim() >= 6 ? out.view(out_sizes) : out);
 }
 
 // neg/exp with out=: a real self (dispatched here through a complex out) is torch's real op, then cast into out as
@@ -2437,7 +2517,7 @@ at::Tensor& masked_fill_pu1(at::Tensor& self, const at::Tensor& mask, const at::
     // A -0.0 part goes in as a tensor, not a scalar: Habana's lazy graph merges the constants -0.0 and 0.0 (the two
     // parts' fills came out with each other's zero sign; Gaudi2, bridge 1.21.4).
     auto value = at::tensor({static_cast<float>(c.real()), static_cast<float>(c.imag())}).to(self.device());
-    filled = at::where(m.unsqueeze(-1), value, pair);
+    filled = flat_where(m.unsqueeze(-1), value, pair);
   } else {
     filled = at::stack({pair.select(-1, 0).masked_fill(m, c.real()), pair.select(-1, 1).masked_fill(m, c.imag())}, -1);
   }
@@ -2598,10 +2678,10 @@ at::Tensor vector_norm_pu1(const at::Tensor& self, const at::Scalar& ord, at::Op
     const auto mag = pair.abs();
     const auto elem_inf = (mag == inf).any(-1, /*keepdim=*/true);
     const auto elem_nan = mag.isnan().any(-1, /*keepdim=*/true).logical_and(elem_inf.logical_not());
-    const auto bound = at::amax(at::nan_to_num(mag, 0.0, inf, -inf), all, /*keepdim=*/true);
-    const auto scale = at::where(bound.isfinite().logical_and(bound > 0), bound, at::ones_like(bound));
+    const auto bound = at::amax(flat_nan_to_num(mag, 0.0, inf, -inf), all, /*keepdim=*/true);
+    const auto scale = flat_where(bound.isfinite().logical_and(bound > 0), bound, at::ones_like(bound));
     auto norm = at::linalg_vector_norm(pair / scale, 2, all, /*keepdim=*/true) * scale;
-    norm = at::where(bound == inf, bound, norm);
+    norm = flat_where(bound == inf, bound, norm);
     norm = norm.masked_fill(at::amax(elem_nan.to(at::kFloat), all, /*keepdim=*/true) > 0,
                             std::numeric_limits<float>::quiet_NaN());
     norm = norm.squeeze(-1);
@@ -2620,7 +2700,7 @@ at::Tensor vector_norm_pu1(const at::Tensor& self, const at::Scalar& ord, at::Op
     return with_nan(at::linalg_vector_norm(mod, ord, dim, keepdim, std::nullopt));
   }
   const auto bound = p > 0 ? at::amax(mod, dims, /*keepdim=*/true) : at::amin(mod, dims, /*keepdim=*/true);
-  const auto scale = at::where(bound.isfinite().logical_and(bound > 0), bound, at::ones_like(bound));
+  const auto scale = flat_where(bound.isfinite().logical_and(bound > 0), bound, at::ones_like(bound));
   const auto ratio = mod / scale;
   if (std::abs(p) >= 1.0) {
     // A ratio lost to under- (ord > 0) or overflow (ord < 0) has a term ratio^ord below 1e-38 next to the bound's 1.
@@ -2632,7 +2712,7 @@ at::Tensor vector_norm_pu1(const at::Tensor& self, const at::Scalar& ord, at::Op
   auto terms = ratio.pow(p);
   const auto lost = p > 0 ? (ratio < std::numeric_limits<float>::min()).logical_and(mod > 0)
                           : ratio.isinf().logical_and(mod.isfinite());
-  terms = at::where(lost, ((mod.log() - scale.log()) * p).exp(), terms);
+  terms = flat_where(lost, ((mod.log() - scale.log()) * p).exp(), terms);
   auto sum = at::linalg_vector_norm(terms, 1, dim, keepdim, std::nullopt);  // the terms are >= 0 (or NaN)
   // sum^(1 / ord) can over- or underflow float32 before the rescale (3 x 1e-30 at ord 0.01: 3^100 = 5e47): there,
   // and only there, exp(log(sum) / ord + log(scale)) (the log form costs ~|log| ulps, 2.7e-6 at ord 0.5 measured, so
@@ -2644,9 +2724,9 @@ at::Tensor vector_norm_pu1(const at::Tensor& self, const at::Scalar& ord, at::Op
   const auto use_log = (sum > 0).logical_and(
       probe.isfinite().logical_and(probe >= std::numeric_limits<float>::min()).logical_not());
   const auto one = at::ones_like(sum);
-  const auto by_log = (at::where(use_log, sum, one).log() * inv + s.log()).exp();
-  const auto by_pow = at::where(use_log, one, sum).pow(inv) * s;
-  return with_nan(at::where(use_log, by_log, by_pow));
+  const auto by_log = (flat_where(use_log, sum, one).log() * inv + s.log()).exp();
+  const auto by_pow = flat_where(use_log, one, sum).pow(inv) * s;
+  return with_nan(flat_where(use_log, by_log, by_pow));
 }
 
 at::Tensor& vector_norm_out_pu1(const at::Tensor& self, const at::Scalar& ord, at::OptionalIntArrayRef dim,
