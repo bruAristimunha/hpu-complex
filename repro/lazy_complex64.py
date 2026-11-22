@@ -12,11 +12,10 @@ Demonstrates three modes:
   --mode guarded    : With hpu_complex.enable() in PT_HPU_LAZY_MODE=1:
       Real-only float32 lazy ops and the float-pair API (hpu_complex.rfft /
       hpu_complex.stft) pass cleanly, and complex64 / torch.fft.rfft /
-      torch.linalg.eig(float32) compute right: each complex64 storage holds
-      the Habana tensor it lives in, and the kernels read it through Habana's
-      own views of that tensor (no set_, unlike (b) above). What lazy mode
-      still refuses (complex64 under torch.inference_mode) raises a clean
-      RuntimeError (zero process aborts).
+      torch.linalg.eig(float32) / torch.inference_mode() / rank-5+ permuted
+      complex64 compute right: each complex64 storage holds the Habana tensor
+      it lives in, and the kernels read it through Habana's own views of that
+      tensor (no set_, unlike (b) above).
   --mode workaround : In eager mode (PT_HPU_LAZY_MODE=0) with hpu_complex:
       complex64 ops, torch.fft.rfft fwd+bwd, and torch.compile(backend="hpu_backend")
       on simple complex+FFT modules pass cleanly. (Note: compiled spd_learn.models.Green
@@ -187,14 +186,21 @@ def run_guarded() -> None:
                      else (got.cpu() - ref).abs().max())
         assert diff < 1e-4, (name, diff)
         print(f"[guarded] {name} computes in lazy mode: max_diff={diff:.1e}")
-    try:
-        with torch.inference_mode():
-            torch.fft.rfft(sig.to(hpu))
-    except RuntimeError as exc:
-        assert "PT_HPU_LAZY_MODE=0" in str(exc), str(exc)
-        print(f"[guarded] complex64 under inference_mode raised clean RuntimeError: {str(exc).splitlines()[0]}")
-    else:
-        raise AssertionError("Expected RuntimeError for complex64 under inference_mode in lazy mode")
+    with torch.inference_mode():
+        inf_h = torch.fft.rfft(sig.to(hpu))
+        htcore.mark_step()
+    inf_c = torch.fft.rfft(sig)
+    inf_diff = float((torch.view_as_real(inf_h.cpu()) - torch.view_as_real(inf_c)).abs().max())
+    assert inf_h.is_inference() and inf_diff < 1e-4, inf_diff
+    print(f"[guarded] rfft under inference_mode computes in lazy mode: max_diff={inf_diff:.1e}")
+
+    z5 = torch.randn(2, 3, 4, 5, 6, dtype=torch.complex64)
+    p5_h = z5.to(hpu).permute(0, 2, 1, 3, 4) * 2
+    htcore.mark_step()
+    p5_c = z5.permute(0, 2, 1, 3, 4) * 2
+    p5_diff = float((torch.view_as_real(p5_h.cpu()) - torch.view_as_real(p5_c)).abs().max())
+    assert p5_diff < 1e-4, p5_diff
+    print(f"[guarded] rank-5 permuted complex64 computes in lazy mode: max_diff={p5_diff:.1e}")
 
 
 def run_workaround() -> None:

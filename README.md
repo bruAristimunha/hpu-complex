@@ -270,10 +270,10 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
   there (and their views) are inference tensors, like the Habana tensors they live in, so autograd never tracks a
   view of an inference tensor (what made lazy mode refuse them before). A real HPU tensor times a complex scalar
   (`x * 2j`) under `torch.inference_mode` skips the autograd keys, so it is also taken at BackendSelect, below
-  autograd and above Habana's kernels (`hpu_complex/tests/inference_check.py`, one process per case). The guard
-  still refuses, with a clear `RuntimeError` instead of a failure deep in Habana, permuted complex64 tensors of
-  rank 5 or more at storage offset 0 (Habana's lazy graphs read their permute block wrong: errors up to 12; the same
-  layouts at an offset read right).
+  autograd and above Habana's kernels (`hpu_complex/tests/inference_check.py`, one process per case). Permuted
+  complex64 tensors of rank 5 or more at storage offset 0 also run in lazy mode: dense reads, copies, FFTs, matmuls
+  and in-place writes materialize or pack via rank-<=4 permute steps (`permute_low_rank`) or contiguous storage slices,
+  while `view_as_real` / `.real` / `view(float32)` return lazy `as_strided` views.
   The complex tensor holds a detached alias of the Habana tensor (`r.data = ...`, `r.resize_()` on the tensor given
   to `view_as_complex` do not retarget it; writes through either side reach the other); an `out=` resize keeps the
   storage, so views taken before see the result, as in eager mode. `z.untyped_storage().cpu()` raises Habana's
