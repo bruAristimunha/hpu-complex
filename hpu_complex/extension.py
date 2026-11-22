@@ -1,10 +1,12 @@
 """Build/load the C++ extension (first call compiles, then cached).
 
-Must run inside the Gaudi stack (habana torch fork): the extension
-registers kernels for the fork's c10::DispatchKey::HPU (entry points),
-AutogradHPU (the rfft backward), BackendSelect (complex factories) and
-PrivateUse1 (complex tensors). The build goes to torch's default
-extension directory (TORCH_EXTENSIONS_DIR, else ~/.cache/torch_extensions).
+Registers kernels for c10::DispatchKey::HPU (entry points: _fft_r2c,
+view_as_complex, view.dtype, complex, _neg_view), AutogradHPU (_fft_r2c and
+complex-scalar arithmetic), BackendSelect (complex factories and
+complex-scalar fallback), and PrivateUse1 (complex tensors). Builds against
+either the Gaudi stack or stock CPU PyTorch (used with a stub guard in the CPU
+test suite). The build goes to torch's extension directory
+(TORCH_EXTENSIONS_DIR, else ~/.cache/torch_extensions).
 """
 import pathlib
 

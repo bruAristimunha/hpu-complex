@@ -99,6 +99,21 @@ def _eager_for_host_inputs(gm, compiled):
     return run
 
 
+def _install(owner, name, make_wrapper):
+    """Wrap ``owner.name`` (or ``owner[name]``) once, marking the wrapper with ``hpu_complex = True``."""
+    is_dict = isinstance(owner, dict)
+    original = owner.get(name) if is_dict else getattr(owner, name, None)
+    if original is None or getattr(original, "hpu_complex", False):
+        return False
+    wrapper = make_wrapper(original)
+    wrapper.hpu_complex = True
+    if is_dict:
+        owner[name] = wrapper
+    else:
+        setattr(owner, name, wrapper)
+    return True
+
+
 def _complex128_graphs_run_eagerly():
     """torch.compile(backend="hpu_backend") of a graph holding complex128 values: the graph runs eagerly, whole.
 
@@ -111,21 +126,21 @@ def _complex128_graphs_run_eagerly():
     from torch._dynamo.backends import registry
 
     try:
-        original = registry.lookup_backend("hpu_backend")
+        registry.lookup_backend("hpu_backend")
     except Exception:  # noqa: BLE001 (InvalidBackend: Habana's backend is not registered)
         return
-    if getattr(original, "hpu_complex", False):
-        return
 
-    @functools.wraps(original)
-    def hpu_backend(gm, example_inputs, **kwargs):
-        _patch_hpu_ops_im2col()
-        if _holds_host_values(gm, example_inputs):
-            return gm.forward
-        return _eager_for_host_inputs(gm, original(gm, example_inputs, **kwargs))
+    def make_wrapper(original):
+        @functools.wraps(original)
+        def hpu_backend(gm, example_inputs, **kwargs):
+            _patch_hpu_ops_im2col()
+            if _holds_host_values(gm, example_inputs):
+                return gm.forward
+            return _eager_for_host_inputs(gm, original(gm, example_inputs, **kwargs))
 
-    hpu_backend.hpu_complex = True
-    registry._COMPILER_FNS["hpu_backend"] = hpu_backend
+        return hpu_backend
+
+    _install(registry._COMPILER_FNS, "hpu_backend", make_wrapper)
 
 
 def _fold_conj_of_python_scalars(gm):
@@ -429,25 +444,18 @@ def _complex_nodes_run_eagerly():
         warnings.warn("hpu_complex: Habana's torch.compile passes not found; complex nodes of "
                       "hpu_backend graphs are not forced to run eagerly")
         return
-    original = passes.is_eager_fallback_required
-    if getattr(original, "hpu_complex", False):
-        return
 
-    def is_eager_fallback_required(node, is_dynamic=False):
-        # A node that reads a float view of complex storage runs eagerly too, however long the view chain: the view
-        # can be strided (view_as_real of a diagonal in the qr backward, then select), and a fused graph misreads it
-        # (compiled qr gradient 0.3-0.7 off with no error, Gaudi2, bridge 1.21.4). Fresh float results of complex
-        # nodes (abs, angle) and of those eager readers stay fusable.
-        return _runs_eagerly(node) or original(node, is_dynamic=is_dynamic)
-
-    is_eager_fallback_required.hpu_complex = True
-    passes.is_eager_fallback_required = is_eager_fallback_required
+    # A node that reads a float view of complex storage runs eagerly too, however long the view chain: the view
+    # can be strided (view_as_real of a diagonal in the qr backward, then select), and a fused graph misreads it
+    # (compiled qr gradient 0.3-0.7 off with no error, Gaudi2, bridge 1.21.4). Fresh float results of complex
+    # nodes (abs, angle) and of those eager readers stay fusable.
+    _install(passes, "is_eager_fallback_required",
+             lambda original: lambda node, is_dynamic=False: _runs_eagerly(node) or original(node, is_dynamic=is_dynamic))
 
     # pass_mark_placement settles HPU-to-HPU _to_copy nodes (casts to or from complex) before it asks
     # the predicate above, so its placement of complex nodes is overruled afterwards. Their old placement
     # is dropped first: on a second run the pass asserts that it recomputes the stored one.
-    mark_placement = getattr(passes, "pass_mark_placement", None)
-    if mark_placement is not None:
+    def wrap_mark_placement(mark_placement):
         def pass_mark_placement(ctx):
             complex_nodes = [n for n in ctx.graph_module.graph.nodes
                              if n.op == "call_function" and _runs_eagerly(n)]
@@ -458,29 +466,31 @@ def _complex_nodes_run_eagerly():
                 node.meta["placement"] = "eager"
             return changed
 
-        passes.pass_mark_placement = pass_mark_placement
+        return pass_mark_placement
+
+    _install(passes, "pass_mark_placement", wrap_mark_placement)
 
     # pass_fuse_view_chains replaces a chain of views by one as_strided with the strides traced by the fake
     # tensors. For complex linalg outputs those differ from the real ones (torch's meta of linalg_eig gives
     # contiguous eigenvectors, the CPU kernel column-major ones), so the baked as_strided reads the matrix
     # transposed: compiled eig/eigvals gradients were wrong with no error. No chain starts at, or runs into, a view
     # touching complex storage: complex views, float views of it (V.real.mT) and float views feeding view(complex).
-    fuse_view_chains = getattr(passes, "pass_fuse_view_chains", None)
-    if fuse_view_chains is not None:
+    def wrap_fuse_view_chains(fuse_view_chains):
         def pass_fuse_view_chains(ctx):
             for node in ctx.graph_module.graph.nodes:
                 if node.op == "call_function" and _view_chain_reaches_complex(node):
                     node.meta["visited"] = True  # the pass starts no chain at a visited node
             return fuse_view_chains(ctx)
 
-        passes.pass_fuse_view_chains = pass_fuse_view_chains
+        return pass_fuse_view_chains
+
+    _install(passes, "pass_fuse_view_chains", wrap_fuse_view_chains)
 
     # pass_remove_unnecessary_bmm_view drops the views around a bmm, so the bmm takes the 4-D or 5-D tensors before
     # them (Synapse's bmm accepts those). A complex bmm runs eagerly on the extension's kernel, which takes 3-D only:
     # compiled z @ z.mT.conj() of a 4-D complex z raised "hpu_complex: bmm shapes [4, 10, 22, 137] @ ..." (Gaudi2,
     # bridge 1.21.4). The pass does not see complex bmm nodes.
-    remove_bmm_view = getattr(passes, "pass_remove_unnecessary_bmm_view", None)
-    if remove_bmm_view is not None:
+    def wrap_remove_bmm_view(remove_bmm_view):
         def pass_remove_unnecessary_bmm_view(ctx):
             import torch
 
@@ -498,7 +508,9 @@ def _complex_nodes_run_eagerly():
                     ctx.graph_module.recompile()
             return changed
 
-        passes.pass_remove_unnecessary_bmm_view = pass_remove_unnecessary_bmm_view
+        return pass_remove_unnecessary_bmm_view
+
+    _install(passes, "pass_remove_unnecessary_bmm_view", wrap_remove_bmm_view)
 
     _complex128_graphs_run_eagerly()
     _aot_graphs_keep_complex64_scalars()
@@ -508,9 +520,8 @@ def _complex_nodes_run_eagerly():
     except ImportError:
         return
     support = batch_as_strided.BatchAsStridedOperatorSupport
-    batchable = support.is_node_supported
-    support.is_node_supported = lambda self, submodules, node: (
-        not _runs_eagerly(node) and not _views_complex_storage(node) and batchable(self, submodules, node))
+    _install(support, "is_node_supported", lambda batchable: lambda self, submodules, node: (
+        not _runs_eagerly(node) and not _views_complex_storage(node) and batchable(self, submodules, node)))
 
 
 def _bridge_is_lazy():
@@ -563,27 +574,25 @@ def _pickle_complex128_through_the_cpu():
     """
     import torch
 
-    original = torch.Tensor._reduce_ex_internal
-    if getattr(original, "hpu_complex", False):
-        return
+    def make_wrapper(original):
+        def _reduce_ex_internal(self, proto):
+            if _host_backed(self):
+                # Its bytes as a latin-1 str, not a CPU tensor: torch.load(map_location="hpu") would restore a tensor's
+                # storage on the card, at float32 precision for float64; and weights_only=True accepts a str, not bytes.
+                # A dense layout (a transpose, channels_last) is kept: the bytes in memory order, with the strides.
+                values = self.detach().cpu().resolve_conj().resolve_neg()
+                if not _dense(values):
+                    values = values.contiguous()
+                flat = values.as_strided((values.numel(),), (1,), values.storage_offset())
+                raw = flat.view(torch.uint8).numpy().tobytes()  # bytes of any dtype (numpy has no bfloat16)
+                return (_rebuild_host_backed_from_cpu,
+                        (raw.decode("latin-1"), self.dtype, str(self.device), self.requires_grad,
+                         tuple(values.shape), tuple(values.stride())))
+            return original(self, proto)
 
-    def _reduce_ex_internal(self, proto):
-        if _host_backed(self):
-            # Its bytes as a latin-1 str, not a CPU tensor: torch.load(map_location="hpu") would restore a tensor's
-            # storage on the card, at float32 precision for float64; and weights_only=True accepts a str, not bytes.
-            # A dense layout (a transpose, channels_last) is kept: the bytes in memory order, with the strides.
-            values = self.detach().cpu().resolve_conj().resolve_neg()
-            if not _dense(values):
-                values = values.contiguous()
-            flat = values.as_strided((values.numel(),), (1,), values.storage_offset())
-            raw = flat.view(torch.uint8).numpy().tobytes()  # bytes of any dtype (numpy has no bfloat16)
-            return (_rebuild_host_backed_from_cpu,
-                    (raw.decode("latin-1"), self.dtype, str(self.device), self.requires_grad,
-                     tuple(values.shape), tuple(values.stride())))
-        return original(self, proto)
+        return _reduce_ex_internal
 
-    _reduce_ex_internal.hpu_complex = True
-    torch.Tensor._reduce_ex_internal = _reduce_ex_internal
+    _install(torch.Tensor, "_reduce_ex_internal", make_wrapper)
 
 
 _LEGACY_LOAD = threading.local()
@@ -598,21 +607,19 @@ def _legacy_load_sees_map_location():
 
     import torch.serialization as serialization
 
-    original = serialization._legacy_load
-    if getattr(original, "hpu_complex", False):
-        return
+    def make_wrapper(original):
+        @functools.wraps(original)
+        def _legacy_load(f, map_location, pickle_module, **pickle_load_args):
+            saved = getattr(_LEGACY_LOAD, "map_location", None)
+            _LEGACY_LOAD.map_location = map_location
+            try:
+                return original(f, map_location, pickle_module, **pickle_load_args)
+            finally:
+                _LEGACY_LOAD.map_location = saved
 
-    @functools.wraps(original)
-    def _legacy_load(f, map_location, pickle_module, **pickle_load_args):
-        saved = getattr(_LEGACY_LOAD, "map_location", None)
-        _LEGACY_LOAD.map_location = map_location
-        try:
-            return original(f, map_location, pickle_module, **pickle_load_args)
-        finally:
-            _LEGACY_LOAD.map_location = saved
+        return _legacy_load
 
-    _legacy_load.hpu_complex = True
-    serialization._legacy_load = _legacy_load
+    _install(serialization, "_legacy_load", make_wrapper)
 
 
 def _restore(device, data):
@@ -688,35 +695,33 @@ def _deepcopy_complex128_in_host_memory():
 
     import torch
 
-    original = torch.Tensor.__deepcopy__
-    if getattr(original, "hpu_complex", False):
-        return
+    def make_wrapper(original):
+        def __deepcopy__(self, memo):
+            if (type(self) is not torch.Tensor or not self.is_leaf or not _host_backed(self)
+                    or torch.overrides.has_torch_function_unary(self)):
+                return original(self, memo)
+            if id(self) in memo:
+                return memo[id(self)]
+            copies = memo.setdefault("hpu_complex", {})  # storage -> a copy over its copied storage
+            key = self.untyped_storage()._cdata
+            with torch.no_grad():
+                new = torch.ops.hpu_complex.host_deepcopy(self, copies.get(key))
+                copies.setdefault(key, new)
+                if self.is_conj():
+                    new = new.conj_physical()
+                if self.is_neg():
+                    new = new.neg()
+            if self.requires_grad:
+                new.requires_grad_()
+            if self.grad is not None:
+                new.grad = copy.deepcopy(self.grad, memo)
+            new.__dict__ = copy.deepcopy(self.__dict__, memo)
+            memo[id(self)] = new
+            return new
 
-    def __deepcopy__(self, memo):
-        if (type(self) is not torch.Tensor or not self.is_leaf or not _host_backed(self)
-                or torch.overrides.has_torch_function_unary(self)):
-            return original(self, memo)
-        if id(self) in memo:
-            return memo[id(self)]
-        copies = memo.setdefault("hpu_complex", {})  # storage -> a copy over its copied storage
-        key = self.untyped_storage()._cdata
-        with torch.no_grad():
-            new = torch.ops.hpu_complex.host_deepcopy(self, copies.get(key))
-            copies.setdefault(key, new)
-            if self.is_conj():
-                new = new.conj_physical()
-            if self.is_neg():
-                new = new.neg()
-        if self.requires_grad:
-            new.requires_grad_()
-        if self.grad is not None:
-            new.grad = copy.deepcopy(self.grad, memo)
-        new.__dict__ = copy.deepcopy(self.__dict__, memo)
-        memo[id(self)] = new
-        return new
+        return __deepcopy__
 
-    __deepcopy__.hpu_complex = True
-    torch.Tensor.__deepcopy__ = __deepcopy__
+    _install(torch.Tensor, "__deepcopy__", make_wrapper)
 
 
 try:  # at import: no torch here is fine (enable() needs it anyway)

@@ -63,17 +63,17 @@ class ComplexMode(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         if func is aten._fft_r2c.default and FFT_R2C_HOOK is not None:
-            for _attempt in (1, 2):
+            out = None
+            for _ in range(2):
                 try:
                     out = FFT_R2C_HOOK(*args)
-                    if out is not None:
-                        return out
                     break
                 except Exception:
                     # First graph compile after a custom-kernel graph can
                     # fail once on this stack; retry, then fall back.
-                    if _attempt == 2:
-                        pass
+                    out = None
+            if out is not None:
+                return out
             # fall through to the GEMM path on None/failure
         from torch.utils._python_dispatch import _disable_current_modes
 
@@ -101,19 +101,14 @@ class ComplexMode(TorchDispatchMode):
                 kwargs.get("rounding_mode") is None:
             ref = args[0] if isinstance(args[0], torch.Tensor) else args[1]
             return _div(_operand(args[0], ref), _operand(args[1], ref))
-        if func in (aten.add.Tensor, aten.add.Scalar):
+        if func in (aten.add.Tensor, aten.add.Scalar, aten.sub.Tensor, aten.sub.Scalar):
             ref = args[0] if isinstance(args[0], torch.Tensor) else args[1]
             a, b = _operand(args[0], ref), _operand(args[1], ref)
-            alpha = args[2] if len(args) > 2 and func is aten.add.Tensor \
-                else kwargs.get("alpha", 1)
-            pair = _pair(a) + _pair(b) * alpha
-            return torch.view_as_complex(pair.contiguous())
-        if func in (aten.sub.Tensor, aten.sub.Scalar):
-            ref = args[0] if isinstance(args[0], torch.Tensor) else args[1]
-            a, b = _operand(args[0], ref), _operand(args[1], ref)
-            alpha = args[2] if len(args) > 2 and func is aten.sub.Tensor \
-                else kwargs.get("alpha", 1)
-            pair = _pair(a) - _pair(b) * alpha
+            is_add = func in (aten.add.Tensor, aten.add.Scalar)
+            tensor_op = aten.add.Tensor if is_add else aten.sub.Tensor
+            alpha = args[2] if len(args) > 2 and func is tensor_op else kwargs.get("alpha", 1)
+            sign = 1 if is_add else -1
+            pair = _pair(a) + _pair(b) * (alpha * sign)
             return torch.view_as_complex(pair.contiguous())
         if func is aten.neg.default:
             pair = torch.view_as_real(args[0])

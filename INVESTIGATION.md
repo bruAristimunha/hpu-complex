@@ -56,7 +56,7 @@ complex *data type* is blocked, and only in Intel's closed compiler.
 |---|---|---|---|---|
 | R1. Float shim package (`hpu_fft.py`, done) | Us, today | Days | Correct on-device FFT/STFT now, eager + compile, autograd | Returns float `[...,2]`, not `complex64` — call sites change. Unfused, no plan cache. |
 | R2. Bridge decomposition (fork) | Us (fork only) | Weeks | Unmodified `torch.compile` graphs produce FFT on HPU; optional slice makes real `complex64` tensors exist via `view_as_real` | Never merges upstream (CONTRIBUTING.md). Same unfused perf. |
-| R3. Custom TPC FFT kernel | Us | Weeks–months | Fused fast FFT via official `registerUserCustomOp` + `GC_KERNEL_PATH` plugin (eager/lazy/compile proven pattern in `tests/user_custom_op/`) | Still float-pair API, own namespace `custom_op::` — not `torch.fft`. |
+| R3. Custom TPC FFT kernel | Us | Weeks–months | Fused fast FFT via official `registerUserCustomOp` + `GC_KERNEL_PATH` plugin (eager/lazy/compile proven pattern in `HabanaAI/gaudi-pytorch-bridge` `tests/user_custom_op/`) | Still float-pair API, own namespace `custom_op::` — not `torch.fft`. |
 | R4. Native support | **Intel only** | Roadmap | True parity with cuFFT: `complex64`, unmodified `torch.fft`, vendor FFT guid | The only competitive-performance route. |
 | R5. CPU fallback (today) | — | 0 | Correct results | Host copies dominate; cards idle. |
 
@@ -83,7 +83,7 @@ claim is **true**: we can ship correct, fast-enough on-device FFT today
    Rationale: the allocator is byte-based — a complex tensor can *exist*
    as interleaved float storage and be `view_as_real`'d before any
    Synapse compute. No `synDataType` change needed for this slice.
-5. Tests: `tests/pytest_working/{eager,lazy,compile}/test_fft*.py` vs CPU
+5. Tests (in `HabanaAI/gaudi-pytorch-bridge`): `tests/pytest_working/{eager,lazy,compile}/test_fft*.py` vs CPU
    `torch.fft`; update `tests/pytest_working/lazy/test_complex.py` which
    currently asserts the CPU-device result.
 
