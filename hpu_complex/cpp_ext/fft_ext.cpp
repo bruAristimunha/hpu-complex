@@ -2822,13 +2822,13 @@ at::Tensor col2im_pu1(const at::Tensor& self, c10::IntArrayRef output_size, c10:
     if (w == 1 && kw == 1) {
       auto t = pair.reshape({n * c, kh, oh, 2}).transpose(1, 2).contiguous().reshape({n * c, oh * kh, 1, 2});
       if (h > oh * kh) {
-        t = at::constant_pad_nd(t.permute({0, 3, 1, 2}), {0, 0, 0, h - oh * kh}).permute({0, 2, 3, 1}).contiguous();
+        t = at::cat({t, at::zeros({n * c, h - oh * kh, 1, 2}, t.options())}, 1);
       }
       res_pair = t;
     } else {
       auto t = pair.reshape({n * c, kw, ow, 2}).transpose(1, 2).contiguous().reshape({n * c, 1, ow * kw, 2});
       if (w > ow * kw) {
-        t = at::constant_pad_nd(t.permute({0, 3, 1, 2}), {0, w - ow * kw, 0, 0}).permute({0, 2, 3, 1}).contiguous();
+        t = at::cat({t, at::zeros({n * c, 1, w - ow * kw, 2}, t.options())}, 2);
       }
       res_pair = t;
     }

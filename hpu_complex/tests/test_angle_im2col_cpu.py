@@ -100,7 +100,9 @@ def test_eq_scalar_out_complex64(scalar):
 @pytest.mark.parametrize("shape,k,d,p,s", [
     # Tier 1 fast paths: (W==1, kw==1) and (H==1, kh==1), exact & remainder crop
     ((2, 3, 6, 1), (2, 1), (1, 1), (0, 0), (2, 1)),
+    ((2, 3, 7, 1), (2, 1), (1, 1), (0, 0), (2, 1)),
     ((2, 3, 7, 1), (3, 1), (1, 1), (0, 0), (3, 1)),
+    ((2, 3, 1, 7), (1, 2), (1, 1), (0, 0), (1, 2)),
     ((2, 3, 1, 8), (1, 4), (1, 1), (0, 0), (1, 4)),
     ((3, 1, 7), (1, 3), (1, 1), (0, 0), (1, 3)),  # 3-D unbatched Tier 1
     # Tier 2 general paths: padding, dilation, overlap, non-square, 3-D unbatched, empty batch
@@ -141,7 +143,9 @@ def test_im2col_fwd_bwd_and_inference(shape, k, d, p, s, dtype):
 
 @pytest.mark.parametrize("out_size,k,d,p,s,batched", [
     ((6, 1), (2, 1), (1, 1), (0, 0), (2, 1), True),
+    ((7, 1), (2, 1), (1, 1), (0, 0), (2, 1), True),
     ((7, 1), (3, 1), (1, 1), (0, 0), (3, 1), True),
+    ((1, 7), (1, 2), (1, 1), (0, 0), (1, 2), True),
     ((1, 9), (1, 4), (1, 1), (0, 0), (1, 4), False),
     ((5, 6), (2, 3), (1, 1), (1, 1), (1, 2), True),
     ((7, 7), (3, 2), (2, 1), (1, 2), (2, 1), False),

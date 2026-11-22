@@ -112,7 +112,13 @@ def _slogdet_phase(res):
 def _svd_gauge_free(res):
     U, S, Vh = res
     k = S.shape[-1]
-    return (U[..., :k] * S.unsqueeze(-2)) @ Vh[..., :k, :], S
+    if U.shape[-1] != k:
+        er = torch.eye(U.shape[-1], k, device=S.device, dtype=S.dtype)
+        U = U @ torch.complex(er, torch.zeros_like(er))
+    if Vh.shape[-2] != k:
+        er = torch.eye(k, Vh.shape[-2], device=S.device, dtype=S.dtype)
+        Vh = torch.complex(er, torch.zeros_like(er)) @ Vh
+    return (U * S.unsqueeze(-2)) @ Vh, S
 
 
 def _qr_gauge_free(qr):
@@ -136,7 +142,7 @@ def _herm(b, n, seed):
 
 def _gauge_free(wv):
     w, V = wv
-    return w, V.abs() ** 2
+    return w, V.real.square() + V.imag.square()
 
 
 def loss_of(out):
@@ -159,22 +165,31 @@ def run(f, inputs, grad):
 
 def time_calls(f, inputs, grad, reps):
     xs = [x.clone().requires_grad_(grad) for x in inputs]
-    keep = []
+    keep = [] if not LAZY else None
 
     def once():
+        nonlocal keep
         out = f(*xs)
         if grad:
             g = torch.autograd.grad(loss_of(out), xs)
-            keep.append(g)
-        keep.append(out)
+            val = (out, g)
+        else:
+            val = out
+        if LAZY:
+            keep = val
+            sync()
+        else:
+            keep.append(val)
 
     for _ in range(3):
         once()
-    sync()
+    if not LAZY:
+        sync()
     t = time.perf_counter()
     for _ in range(reps):
         once()
-    sync()
+    if not LAZY:
+        sync()
     return (time.perf_counter() - t) / reps * 1e3
 
 
@@ -200,6 +215,7 @@ def main():
     import hpu_complex.linalg as L
 
     hpu_complex.enable()
+    hpu_complex.set_matmul_cpu_threshold(0)
     ext = torch.ops.hpu_complex
     failed = 0
     wanted = set(filter(None, args.ops.split(",")))
@@ -240,12 +256,16 @@ def main():
                             with warnings.catch_warnings():
                                 warnings.simplefilter("ignore")
                                 times[f"{label}_fwd"].append(time_calls(f, hin, False, args.reps))
-                                times[f"{label}_fwd_bwd"].append(time_calls(f, hin, True, args.reps))
-                    row["ms_median"] = {k: round(statistics.median(v), 3) for k, v in times.items()}
+                                # Habana's native Lazy cpu_route backward crashes strided_insert on left=False solve & SVD U/Vh.
+                                if not (LAZY and label == "cpu_route" and (
+                                        name == "solve_left_false" or (name.startswith("svd") and name != "svdvals"))):
+                                    times[f"{label}_fwd_bwd"].append(time_calls(f, hin, True, args.reps))
+                    row["ms_median"] = {k: (round(statistics.median(v), 3) if v else None) for k, v in times.items()}
                     row["ms_all"] = {k: [round(x, 3) for x in v] for k, v in times.items()}
                     row["speedup_fwd"] = round(row["ms_median"]["cpu_route_fwd"] / row["ms_median"]["card_fwd"], 2)
-                    row["speedup_fwd_bwd"] = round(row["ms_median"]["cpu_route_fwd_bwd"]
-                                                   / row["ms_median"]["card_fwd_bwd"], 2)
+                    row["speedup_fwd_bwd"] = (round(row["ms_median"]["cpu_route_fwd_bwd"]
+                                                    / row["ms_median"]["card_fwd_bwd"], 2)
+                                              if row["ms_median"]["cpu_route_fwd_bwd"] is not None else None)
                 L.install()
                 row["status"] = "ok" if ok else "wrong"
             except Exception as e:  # noqa: BLE001  (the failure is the result)

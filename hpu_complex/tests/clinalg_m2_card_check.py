@@ -305,11 +305,18 @@ def main():
 
     check("g10_angle_fwd_bwd_out_eq0", test_g10_angle)
 
-    # 7. G11/G16: im2col (Tier-1 non-overlap & Tier-2 overlapping dilated/padded) + col2im fwd + bwd
+    # 7. G11/G16: im2col (Tier-1 exact & remainder crop + Tier-2 overlapping dilated/padded) + col2im fwd + bwd
     def test_g11_g16_im2col_col2im():
         errs = []
-        for kw, stride, pad, dil in ((2, 2, 0, 1), (3, 1, 1, 2)):
-            x0 = rand(2, 3, 7, 6, seed=30 + kw)
+        cases = [
+            ((2, 3, 7, 6), (2, 2), (2, 2), (0, 0), (1, 1)),
+            ((2, 3, 7, 6), (3, 3), (1, 1), (1, 1), (2, 2)),
+            ((2, 3, 7, 1), (2, 1), (2, 1), (0, 0), (1, 1)),
+            ((2, 3, 1, 7), (1, 2), (1, 2), (0, 0), (1, 1)),
+        ]
+        for idx, (shape, kw, stride, pad, dil) in enumerate(cases):
+            out_hw = shape[-2:]
+            x0 = rand(*shape, seed=30 + idx)
             xc = x0.clone().requires_grad_()
             xh = x0.to(C64).to(HPU).requires_grad_()
             yc = F.unfold(xc, kernel_size=kw, stride=stride, padding=pad, dilation=dil)
@@ -318,52 +325,88 @@ def main():
             (yh.abs() ** 2).sum().backward()
             errs.append(rel(to_cpu(yh), yc))
             errs.append(rel(to_cpu(xh.grad), xc.grad))
-            # Fold (col2im) fwd + bwd
-            fc_in = yc.detach().clone().requires_grad_()
-            fh_in = yh.detach().clone().requires_grad_()
-            fc = F.fold(fc_in, (7, 6), kernel_size=kw, stride=stride, padding=pad, dilation=dil)
-            fh = F.fold(fh_in, (7, 6), kernel_size=kw, stride=stride, padding=pad, dilation=dil)
-            (fc.abs() ** 2).sum().backward()
-            (fh.abs() ** 2).sum().backward()
-            errs.append(rel(to_cpu(fh), fc))
-            errs.append(rel(to_cpu(fh_in.grad), fc_in.grad))
+            # Fold (col2im) fwd + bwd (conj=False and conj=True)
+            for conj in (False, True):
+                fc_base = yc.detach().conj() if conj else yc.detach()
+                fh_base = yh.detach().conj() if conj else yh.detach()
+                fc_in = fc_base.clone().requires_grad_()
+                fh_in = fh_base.clone().requires_grad_()
+                fc = F.fold(fc_in, out_hw, kernel_size=kw, stride=stride, padding=pad, dilation=dil)
+                fh = F.fold(fh_in, out_hw, kernel_size=kw, stride=stride, padding=pad, dilation=dil)
+                (fc.abs() ** 2).sum().backward()
+                (fh.abs() ** 2).sum().backward()
+                errs.append(rel(to_cpu(fh), fc))
+                errs.append(rel(to_cpu(fh_in.grad), fc_in.grad))
         return max(errs) < 1e-5, max(errs)
 
     check("g11_g16_im2col_col2im", test_g11_g16_im2col_col2im)
 
-    # 8. Eager mode only: torch.compile(backend="hpu_backend") on new ops
+    # 8. Eager mode only: torch.compile(backend="hpu_backend") on new ops (steady-state step2 zero fallback)
     if not LAZY:
-        def test_compile_m2():
-            g = torch.Generator().manual_seed(41)
-            A0 = torch.randn(4, 6, 6, dtype=C64, generator=g)
-            H0 = A0 @ A0.mH / 6 + torch.eye(6, dtype=C64)
-            R0 = torch.randn(4, 6, 4, dtype=C64, generator=g)
-            img0 = torch.randn(2, 2, 6, 6, dtype=C64, generator=g)
-
-            def fn(A, H, R, img):
-                return (
-                    torch.linalg.det(A).abs().sum()
-                    + torch.linalg.slogdet(A).logabsdet.sum()
-                    + torch.linalg.eigh(H).eigenvalues.sum()
-                    + torch.linalg.eigvalsh(H, UPLO="U").sum()
-                    + torch.linalg.svd(R, full_matrices=False).S.sum()
-                    + torch.linalg.svdvals(R).sum()
-                    + torch.angle(A).sum()
-                    + F.unfold(img, kernel_size=3, padding=1).abs().sum()
-                )
-
+        def check_compiled_steady(name, fn, inputs, check_zero_fb=True):
             cfn = torch.compile(fn, backend="hpu_backend")
-            ins_e = [t.to(HPU).requires_grad_() for t in (A0, H0, R0, img0)]
-            le = fn(*ins_e)
-            le.backward()
-            ins_c = [t.to(HPU).requires_grad_() for t in (A0, H0, R0, img0)]
-            lc = cfn(*ins_c)
-            lc.backward()
-            err = abs(le.item() - lc.item()) / max(abs(le.item()), 1e-30)
-            gerr = max(rel(c.grad, e.grad.cpu()) for c, e in zip(ins_c, ins_e))
-            return max(err, gerr) < 1e-4, max(err, gerr)
+            # Step 1 warmup (triggers dynamo/AOT compilation)
+            w_ins = [t.to(HPU).requires_grad_() for t in inputs]
+            cfn(*w_ins).backward()
+            torch.hpu.synchronize()
 
-        check("torch_compile_m2", test_compile_m2, check_zero_fb=False)
+            def run_step2():
+                ins_e = [t.to(HPU).requires_grad_() for t in inputs]
+                le = fn(*ins_e)
+                le.backward()
+                ins_c = [t.to(HPU).requires_grad_() for t in inputs]
+                lc = cfn(*ins_c)
+                lc.backward()
+                torch.hpu.synchronize()
+                err = abs(le.item() - lc.item()) / max(abs(le.item()), 1e-30)
+                gerr = max(rel(c.grad, e.grad.cpu()) for c, e in zip(ins_c, ins_e))
+                return max(err, gerr) < 1e-4, max(err, gerr)
+
+            check(name, run_step2, check_zero_fb=check_zero_fb)
+
+        g = torch.Generator().manual_seed(41)
+        A0 = torch.randn(4, 6, 6, dtype=C64, generator=g)
+        H0 = A0 @ A0.mH / 6 + torch.eye(6, dtype=C64)
+        R0 = torch.randn(4, 6, 4, dtype=C64, generator=g)
+        img_t2 = torch.randn(2, 2, 6, 6, dtype=C64, generator=g)
+        img_t1 = torch.randn(2, 3, 7, 1, dtype=C64, generator=g)
+        col_t1 = torch.randn(2, 6, 3, dtype=C64, generator=g)
+        col_t2 = torch.randn(2, 18, 36, dtype=C64, generator=g)
+
+        check_compiled_steady(
+            "torch_compile_m2_angle",
+            lambda A: torch.angle(A).sum(),
+            (A0,),
+            check_zero_fb=True,
+        )
+        check_compiled_steady(
+            "torch_compile_m2_unfold_fold",
+            lambda i1, i2, c1, c2: (
+                F.unfold(i1, kernel_size=(2, 1), stride=(2, 1)).abs().sum()
+                + F.unfold(i2, kernel_size=3, padding=1).abs().sum()
+                + F.fold(c1, (7, 1), kernel_size=(2, 1), stride=(2, 1)).abs().sum()
+                + F.fold(c2, (6, 6), kernel_size=3, padding=1).abs().sum()
+            ),
+            (img_t1, img_t2, col_t1, col_t2),
+            check_zero_fb=True,
+        )
+        check_compiled_steady(
+            "torch_compile_m2_linalg",
+            lambda H, R: (
+                torch.linalg.eigh(H).eigenvalues.sum()
+                + torch.linalg.eigvalsh(H, UPLO="U").sum()
+                + torch.linalg.svd(R, full_matrices=False).S.sum()
+                + torch.linalg.svdvals(R).sum()
+            ),
+            (H0, R0),
+            check_zero_fb=True,
+        )
+        check_compiled_steady(
+            "torch_compile_m2_det_slogdet",
+            lambda A: torch.linalg.det(A).abs().sum() + torch.linalg.slogdet(A).logabsdet.sum(),
+            (A0,),
+            check_zero_fb=False,
+        )
 
     failed = sum(r["status"] != "ok" for r in results)
     return 1 if failed else 0

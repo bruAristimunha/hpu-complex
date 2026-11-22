@@ -955,20 +955,33 @@ def eigvalsh(A, UPLO="L"):
 
 def _complete_orthogonal(Q, rows=False):
     """Complete orthonormal columns of Q (..., d, k) (or rows (..., k, d) if rows=True) to (..., d, d)."""
+    lazy = Q.device.type == "hpu" and _lazy()
+    if lazy:
+        import habana_frameworks.torch.core as htcore
+
+        htcore.mark_step()
     cl = _complex_linalg()
     if rows:
         k, d = Q.shape[-2], Q.shape[-1]
         pr, pi = _pair(-_cmatmul(Q.mH, Q))
         P = _complex(pr + torch.eye(d, dtype=torch.float32, device=Q.device), pi)
         Up, _, _ = cl.svd(P, full_matrices=False)
-        V_null = _as_complex(Up)[..., :, : d - k]
-        return torch.cat([Q, V_null.mH], -2)
-    d, k = Q.shape[-2], Q.shape[-1]
-    pr, pi = _pair(-_cmatmul(Q, Q.mH))
-    P = _complex(pr + torch.eye(d, dtype=torch.float32, device=Q.device), pi)
-    Up, _, _ = cl.svd(P, full_matrices=False)
-    U_null = _as_complex(Up)[..., :, : d - k]
-    return torch.cat([Q, U_null], -1)
+        if lazy:
+            htcore.mark_step()
+        V_null = _as_complex(Up)[..., :, : d - k].mH
+        out = torch.cat([Q, V_null.contiguous() if lazy else V_null], -2)
+    else:
+        d, k = Q.shape[-2], Q.shape[-1]
+        pr, pi = _pair(-_cmatmul(Q, Q.mH))
+        P = _complex(pr + torch.eye(d, dtype=torch.float32, device=Q.device), pi)
+        Up, _, _ = cl.svd(P, full_matrices=False)
+        if lazy:
+            htcore.mark_step()
+        U_null = _as_complex(Up)[..., :, : d - k]
+        out = torch.cat([Q, U_null.contiguous() if lazy else U_null], -1)
+    if lazy:
+        htcore.mark_step()
+    return out
 
 
 class _Svd(torch.autograd.Function):

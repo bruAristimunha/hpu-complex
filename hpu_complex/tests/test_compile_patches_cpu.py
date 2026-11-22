@@ -439,3 +439,77 @@ def test_python_partitioner_is_thread_safe_and_handles_reimported_compilers(monk
         t.join()
     assert observed == [("enter", False), ("enter", False), ("inside", False), ("inside", False)]
     assert config.use_cpp_partitioner is True
+
+
+def test_complex_im2col_col2im_decomps_are_preserved(monkeypatch):
+    """G16: complex im2col/col2im skip AOT decomposition so pass_mark_placement keeps them eager on im2col_pu1/col2im_pu1,
+    while float im2col/col2im still decompose normally."""
+    import torch.nn.functional as F
+    from functorch.compile import aot_function
+    from torch._decomp import core_aten_decompositions
+
+    core = dict(core_aten_decompositions())
+    decomposition = types.ModuleType("decomposition")
+    decomposition.hpu_backend_decompositions_common = dict(core)
+    decomposition.get_hpu_decompositions = lambda: dict(decomposition.hpu_backend_decompositions_common)
+
+    backends = types.ModuleType("backends")
+    backends.get_hpu_decompositions = decomposition.get_hpu_decompositions
+    config = types.ModuleType("config")
+    config.use_cpp_partitioner = True
+
+    names = ["habana_frameworks", "habana_frameworks.torch", "habana_frameworks.torch.dynamo",
+             "habana_frameworks.torch.dynamo.compile_backend"]
+    for name in names:
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    pkg = sys.modules["habana_frameworks.torch.dynamo.compile_backend"]
+    pkg.backends, pkg.config, pkg.decomposition = backends, config, decomposition
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch.dynamo.compile_backend.backends", backends)
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch.dynamo.compile_backend.config", config)
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch.dynamo.compile_backend.decomposition", decomposition)
+
+    hpu_complex._aot_graphs_keep_complex64_scalars()
+    wrapped_fn = backends.get_hpu_decompositions
+    hpu_complex._preserve_complex_im2col_decomps()
+    assert backends.get_hpu_decompositions is wrapped_fn  # idempotent
+
+    seen = {"fw": [], "bw": []}
+
+    def capture(tag):
+        def compiler(gm, example_inputs):
+            seen[tag].append([n.target for n in gm.graph.nodes if n.op == "call_function"])
+            return gm.forward
+
+        return compiler
+
+    def fn(t):
+        return F.unfold(t, (3, 3), padding=1).abs().sum()
+
+    z = torch.randn(2, 3, 6, 6, dtype=torch.complex64, requires_grad=True)
+    aot_function(fn, fw_compiler=capture("fw"), bw_compiler=capture("bw"),
+                 decompositions=backends.get_hpu_decompositions())(z).backward()
+    assert torch.ops.aten.im2col.default in seen["fw"][0]
+    assert torch.ops.aten.col2im.default in seen["bw"][0]
+
+    seen["fw"].clear()
+    seen["bw"].clear()
+    x = torch.randn(2, 3, 6, 6, dtype=torch.float32, requires_grad=True)
+    aot_function(fn, fw_compiler=capture("fw"), bw_compiler=capture("bw"),
+                 decompositions=backends.get_hpu_decompositions())(x).backward()
+    assert torch.ops.aten.im2col.default not in seen["fw"][0]
+    assert torch.ops.aten.col2im.default not in seen["bw"][0]
+
+
+def test_patch_hpu_ops_im2col_declines_complex(monkeypatch):
+    """When hpu_ops.im2col is loaded, _patch_hpu_ops_im2col makes _valid_im2col/_valid_col2im return False on complex
+    tensors while preserving float behavior."""
+    fake_mod = types.ModuleType("hpu_ops.im2col")
+    fake_mod._valid_im2col = lambda self, *a: True
+    fake_mod._valid_col2im = lambda self, *a: True
+    monkeypatch.setitem(sys.modules, "hpu_ops.im2col", fake_mod)
+    hpu_complex._patch_hpu_ops_im2col()
+    assert getattr(fake_mod, "_hpu_complex_patched", False)
+    z = torch.randn(1, 2, 4, 4, dtype=torch.complex64)
+    x = torch.randn(1, 2, 4, 4, dtype=torch.float32)
+    assert fake_mod._valid_im2col(z) is False and fake_mod._valid_col2im(z) is False
+    assert fake_mod._valid_im2col(x) is True and fake_mod._valid_col2im(x) is True

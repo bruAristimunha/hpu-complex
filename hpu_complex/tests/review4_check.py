@@ -228,13 +228,53 @@ check("m copy_ full self-overlap / disjoint as on the CPU", lambda: max(
     err((lambda b: (b.copy_(b), b)[1])(cplx(10).to(hpu)), cplx(10)),
     err((lambda b: (b[5:].copy_(b[:5]), b)[1])(cplx(10).to(hpu)), (lambda b: (b[5:].copy_(b[:5]), b)[1])(cplx(10)))))
 
-for compiled in (False, True):
-    tag = "compiled" if compiled else "eager   "
-    check(f"m2 {tag} angle(z) fwd+bwd (rel)",
-          lambda c=compiled: fwd_bwd_err(lambda t: torch.angle(t) + (t.abs() * 0), _z, c), 1e-5)
-    check(f"m2 {tag} F.unfold(z) fwd+bwd (rel)",
-          lambda c=compiled: fwd_bwd_err(
-              lambda t: torch.nn.functional.unfold(t.unsqueeze(1), (2, 2), padding=1).abs(), _z, c), 1e-5)
+def compiled_zero_fb_err(f, x):
+    """Compiled f(x) fwd+bwd after 1 warmup step: steady-state step2 must have 0 hpu_complex CPU fallbacks/warnings."""
+    torch._dynamo.reset()
+    fh = torch.compile(f, backend="hpu_backend")
+    ext = torch.ops.hpu_complex
+
+    # Step 1: warmup compile (no index/index_put fallback allowed)
+    xw = x.to(hpu).requires_grad_()
+    with warnings.catch_warnings(record=True) as w1:
+        warnings.simplefilter("always")
+        yw = fh(xw)
+        yw.backward(torch.ones_like(yw))
+        torch.hpu.synchronize()
+    bad_w1 = [str(w.message) for w in w1 if "runs on the CPU" in str(w.message)
+              and any(k in str(w.message) for k in ("index", "gather", "scatter_add"))]
+    assert not bad_w1, f"im2col/col2im decomposed into CPU fallback on warmup: {bad_w1}"
+
+    # Step 2: steady-state check
+    xc = x.clone().requires_grad_()
+    xh = x.to(hpu).requires_grad_()
+    yc = f(xc)
+    yc.backward(torch.ones_like(yc))
+    ext0 = ext.cpu_fallback_calls()
+    with warnings.catch_warnings(record=True) as w2:
+        warnings.simplefilter("always")
+        yh = fh(xh)
+        yh.backward(torch.ones_like(yh))
+        torch.hpu.synchronize()
+    ext_delta = ext.cpu_fallback_calls() - ext0
+    warns2 = [str(w.message)[:90] for w in w2 if "runs on the CPU" in str(w.message)]
+    assert ext_delta == 0 and not warns2, f"steady-state compiled CPU fallback: delta={ext_delta}, warns={warns2}"
+    return max(err(g, r) / max(r.detach().abs().max().item(), 1e-30) for g, r in ((yh, yc), (xh.grad, xc.grad)))
+
+
+check("m2 eager    angle(z) fwd+bwd (rel)",
+      lambda: fwd_bwd_err(lambda t: torch.angle(t) + (t.abs() * 0), _z, False), 1e-5)
+check("m2 compiled angle(z) fwd+bwd (rel, zero-fb)",
+      lambda: compiled_zero_fb_err(lambda t: torch.angle(t) + (t.abs() * 0), _z), 1e-5)
+check("m2 eager    F.unfold(z) Tier-2 fwd+bwd (rel)",
+      lambda: fwd_bwd_err(lambda t: torch.nn.functional.unfold(t.unsqueeze(1), (2, 2), padding=1).abs(), _z, False),
+      1e-5)
+check("m2 compiled F.unfold(z) Tier-2 fwd+bwd (rel, zero-fb)",
+      lambda: compiled_zero_fb_err(
+          lambda t: torch.nn.functional.unfold(t.unsqueeze(1), (2, 2), padding=1).abs(), _z), 1e-5)
+check("m2 compiled F.unfold(z) Tier-1 fwd+bwd (rel, zero-fb)",
+      lambda: compiled_zero_fb_err(
+          lambda t: torch.nn.functional.unfold(t[:, :, :1].unsqueeze(1), (2, 1), stride=(2, 1)).abs(), _z), 1e-5)
 
 passed = sum(results)
 print(f"REVIEW4_CHECK {passed}/{len(results)} passed", flush=True)
