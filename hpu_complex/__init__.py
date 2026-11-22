@@ -11,6 +11,7 @@ enable() is safe to call anywhere: without a Gaudi it does nothing.
 hpu_complex.rfft/irfft/fft/stft (the _core module) are a separate,
 device-agnostic float API on [..., 2] pairs.
 """
+import contextlib
 import importlib.util
 import math
 import os
@@ -165,6 +166,31 @@ def _fold_conj_of_python_scalars(gm):
     return True
 
 
+_PARTITIONER_LOCK = threading.Lock()
+_PARTITIONER_DEPTH = 0
+_PARTITIONER_SAVED = None
+
+
+@contextlib.contextmanager
+def _python_partitioner(hpu_config):
+    """Hold ``hpu_config.use_cpp_partitioner = False`` across concurrent AOT graph compilations."""
+    global _PARTITIONER_DEPTH, _PARTITIONER_SAVED
+    with _PARTITIONER_LOCK:
+        if _PARTITIONER_DEPTH == 0 and hasattr(hpu_config, "use_cpp_partitioner"):
+            _PARTITIONER_SAVED = hpu_config.use_cpp_partitioner
+            if _PARTITIONER_SAVED:
+                hpu_config.use_cpp_partitioner = False
+        _PARTITIONER_DEPTH += 1
+    try:
+        yield
+    finally:
+        with _PARTITIONER_LOCK:
+            _PARTITIONER_DEPTH -= 1
+            if _PARTITIONER_DEPTH == 0 and _PARTITIONER_SAVED is not None:
+                hpu_config.use_cpp_partitioner = _PARTITIONER_SAVED
+                _PARTITIONER_SAVED = None
+
+
 def _aot_graphs_keep_complex64_scalars():
     """hpu_backend's forward, backward and inference graphs (after AOT autograd).
 
@@ -189,23 +215,47 @@ def _aot_graphs_keep_complex64_scalars():
         backends.import_compilers()
 
     def wrap(compiler):
+        if getattr(compiler, "_hpu_complex_wrapped", False):
+            return compiler
+
         def compile_graph(gm, example_inputs, *args, **kwargs):
             _fold_conj_of_python_scalars(gm)
             if _holds_host_values(gm, example_inputs):
                 from functorch.compile import make_boxed_func
 
                 return make_boxed_func(gm.forward)  # AOT calls its compiled graphs with a boxed list
-            if getattr(hpu_config, "use_cpp_partitioner", False) and any(
-                    n.op == "call_function" and _runs_eagerly(n) for n in gm.graph.nodes):
-                with hpu_config.patch(use_cpp_partitioner=False):
+            if any(n.op == "call_function" and _runs_eagerly(n) for n in gm.graph.nodes):
+                with _python_partitioner(hpu_config):
                     return compiler(gm, example_inputs, *args, **kwargs)
             return compiler(gm, example_inputs, *args, **kwargs)
 
+        compile_graph._hpu_complex_wrapped = True
         return compile_graph
 
-    for name in ("hpu_training_compiler_fw", "hpu_training_compiler_bw", "hpu_inference_compiler"):
-        if callable(getattr(backends, name, None)):
-            setattr(backends, name, wrap(getattr(backends, name)))
+    names = ("hpu_training_compiler_fw", "hpu_training_compiler_bw", "hpu_inference_compiler")
+
+    def wrap_targets():
+        for name in names:
+            if callable(getattr(backends, name, None)):
+                setattr(backends, name, wrap(getattr(backends, name)))
+        try:
+            from habana_frameworks.torch.dynamo.compile_backend import compilers as hpu_compilers
+        except ImportError:
+            hpu_compilers = None
+        if hpu_compilers is not None:
+            for name in names:
+                if callable(getattr(hpu_compilers, name, None)):
+                    setattr(hpu_compilers, name, wrap(getattr(hpu_compilers, name)))
+
+    wrap_targets()
+    orig_import = getattr(backends, "import_compilers", None)
+    if callable(orig_import) and not getattr(orig_import, "_hpu_complex_wrapped", False):
+        def import_compilers():
+            orig_import()
+            wrap_targets()
+
+        import_compilers._hpu_complex_wrapped = True
+        backends.import_compilers = import_compilers
     backends._hpu_complex_aot = True
 
 

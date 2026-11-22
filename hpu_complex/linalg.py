@@ -44,6 +44,7 @@ C64 = torch.complex64
 # Real ops whose float32 HPU kernel runs on the card, and the largest real order they take there. None: unknown
 # (hpu-ops not enabled), the op is declined. Tests on the CPU stand-in set ``FORCE_REAL_ON_CARD``.
 FORCE_REAL_ON_CARD = False
+_CL = None  # test hook: stand-in for hpu_ops.tpc.complex_linalg on CPU tests
 CALLS = {}  # op name -> calls taken on the card (card checks read it)
 
 
@@ -58,6 +59,15 @@ def _hpu_ops_tpc():
     except Exception:  # noqa: BLE001  (no hpu-ops, or an old one without the kernels)
         return None
     return tpc
+
+
+def _complex_linalg():
+    if _CL is not None:
+        return _CL
+    tpc = _hpu_ops_tpc()
+    if tpc is not None and tpc.ready():
+        return getattr(tpc, "complex_linalg", None)
+    return None
 
 
 def _hpu_ops_has(op_name):
@@ -238,37 +248,175 @@ def _placeholder_lu(A_shape, batch, n, device):
     return LU, pivots
 
 
-# ---- solve, inv ----------------------------------------------------------------------------------------------------
+# ---- solve, inv, det, slogdet --------------------------------------------------------------------------------------
+
+
+def _gj_info(S, batch_shape):
+    """int32 info (1-based zero pivot, 0 if regular or non-finite) from complex_linalg's S (..., 4)."""
+    return torch.where(S[..., 2] > 0, S[..., 2], 0.0).to(torch.int32).reshape(batch_shape)
+
+
+class _SolveEx(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, A, rhs):
+        cl = _complex_linalg()
+        batch = torch.broadcast_shapes(A.shape[:-2], rhs.shape[:-2])
+        A_c, rhs_c = A.contiguous(), rhs.contiguous()
+        X_p, _D, S = cl.cgj_solve(A_c, rhs_c)
+        X = _as_complex(X_p)
+        info = _gj_info(S, batch)
+        ctx.save_for_backward(A_c, X)
+        ctx.shapes = (A.shape, rhs.shape)
+        ctx.mark_non_differentiable(info)
+        return X, info
+
+    @staticmethod
+    def backward(ctx, gX, _ginfo):
+        if gX is None:
+            return None, None
+        A, X = ctx.saved_tensors
+        gB = solve_ex(A.mH, gX, left=True, check_errors=False)[0]
+        gA = -_cmatmul(gB, X.mH) if ctx.needs_input_grad[0] else None
+        return (gA.sum_to_size(ctx.shapes[0]) if gA is not None else None), gB.sum_to_size(ctx.shapes[1])
 
 
 def solve_ex(A, B, left=True, check_errors=False):
-    """``_linalg_solve_ex`` from the real solve of ``E(A) [Xr; Xi] = [Br; Bi]``. Returns (X, LU, pivots, info)."""
+    """``_linalg_solve_ex`` via ``complex_linalg.cgj_solve`` (n <= 32) or real ``E(A)`` (n > 32). Returns (X, LU, pivots, info)."""
     vector = _is_vector_rhs(A, B)
     if not left:  # X A = B  <=>  A^T X^T = B^T
         X, LU, pivots, info = solve_ex(A.mT, B.mT, True, check_errors)
-        return X.mT, LU, pivots, info
+        return X.mT.contiguous(), LU, pivots, info
     rhs = B.unsqueeze(-1) if vector else B
     batch = torch.broadcast_shapes(A.shape[:-2], rhs.shape[:-2])
     n = A.shape[-1]
-    ar, ai = _pair(A)
-    br, bi = _pair(rhs)
-    X, info = torch.linalg.solve_ex(_block(ar, ai), _block_rhs(br, bi))
-    X = _from_block_rhs(X, n)
-    info = _info_from_block(info, n)
+    cl = _complex_linalg()
+    if cl is not None and n <= cl.COMPLEX_MAXN:
+        if torch.is_grad_enabled() and (A.requires_grad or rhs.requires_grad):
+            X, info = _SolveEx.apply(A, rhs)
+        else:
+            X_p, _D, S = cl.cgj_solve(A.contiguous(), rhs.contiguous())
+            X = _as_complex(X_p)
+            info = _gj_info(S, batch)
+    else:
+        ar, ai = _pair(A)
+        br, bi = _pair(rhs)
+        X, info = torch.linalg.solve_ex(_block(ar, ai), _block_rhs(br, bi))
+        X = _from_block_rhs(X, n)
+        info = _info_from_block(info, n)
     if check_errors:
         torch.ops.aten._linalg_check_errors(info, "torch.linalg.solve_ex", is_matrix=A.dim() == 2)
     LU, pivots = _placeholder_lu(A.shape, batch, n, A.device)
     return (X.squeeze(-1) if vector else X), LU, pivots, info
 
 
+class _InvEx(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, A):
+        cl = _complex_linalg()
+        X_p, _D, S = cl.cgj_inv(A)
+        Minv = _as_complex(X_p)
+        info = _gj_info(S, A.shape[:-2])
+        ctx.save_for_backward(Minv)
+        ctx.mark_non_differentiable(info)
+        return Minv, info
+
+    @staticmethod
+    def backward(ctx, g, _ginfo):
+        if g is None:
+            return None
+        (Minv,) = ctx.saved_tensors
+        return -_cmatmul(Minv.mH, _cmatmul(g, Minv.mH))
+
+
 def inv_ex(A, check_errors=False):
     n = A.shape[-1]
-    ar, ai = _pair(A)
-    Minv, info = torch.linalg.inv_ex(_block(ar, ai))
-    info = _info_from_block(info, n)
+    cl = _complex_linalg()
+    if cl is not None and n <= cl.COMPLEX_MAXN:
+        if torch.is_grad_enabled() and A.requires_grad:
+            Minv, info = _InvEx.apply(A)
+        else:
+            X_p, _D, S = cl.cgj_inv(A)
+            Minv = _as_complex(X_p)
+            info = _gj_info(S, A.shape[:-2])
+    else:
+        ar, ai = _pair(A)
+        Minv, info = torch.linalg.inv_ex(_block(ar, ai))
+        Minv = _complex(Minv[..., :n, :n], Minv[..., n:, :n])
+        info = _info_from_block(info, n)
     if check_errors:
         torch.ops.aten._linalg_check_errors(info, "linalg.inv_ex", is_matrix=A.dim() == 2)
-    return _complex(Minv[..., :n, :n], Minv[..., n:, :n]), info
+    return Minv, info
+
+
+def _det_svd_backward(A, g_det):
+    U, S, Vh = svd(A, full_matrices=False, compute_uv=True)
+    alpha = (det(U)[0] * det(Vh)[0]).conj()
+    before = torch.cat([torch.ones_like(S[..., :1]), S[..., :-1].cumprod(-1)], -1)
+    after = torch.cat([S[..., 1:].flip(-1).cumprod(-1).flip(-1), torch.ones_like(S[..., :1])], -1)
+    D = (g_det * alpha)[..., None] * (before * after)
+    return _cmatmul(U * D.unsqueeze(-2), Vh)
+
+
+class _Det(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, A):
+        ctx.set_materialize_grads(False)
+        d = _as_complex(_complex_linalg().det(A))
+        ctx.save_for_backward(A, d)
+        return d
+
+    @staticmethod
+    def backward(ctx, g_det):
+        if g_det is None:
+            return None
+        A, d = ctx.saved_tensors
+        singular = d.abs() == 0
+        if torch.is_grad_enabled() and singular.any():
+            return _det_svd_backward(A, g_det)
+        # Call inv_ex before building (g_det * d.conj()) so TPC's lazy mark_step does not split the cofactor graph.
+        inv_ah = inv_ex(A, check_errors=False)[0].mH
+        cofactor = (g_det * d.conj())[..., None, None] * inv_ah
+        return torch.where(singular[..., None, None], 0.0, cofactor)
+
+
+def det(A):
+    """``_linalg_det`` via ``complex_linalg.det`` -> (result, LU, pivots)."""
+    d = _Det.apply(A) if torch.is_grad_enabled() and A.requires_grad else _as_complex(_complex_linalg().det(A))
+    LU, pivots = _placeholder_lu(A.shape, A.shape[:-2], A.shape[-1], A.device)
+    return d, LU, pivots
+
+
+class _Slogdet(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, A):
+        ctx.set_materialize_grads(False)
+        sign_p, lad = _complex_linalg().slogdet(A)
+        sign = _as_complex(sign_p)
+        ctx.save_for_backward(A, sign)
+        return sign, lad
+
+    @staticmethod
+    def backward(ctx, g_sign, g_lad):
+        if g_sign is None and g_lad is None:
+            return None
+        A, sign = ctx.saved_tensors
+        inv_ah = inv_ex(A, check_errors=False)[0].mH
+        re = g_lad if g_lad is not None else torch.zeros(sign.shape, dtype=torch.float32, device=sign.device)
+        im = (torch.view_as_real((sign.conj() * g_sign).resolve_conj())[..., 1]
+              if g_sign is not None else torch.zeros_like(re))
+        scale = _complex(re, im)
+        return scale[..., None, None] * inv_ah
+
+
+def slogdet(A):
+    """``_linalg_slogdet`` via ``complex_linalg.slogdet`` -> (sign, logabsdet, LU, pivots)."""
+    if torch.is_grad_enabled() and A.requires_grad:
+        sign, lad = _Slogdet.apply(A)
+    else:
+        sign_p, lad = _complex_linalg().slogdet(A)
+        sign = _as_complex(sign_p)
+    LU, pivots = _placeholder_lu(A.shape, A.shape[:-2], A.shape[-1], A.device)
+    return sign, lad, LU, pivots
 
 
 # ---- triangular -----------------------------------------------------------------------------------------------------
@@ -711,9 +859,13 @@ def householder_product(A, tau):
     return _complex(torch.eye(m, n, dtype=ar.dtype, device=ar.device) - qr, -qi)
 
 
-# ---- eigh -------------------------------------------------------------------------------------------------------------
+# ---- eigh, svd -------------------------------------------------------------------------------------------------------
 
-_GOLDEN = math.pi * (3 - math.sqrt(5))
+
+def _upper(UPLO):
+    if not isinstance(UPLO, str) or UPLO.upper() not in ("L", "U"):
+        raise RuntimeError(f"Expected UPLO argument to be 'L' or 'U', but got {UPLO}")
+    return UPLO.upper() == "U"
 
 
 def _hermitian_pairs(A, upper):
@@ -725,92 +877,57 @@ def _hermitian_pairs(A, upper):
     return lr + lr.tril(-1).mT, li - li.mT
 
 
-def _orthonormalize(wr, wi, passes=2):
-    """Cholesky QR, ``passes`` times: ``W <- W L^-H`` with ``L L^H = W^H W``. Columns that are already orthogonal
-    stay (up to their norm); the others are Gram-Schmidt'ed in order."""
-    for _ in range(passes):
-        gr, gi = _cmm(wr.mT, -wi.mT, wr, wi)
-        L, _info = _cholesky_ex(_complex(gr, gi))
-        W = solve_triangular(L.mH, _complex(wr, wi), upper=True, left=False)
-        wr, wi = _pair(W)
-    return wr, wi
-
-
-def _eigh_forward(A, upper, compute_v):
-    """``E(H) = [[Hr, -Hi], [Hi, Hr]]`` has every eigenvalue of ``H`` twice: for ``H v = l v``, ``v = x + i y``, both
-    ``[x; y]`` and ``[-y; x]`` are eigenvectors, and any real eigenvector ``[x; y]`` of ``E(H)`` gives the complex
-    eigenvector ``x + i y``. The sorted real eigenvalues pair up (the complex one is the mean of a pair). From pair k
-    (real eigenvectors ``u_2k``, ``u_2k+1``, complex images ``a_k``, ``b_k``), ``w_k = a_k + omega_k b_k`` with
-    ``|omega_k| = 1/2`` is never zero (``b_k`` is ``a_k`` times a phase when the eigenvalue is simple). Inside a cluster
-    of equal eigenvalues the real solver returns any basis of the doubled space, so the ``a_k`` alone can repeat a
-    vector (``u`` and ``[-y; x]`` from two pairs: ``H = I``); distinct ``omega_k`` (golden-angle phases) make the
-    ``w_k`` independent, and two Cholesky QR passes orthonormalize them (Gram-Schmidt inside clusters, nothing
-    across them, where the ``w_k`` are orthogonal already)."""
-    n = A.shape[-1]
-    hr, hi = _hermitian_pairs(A, upper)
-    w, U = torch.linalg.eigh(_block(hr, hi))
-    L = 0.5 * (w[..., 0::2] + w[..., 1::2])
-    if not compute_v:
-        return L, None
-    ar, ai = U[..., :n, 0::2], U[..., n:, 0::2]
-    br, bi = U[..., :n, 1::2], U[..., n:, 1::2]
-    phase = torch.arange(n, dtype=w.dtype, device=w.device) * _GOLDEN
-    om_r, om_i = 0.5 * torch.cos(phase), 0.5 * torch.sin(phase)
-    wr = ar + om_r * br - om_i * bi
-    wi = ai + om_r * bi + om_i * br
-    wr, wi = _orthonormalize(wr, wi)
-    return L, _complex(wr, wi)
-
-
 class _Eigh(torch.autograd.Function):
     """torch's ``linalg_eig_backward`` (``is_hermitian``): ``gA = V (diag(gL) + skew(V^H gV) / E) V^H`` with
-    ``skew(X) = (X - X^H) / 2`` and ``E_ij = L_j - L_i`` (1 on the diagonal). torch's check that the loss does not
-    depend on the eigenvectors' phases (a host read of ``imag(diag(V^H gV))``) is not made."""
+    ``skew(X) = (X - X^H) / 2`` and ``E_ij = L_j - L_i`` (1 on the diagonal)."""
 
     @staticmethod
-    def forward(ctx, A, upper):
-        L, V = _eigh_forward(A, upper, True)
+    def forward(ctx, A, UPLO, compute_v):
+        ctx.set_materialize_grads(False)
+        L, V_p = _complex_linalg().eigh(A, UPLO=UPLO)
+        V = _as_complex(V_p)
         ctx.save_for_backward(L, V)
+        if not compute_v:
+            return L, torch.empty(0, dtype=C64, device=A.device)
         return L, V
 
     @staticmethod
     def backward(ctx, gL, gV):
+        if gL is None and gV is None:
+            return None, None, None
         L, V = ctx.saved_tensors
+        if gV is None:
+            return _cmatmul(V * gL.unsqueeze(-2), V.mH), None, None
         vr, vi = _pair(V)
-        if gV is not None:
-            gr, gi = _pair(gV)
-            xr, xi = _cmm(vr.mT, -vi.mT, gr, gi)  # V^H gV
-            xr, xi = 0.5 * (xr - xr.mT), 0.5 * (xi + xi.mT)
-            E = L.unsqueeze(-2) - L.unsqueeze(-1)
-            E = E + torch.eye(L.shape[-1], dtype=L.dtype, device=L.device)
-            xr, xi = xr / E, xi / E
-            if gL is not None:
-                eye = torch.eye(L.shape[-1], dtype=L.dtype, device=L.device)
-                xr = xr * (1 - eye) + torch.diag_embed(gL)
-                xi = xi * (1 - eye)
+        gr, gi = _pair(gV)
+        xr, xi = _cmm(vr.mT, -vi.mT, gr, gi)  # V^H gV
+        xr, xi = 0.5 * (xr - xr.mT), 0.5 * (xi + xi.mT)
+        eye = torch.eye(L.shape[-1], dtype=L.dtype, device=L.device)
+        E = (L.unsqueeze(-2) - L.unsqueeze(-1)) + eye
+        xr, xi = xr / E, xi / E
+        if gL is not None:
+            xr = xr * (1 - eye) + torch.diag_embed(gL)
         else:
-            xr, xi = torch.diag_embed(gL), torch.zeros_like(vr)
+            xr = xr * (1 - eye)
+        xi = xi * (1 - eye)
         tr, ti = _cmm(xr, xi, vr.mT, -vi.mT)  # (...) V^H
         gr, gi = _cmm(vr, vi, tr, ti)
-        return _complex(gr, gi), None
+        return _complex(gr, gi), None, None
 
 
 def eigh(A, UPLO="L", compute_v=True):
-    """``_linalg_eigh`` -> (eigenvalues, eigenvectors); without ``compute_v`` the eigenvectors are empty."""
-    upper = UPLO.upper() == "U"
+    """``_linalg_eigh`` via ``complex_linalg.eigh`` -> (eigenvalues, eigenvectors)."""
+    _upper(UPLO)
     if not compute_v:
         return eigvalsh(A, UPLO), torch.empty(0, dtype=C64, device=A.device)
     if torch.is_grad_enabled() and A.requires_grad:
-        return _Eigh.apply(A, upper)
-    return _eigh_forward(A, upper, True)
+        return _Eigh.apply(A, UPLO, True)
+    L, V_p = _complex_linalg().eigh(A, UPLO=UPLO)
+    return L, _as_complex(V_p)
 
 
 class _HermitianEmbedding(torch.autograd.Function):
-    """The interleaved embedding of the Hermitian matrix in one triangle of ``A``, right in that triangle (the real
-    eigh reads only it; the imaginary part of the diagonal is masked). Backward: the complex matrix of the real
-    gradient, ``gA = (g[2i, 2j] + g[2i+1, 2j+1]) + i (g[2i+1, 2j] - g[2i, 2j+1])``, not masked to the triangle: for
-    torch's eigvalsh gradient ``V diag(gL) V^H`` the real one is ``U diag(gw) U^T = E(V diag(gL) V^H) / 2`` with
-    ``gw = gL / 2`` on each pair, and the map gives it back in full."""
+    """Fallback interleaved embedding of ``eigvalsh`` when ``complex_linalg`` is unavailable."""
 
     @staticmethod
     def forward(ctx, A, upper):
@@ -823,14 +940,136 @@ class _HermitianEmbedding(torch.autograd.Function):
 
 
 def eigvalsh(A, UPLO="L"):
-    """``linalg.eigvalsh``: the sorted real eigenvalues of the interleaved embedding (hpu-ops' Jacobi kernel) come in
-    equal pairs, each the complex eigenvalue; their mean is it (exact also for clusters). The gradient is torch's,
-    through the real eigvalsh's backward."""
-    upper = UPLO.upper() == "U"
+    """``linalg.eigvalsh`` via ``complex_linalg.eigvalsh`` (or ``_HermitianEmbedding`` fallback if unavailable)."""
+    upper = _upper(UPLO)
+    cl = _complex_linalg()
+    if cl is not None and A.shape[-1] <= cl.COMPLEX_MAXN:
+        if torch.is_grad_enabled() and A.requires_grad:
+            return _Eigh.apply(A, UPLO, False)[0]
+        return cl.eigvalsh(A, UPLO=UPLO)
     E = _HermitianEmbedding.apply(A, upper) if torch.is_grad_enabled() and A.requires_grad else \
         _HermitianEmbedding.forward(None, A, upper)
     w = torch.linalg.eigvalsh(E, UPLO="U" if upper else "L")
     return 0.5 * (w[..., 0::2] + w[..., 1::2])
+
+
+def _complete_orthogonal(Q, rows=False):
+    """Complete orthonormal columns of Q (..., d, k) (or rows (..., k, d) if rows=True) to (..., d, d)."""
+    cl = _complex_linalg()
+    if rows:
+        k, d = Q.shape[-2], Q.shape[-1]
+        pr, pi = _pair(-_cmatmul(Q.mH, Q))
+        P = _complex(pr + torch.eye(d, dtype=torch.float32, device=Q.device), pi)
+        Up, _, _ = cl.svd(P, full_matrices=False)
+        V_null = _as_complex(Up)[..., :, : d - k]
+        return torch.cat([Q, V_null.mH], -2)
+    d, k = Q.shape[-2], Q.shape[-1]
+    pr, pi = _pair(-_cmatmul(Q, Q.mH))
+    P = _complex(pr + torch.eye(d, dtype=torch.float32, device=Q.device), pi)
+    Up, _, _ = cl.svd(P, full_matrices=False)
+    U_null = _as_complex(Up)[..., :, : d - k]
+    return torch.cat([Q, U_null], -1)
+
+
+class _Svd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, A, full_matrices, compute_uv):
+        ctx.set_materialize_grads(False)
+        cl = _complex_linalg()
+        m, n = A.shape[-2], A.shape[-1]
+        if not compute_uv and not ctx.needs_input_grad[0]:
+            S = cl.svdvals(A)
+            empty = torch.empty(0, dtype=C64, device=A.device)
+            return empty, S, empty
+        U_p, S, Vh_p = cl.svd(A, full_matrices=False)
+        U, Vh = _as_complex(U_p), _as_complex(Vh_p)
+        ctx.save_for_backward(U, S, Vh)
+        if not compute_uv:
+            empty = torch.empty(0, dtype=C64, device=A.device)
+            return empty, S, empty
+        if full_matrices and m != n:
+            if m > n:
+                U = _complete_orthogonal(U, rows=False)
+            else:
+                Vh = _complete_orthogonal(Vh, rows=True)
+        return U, S, Vh
+
+    @staticmethod
+    def backward(ctx, gU, gS, gVh):
+        if gU is None and gS is None and gVh is None:
+            return None, None, None
+        U, S, Vh = ctx.saved_tensors
+        m, k = U.shape[-2], U.shape[-1]
+        n = Vh.shape[-1]
+        gUk = gU[..., :k] if gU is not None else None
+        gVhk = gVh[..., :k, :] if gVh is not None else None
+        if gUk is None and gVhk is None:
+            return _cmatmul(U * gS.unsqueeze(-2), Vh), None, None
+        S_inv = torch.where(S > 0, S.reciprocal(), 0.0)
+        total = S.unsqueeze(-2) + S.unsqueeze(-1)
+        safe_total = torch.where(total != 0, total, 1.0)
+        diff1 = S.unsqueeze(-2) - S.unsqueeze(-1)
+        distinct = diff1 != 0
+        safe_diff1 = torch.where(distinct, diff1, 1.0)
+        G1 = torch.where(distinct, (S.unsqueeze(-2) / safe_total) / safe_diff1, 0.0)
+        G2 = torch.where(distinct, (S.unsqueeze(-1) / safe_total) / safe_diff1, 0.0)
+        diag_sum = torch.zeros_like(S)
+        core = None
+        extra = None
+        if gUk is not None:
+            UhgU = _cmatmul(U.mH, gUk)
+            diag_sum = diag_sum + torch.view_as_real(UhgU.diagonal(0, -2, -1).resolve_conj())[..., 1]
+            core = (UhgU - UhgU.mH) * G1
+            if m > k:
+                extra = _cmatmul((gUk - _cmatmul(U, UhgU)) * S_inv.unsqueeze(-2), Vh)
+        if gVhk is not None:
+            gVhV = _cmatmul(gVhk, Vh.mH)
+            diag_sum = diag_sum + torch.view_as_real(gVhV.diagonal(0, -2, -1).resolve_conj())[..., 1]
+            t2 = (gVhV - gVhV.mH) * G2
+            core = -t2 if core is None else (core - t2)
+            if n > k:
+                t_extra = _cmatmul(U * S_inv.unsqueeze(-2), gVhk - _cmatmul(gVhV, Vh))
+                extra = t_extra if extra is None else (extra + t_extra)
+        diag_c = _complex(gS if gS is not None else torch.zeros_like(S), 0.5 * diag_sum * S_inv)
+        gA = _cmatmul(U * diag_c.unsqueeze(-2), Vh) + _cmatmul(U, _cmatmul(core, Vh))
+        if extra is not None:
+            gA = gA + extra
+        return gA, None, None
+
+
+def svd(A, full_matrices=False, compute_uv=True, *, driver=None):
+    """``_linalg_svd`` via ``complex_linalg.svd`` / ``svdvals``."""
+    if torch.is_grad_enabled() and A.requires_grad:
+        return _Svd.apply(A, full_matrices, compute_uv)
+    cl = _complex_linalg()
+    if not compute_uv:
+        empty = torch.empty(0, dtype=C64, device=A.device)
+        return empty, cl.svdvals(A), empty
+    U_p, S, Vh_p = cl.svd(A, full_matrices=False)
+    U, Vh = _as_complex(U_p), _as_complex(Vh_p)
+    m, n = A.shape[-2], A.shape[-1]
+    if full_matrices and m != n:
+        if m > n:
+            U = _complete_orthogonal(U, rows=False)
+        else:
+            Vh = _complete_orthogonal(Vh, rows=True)
+    return U, S, Vh
+
+
+def svd_out(A, full_matrices=False, compute_uv=True, *, driver=None, U, S, Vh):
+    u, s, vh = svd(A, full_matrices, compute_uv, driver=driver)
+    if compute_uv:
+        torch.ops.aten._copy_from_and_resize(u, U)
+        torch.ops.aten._copy_from_and_resize(vh, Vh)
+    S.resize_(s.shape).copy_(s)
+    return U, S, Vh
+
+
+def svdvals(A, *, driver=None):
+    """``linalg_svdvals`` via ``complex_linalg.svdvals`` (or ``_Svd`` when grad is needed)."""
+    if torch.is_grad_enabled() and A.requires_grad:
+        return _Svd.apply(A, False, False)[1]
+    return _complex_linalg().svdvals(A)
 
 
 # ---- qr ---------------------------------------------------------------------------------------------------------------
@@ -972,38 +1211,36 @@ def lstsq(A, B, rcond=None, driver=None):
 # ---- registration ------------------------------------------------------------------------------------------------------
 
 
-def _decline(op, args, kwargs):
-    """torch's own kernel: the Autograd one, or for a CompositeImplicitAutograd op (``linalg_eigvalsh``, which has no
-    Autograd kernel: the alias would come back here) its decomposition."""
+def _decline(op, args, kwargs, key="AutogradPrivateUse1"):
+    """torch's own kernel: CompositeImplicitAutograd for math ops, Autograd when at AutogradPrivateUse1,
+    or PrivateUse2 (Extension cpu_fallback / structured_pu1) when at PrivateUse1."""
     if torch._C._dispatch_has_kernel_for_dispatch_key(op.name(), "CompositeImplicitAutograd"):
         return op._op_dk(DispatchKey.CompositeImplicitAutograd, *args, **kwargs)
+    if key == "PrivateUse1":
+        return op._op_dk(DispatchKey.PrivateUse2, *args, **kwargs)
     return op._op_dk(DispatchKey.Autograd, *args, **kwargs)
 
 
-# Where each op is taken by default, from the measured speed against the CPU route (forward and forward + backward,
-# batch 32, n = 4..32; clinalg_card_check.py, Gaudi2, bridge 1.21.4; tables in TEAM_REPORT.md). Keeping the work on
-# the card comes first: an op is routed where it measured at about parity or faster in that mode, even if some
-# sizes or variants were slower (noted per op; e.g. eager cholesky_solve(upper) 0.78x and cholesky_inverse 0.90x
-# forward at n = 16); it is gated to "with grad" or a mode only where it was clearly slower otherwise.
-# HPU_COMPLEX_LINALG=all takes every op in both modes (nothing on the CPU, at that speed); =0 none.
 ROUTES = {
     "solve": ("eager", "lazy"),
-    "solve_left_false": ("lazy",),  # eager: forward + backward 0.79-1.0x
+    "solve_left_false": ("lazy",),  # eager: forward + backward 0.79-1.0x for real block; n<=32 uses cgj_solve
     "inv": ("eager", "lazy"),
-    "cholesky": ("eager", "lazy"),  # with torch's info computed: forward 0.8-1.1x eager, 0.8-1.2x lazy (parity, the
-    # info's ops and the error check's wait); forward + backward 1.0-1.3x eager, 1.6-2.1x lazy
-    "matrix_exp": ("eager", "lazy"),  # n <= 16: hpu-ops' kernel on E(A)
-    "matrix_exp_composite": ("lazy",),  # n > 16: eager 0.2-0.4x, lazy 1.0-4x
+    "det": ("eager", "lazy"),
+    "slogdet": ("eager", "lazy"),
+    "cholesky": ("eager", "lazy"),
+    "matrix_exp": ("eager", "lazy"),
+    "matrix_exp_composite": ("lazy",),
     "pinv": ("eager", "lazy"),
-    "householder_product": ("eager:grad", "lazy:grad"),  # forward alone 0.2-0.5x, with backward 2-28x
-    "lstsq": ("eager:grad", "lazy:grad"),  # forward alone 0.7-0.9x, with backward 1.6-3.2x
-    "solve_triangular": ("lazy:grad",),  # forward 0.45-0.83x eager, 0.38-0.78x lazy; forward + backward 0.88-1.01x
-    # eager, 1.05-1.32x lazy (n = 4..32)
-    "cholesky_solve": ("eager", "lazy"),  # forward 0.8-3.0x eager, 0.4-1.9x lazy; with backward 1.0-1.2x / 1.1-1.9x
-    "cholesky_inverse": ("eager", "lazy"),  # forward 0.75-3.5x / 0.8-2.5x; with backward 0.9-1.2x / 1.2-2.1x
-    "qr": (),  # Habana's real qr: eager 0.45-0.85x forward, 0.7-0.9x with backward; lazy 90 ms-4.4 s per call
-    "eigvalsh": ("lazy:grad",),  # forward 0.16-0.28x eager, 0.67-0.69x lazy; with backward 0.7-0.9x / 1.05-1.67x
-    "eigh": (),  # eager 0.2x, lazy 0.3x forward (n <= 16, the real kernel's limit)
+    "householder_product": ("eager:grad", "lazy:grad"),
+    "lstsq": ("eager:grad", "lazy:grad"),
+    "solve_triangular": ("lazy:grad",),
+    "cholesky_solve": ("eager", "lazy"),
+    "cholesky_inverse": ("eager", "lazy"),
+    "qr": (),
+    "eigvalsh": ("eager", "lazy"),
+    "eigh": ("eager", "lazy"),
+    "svd": ("eager", "lazy"),
+    "svdvals": ("eager", "lazy"),
 }
 
 
@@ -1023,14 +1260,14 @@ def _routed(name, args, kwargs):
     return mode in routes or (f"{mode}:grad" in routes and _needs_grad(args, kwargs))
 
 
-def _kernel(op, name, takes, compute, meta=True):
+def _kernel(op, name, takes, compute, key="AutogradPrivateUse1", meta=True):
     def kernel(*args, **kwargs):
         if _routed(name, args, kwargs) and takes(*args, **kwargs):
             if meta:  # torch's shape checks and errors (lstsq has no meta kernel: the real lstsq raises its own)
                 _meta_call(op, *args, **kwargs)
             _count(name)
             return compute(*args, **kwargs)
-        return _decline(op, args, kwargs)
+        return _decline(op, args, kwargs, key)
 
     return kernel
 
@@ -1044,26 +1281,42 @@ def _batch(*tensors):
 
 
 def _takes_solve(A, B, left=True, check_errors=False):
-    # Only with grad mode on: the LU and pivots returned here are placeholders, which only torch's own derivative
-    # reads. With grad on, the derivative recorded is this module's (autograd through the real solve); a compiled
-    # graph's forward runs with grad off and its traced backward reads the LU (NaN gradients under
-    # torch.compile(backend="hpu_backend"), measured), so such calls, and torch.no_grad() ones, keep torch's route.
-    if not torch.is_grad_enabled():
+    # Only with grad or inference_mode on: the LU and pivots returned here are placeholders, which only torch's own
+    # derivative reads. A compiled graph's forward runs with grad off (and inference_mode off) and its traced backward
+    # reads LU, so such calls keep torch's route.
+    if not (torch.is_grad_enabled() or torch.is_inference_mode_enabled()):
         return False
     if not (isinstance(B, torch.Tensor) and _complex_on_card(A, B) and _square(A)):
         return False
     if _is_vector_rhs(A, B) and not left:
         return False
-    if not left and not _routed("solve_left_false", (A, B), {}):
-        return False
     rhs = B.unsqueeze(-1) if _is_vector_rhs(A, B) else B
     if rhs.dim() < 2 or rhs.shape[-2 if left else -1] != A.shape[-1]:
         return False
-    return _real_on_card("solve", 2 * A.shape[-1], _batch(A, rhs))
+    n = A.shape[-1]
+    cl = _complex_linalg()
+    if cl is not None and 1 <= n <= cl.COMPLEX_MAXN:
+        return True
+    if not left and not _routed("solve_left_false", (A, B), {}):
+        return False
+    return _real_on_card("solve", 2 * n, _batch(A, rhs))
 
 
 def _takes_inv(A, check_errors=False):
-    return _complex_on_card(A) and _square(A) and _real_on_card("solve", 2 * A.shape[-1], _batch(A))
+    if not (_complex_on_card(A) and _square(A)):
+        return False
+    n = A.shape[-1]
+    cl = _complex_linalg()
+    if cl is not None and 1 <= n <= cl.COMPLEX_MAXN:
+        return True
+    return _real_on_card("solve", 2 * n, _batch(A))
+
+
+def _takes_det(A):
+    if not (torch.is_grad_enabled() or torch.is_inference_mode_enabled()):
+        return False
+    cl = _complex_linalg()
+    return cl is not None and _complex_on_card(A) and _square(A) and 1 <= A.shape[-1] <= cl.COMPLEX_MAXN
 
 
 def _takes_tri(A, B, *, upper, left=True, unitriangular=False):
@@ -1093,7 +1346,12 @@ def _takes_qr(A, mode="reduced"):
 
 
 def _takes_eigvalsh(A, UPLO="L"):
-    return _complex_on_card(A) and _square(A) and _real_on_card("eigh", 2 * A.shape[-1])
+    if not (_complex_on_card(A) and _square(A)):
+        return False
+    cl = _complex_linalg()
+    if cl is not None and 1 <= A.shape[-1] <= cl.COMPLEX_MAXN:
+        return True
+    return cl is None and _real_on_card("eigh", 2 * A.shape[-1])
 
 
 def _takes_cholesky(A, upper=False, check_errors=False):
@@ -1135,13 +1393,45 @@ def _takes_lstsq(A, B, rcond=None, *, driver=None):
 
 
 def _takes_eigh(A, UPLO="L", compute_v=True):
-    return _complex_on_card(A) and _square(A) and _real_on_card("eigh", 2 * A.shape[-1])
+    if not (_complex_on_card(A) and _square(A)):
+        return False
+    cl = _complex_linalg()
+    if cl is not None and 1 <= A.shape[-1] <= cl.COMPLEX_MAXN:
+        return True
+    if not compute_v:
+        return _takes_eigvalsh(A, UPLO)
+    return False
+
+
+def _takes_svd(A, full_matrices=False, compute_uv=True, *, driver=None):
+    cl = _complex_linalg()
+    if cl is None or driver is not None or not _complex_on_card(A) or A.dim() < 2:
+        return False
+    m, n = A.shape[-2], A.shape[-1]
+    return 1 <= m <= cl.COMPLEX_MAXN and 1 <= n <= cl.COMPLEX_MAXN
+
+
+def _takes_svd_out(A, full_matrices=False, compute_uv=True, *, driver=None, U, S, Vh):
+    if _needs_grad((A, U, S, Vh), {}):
+        return False
+    if not _takes_svd(A, full_matrices, compute_uv, driver=driver):
+        return False
+    for out, expected_dtype in ((U, C64), (S, torch.float32), (Vh, C64)):
+        if not isinstance(out, torch.Tensor) or out.device != A.device or out.dtype != expected_dtype or _host_backed(out):
+            return False
+    return True
+
+
+def _takes_svdvals(A, *, driver=None):
+    return _takes_svd(A, False, False, driver=driver)
 
 
 def _entries():
     return [
         (aten._linalg_solve_ex.default, "solve", _takes_solve, solve_ex),
         (aten.linalg_inv_ex.default, "inv", _takes_inv, inv_ex),
+        (aten._linalg_det.default, "det", _takes_det, det),
+        (aten._linalg_slogdet.default, "slogdet", _takes_det, slogdet),
         (aten.linalg_solve_triangular.default, "solve_triangular", _takes_tri,
          lambda A, B, *, upper, left=True, unitriangular=False: solve_triangular(A, B, upper, left, unitriangular)),
         (aten.cholesky_solve.default, "cholesky_solve", _takes_cholesky_solve, cholesky_solve),
@@ -1153,6 +1443,9 @@ def _entries():
         (aten.linalg_householder_product.default, "householder_product", _takes_householder, householder_product),
         (aten.linalg_pinv.atol_rtol_tensor, "pinv", _takes_pinv, pinv),
         (aten._linalg_eigh.default, "eigh", _takes_eigh, eigh),
+        (aten._linalg_svd.default, "svd", _takes_svd, svd),
+        (aten._linalg_svd.U, "svd", _takes_svd_out, svd_out),
+        (aten.linalg_svdvals.default, "svdvals", _takes_svdvals, svdvals),
         (aten.linalg_lstsq.default, "lstsq", _takes_lstsq,
          lambda A, B, rcond=None, *, driver=None: lstsq(A, B, rcond, driver), False),
     ]
@@ -1161,18 +1454,21 @@ def _entries():
 _UNDO = None
 
 
-def install(key="AutogradPrivateUse1"):
-    """Register the kernels at ``key`` (complex HPU tensors). Idempotent; ``HPU_COMPLEX_LINALG=0`` keeps them off.
+def install(keys=("AutogradPrivateUse1", "PrivateUse1")):
+    """Register the kernels at ``keys`` (complex HPU tensors, grad & inference_mode). Idempotent; ``HPU_COMPLEX_LINALG=0`` keeps them off.
     Returns an undo (also ``uninstall()``)."""
     global _UNDO
     if _UNDO is not None or os.environ.get("HPU_COMPLEX_LINALG", "1") == "0":
         return uninstall
+    if isinstance(keys, str):
+        keys = (keys,)
     library = torch.library.Library("aten", "IMPL")
     ops = []
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         for op, name, takes, compute, *meta in _entries():
-            library.impl(op, _kernel(op, name, takes, compute, *meta), key)
+            for key in keys:
+                library.impl(op, _kernel(op, name, takes, compute, key, *meta), key)
             ops.append(op)
     for op in ops:
         op._dispatch_cache.clear()
@@ -1193,5 +1489,6 @@ def uninstall():
         _UNDO = None
 
 
-__all__ = ["install", "uninstall", "CALLS", "solve_ex", "inv_ex", "solve_triangular", "cholesky_solve", "cholesky_ex",
-           "matrix_exp", "householder_product", "cholesky_inverse", "qr", "eigvalsh", "hpd_slogdet", "hpd_logdet"]
+__all__ = ["install", "uninstall", "CALLS", "solve_ex", "inv_ex", "det", "slogdet", "solve_triangular",
+           "cholesky_solve", "cholesky_ex", "matrix_exp", "householder_product", "cholesky_inverse", "qr",
+           "eigh", "eigvalsh", "svd", "svdvals", "hpd_slogdet", "hpd_logdet"]

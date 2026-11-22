@@ -228,6 +228,14 @@ check("m copy_ full self-overlap / disjoint as on the CPU", lambda: max(
     err((lambda b: (b.copy_(b), b)[1])(cplx(10).to(hpu)), cplx(10)),
     err((lambda b: (b[5:].copy_(b[:5]), b)[1])(cplx(10).to(hpu)), (lambda b: (b[5:].copy_(b[:5]), b)[1])(cplx(10)))))
 
+for compiled in (False, True):
+    tag = "compiled" if compiled else "eager   "
+    check(f"m2 {tag} angle(z) fwd+bwd (rel)",
+          lambda c=compiled: fwd_bwd_err(lambda t: torch.angle(t) + (t.abs() * 0), _z, c), 1e-5)
+    check(f"m2 {tag} F.unfold(z) fwd+bwd (rel)",
+          lambda c=compiled: fwd_bwd_err(
+              lambda t: torch.nn.functional.unfold(t.unsqueeze(1), (2, 2), padding=1).abs(), _z, c), 1e-5)
+
 passed = sum(results)
 print(f"REVIEW4_CHECK {passed}/{len(results)} passed", flush=True)
 sys.exit(0 if passed == len(results) else 1)

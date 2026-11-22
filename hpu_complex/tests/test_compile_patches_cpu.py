@@ -365,3 +365,77 @@ def test_bmm_view_pass_skips_complex_bmm(monkeypatch):
     assert seen == float_bmm
     assert all(n.target == torch.ops.aten.bmm.default for n in bmms)  # restored
     torch.testing.assert_close(gm(z, x), (z @ z.mT.conj()).abs() + x @ x.mT)
+
+
+def test_python_partitioner_is_thread_safe_and_handles_reimported_compilers(monkeypatch):
+    """#13 Findings 1 & 2: concurrent complex compilations hold use_cpp_partitioner=False until all exit, and
+    re-invoking backends.import_compilers() (Habana's delayed dynamo hook) keeps compilers wrapped."""
+    import contextlib
+    import threading
+
+    backends = types.ModuleType("backends")
+    compilers = types.ModuleType("compilers")
+    config = types.ModuleType("config")
+    config.use_cpp_partitioner = True
+
+    @contextlib.contextmanager
+    def patch(**changes):
+        saved = {k: getattr(config, k) for k in changes}
+        for k, v in changes.items():
+            setattr(config, k, v)
+        try:
+            yield
+        finally:
+            for k, v in saved.items():
+                setattr(config, k, v)
+
+    config.patch = patch
+    barrier = threading.Barrier(2)
+    observed = []
+
+    def raw_fw(gm, example_inputs, **kwargs):
+        observed.append(("enter", config.use_cpp_partitioner))
+        barrier.wait(timeout=5)
+        observed.append(("inside", config.use_cpp_partitioner))
+        return gm.forward
+
+    def raw_bw(gm, example_inputs, **kwargs):
+        return gm.forward
+
+    def raw_inf(gm, example_inputs, **kwargs):
+        return gm.forward
+
+    compilers.hpu_training_compiler_fw = raw_fw
+    compilers.hpu_training_compiler_bw = raw_bw
+    compilers.hpu_inference_compiler = raw_inf
+
+    def import_compilers():
+        backends.hpu_training_compiler_fw = compilers.hpu_training_compiler_fw
+        backends.hpu_training_compiler_bw = compilers.hpu_training_compiler_bw
+        backends.hpu_inference_compiler = compilers.hpu_inference_compiler
+
+    backends.import_compilers = import_compilers
+    names = ["habana_frameworks", "habana_frameworks.torch", "habana_frameworks.torch.dynamo",
+             "habana_frameworks.torch.dynamo.compile_backend"]
+    for name in names:
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    pkg = sys.modules["habana_frameworks.torch.dynamo.compile_backend"]
+    pkg.backends, pkg.config, pkg.compilers = backends, config, compilers
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch.dynamo.compile_backend.backends", backends)
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch.dynamo.compile_backend.config", config)
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch.dynamo.compile_backend.compilers", compilers)
+    monkeypatch.setattr(torch.ops.hpu_complex, "host_in_use", lambda: False, raising=False)
+
+    hpu_complex._aot_graphs_keep_complex64_scalars()
+    # Re-run import_compilers (as Habana's import hook does on delayed dynamo import): stays wrapped!
+    backends.import_compilers()
+    assert getattr(backends.hpu_training_compiler_fw, "_hpu_complex_wrapped", False)
+
+    gm_cplx = make_fx(lambda z: z.abs())(torch.randn(3, dtype=torch.complex64))
+    threads = [threading.Thread(target=backends.hpu_training_compiler_fw, args=(gm_cplx, [])) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert observed == [("enter", False), ("enter", False), ("inside", False), ("inside", False)]
+    assert config.use_cpp_partitioner is True

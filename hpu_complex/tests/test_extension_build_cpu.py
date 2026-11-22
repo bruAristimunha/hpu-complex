@@ -22,7 +22,9 @@ ops = ["aten::view.dtype", "aten::view_as_complex", "aten::view_as_real", "aten:
        "aten::mul.Tensor", "aten::add_.Scalar", "aten::rsub.Tensor", "aten::div.out_mode",
        "aten::cat", "aten::cat.out", "aten::exp", "aten::exp.out", "aten::neg", "aten::neg.out",
        "aten::masked_fill_.Scalar", "aten::masked_fill_.Tensor", "aten::linalg_vector_norm",
-       "aten::linalg_vector_norm.out", "aten::mul.Scalar_out", "aten::div.Tensor_mode", "aten::add.out"]
+       "aten::linalg_vector_norm.out", "aten::mul.Scalar_out", "aten::div.Tensor_mode", "aten::add.out",
+       "aten::angle", "aten::angle.out", "aten::eq.Scalar_out",
+       "aten::im2col", "aten::im2col.out", "aten::col2im", "aten::col2im.out"]
 table = {op: [line.split(":")[0] for line in torch._C._dispatch_dump(op).splitlines() if "fft_ext" in line]
          for op in ops}
 # The complex-scalar kernels at AutogradHPU hand every other call to AutogradOther: its entry must be torch's
@@ -79,5 +81,6 @@ def test_green_ops_have_card_kernels(registered):
     """Green's complex cat, exp, neg, masked_fill_ and linalg.vector_norm run on the pairs, not the CPU fallback."""
     for op in ("aten::cat", "aten::cat.out", "aten::exp", "aten::exp.out", "aten::neg", "aten::neg.out",
                "aten::masked_fill_.Scalar", "aten::masked_fill_.Tensor", "aten::linalg_vector_norm",
-               "aten::linalg_vector_norm.out"):
+               "aten::linalg_vector_norm.out", "aten::angle", "aten::angle.out", "aten::eq.Scalar_out",
+               "aten::im2col", "aten::im2col.out", "aten::col2im", "aten::col2im.out"):
         assert "PrivateUse1" in registered[op], op

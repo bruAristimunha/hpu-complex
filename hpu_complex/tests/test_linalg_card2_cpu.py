@@ -360,10 +360,10 @@ def test_qr_gradient_through_q_only_and_r_only(card_linalg):
         torch.testing.assert_close(a.grad.cpu().to(C128), r.grad, atol=5e-5, rtol=2e-4)
 
 
-def test_eigvalsh_non_finite_input_as_the_real_kernel(card_linalg):
-    """A NaN entry: torch's CPU kernel raises (both complex and the stand-in's real one, LAPACK does not converge). On
-    the card hpu-ops' real Jacobi kernel returns finite values for that matrix and no error (measured,
-    clinalg_adversarial2_check.py): a limit of the real kernel, the same for float32 input."""
+def test_eigvalsh_non_finite_input_as_the_real_kernel(card_linalg, monkeypatch):
+    """A NaN entry: with the _HermitianEmbedding fallback (_CL=None), torch's CPU real kernel raises (on the card
+    hpu-ops' real Jacobi kernel returns finite values; complex_linalg returns NaN)."""
+    monkeypatch.setattr(card_linalg, "_CL", None)
     H = hermitian(2, 4, seed=1).to(C64)
     H[0, 2, 1] = complex(float("nan"), 0)
     with pytest.raises(torch.linalg.LinAlgError):
@@ -376,6 +376,7 @@ def test_eigvalsh_declined_keeps_torchs_route(card_linalg, monkeypatch):
     """A declined eigvalsh (linalg_eigvalsh is CompositeImplicitAutograd: no Autograd kernel to decline to) runs
     torch's decomposition, not this kernel again (a recursion: the card segfaulted at n = 32 before)."""
     monkeypatch.setattr(card_linalg, "FORCE_REAL_ON_CARD", False)
+    monkeypatch.setattr(card_linalg, "_CL", None)
     monkeypatch.setattr(card_linalg, "_real_on_card", lambda kind, n2, batch=1: False)
     H = hermitian(2, 4, seed=1)
     calls = taken(card_linalg, "eigvalsh")

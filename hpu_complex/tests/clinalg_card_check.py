@@ -87,11 +87,32 @@ def cases(b, n):
         "qr": (lambda A: _qr_gauge_free(torch.linalg.qr(A)), [rand(b, n, n, seed=9)]),
         "qr_tall": (lambda A: _qr_gauge_free(torch.linalg.qr(A)), [rand(b, n, max(1, n // 2), seed=9)]),
         "hpd_slogdet": (_hpd_logabsdet, [hpd(b, n, 3)]),
+        "det": (lambda A: torch.linalg.det(A), [rand(b, n, n, seed=1)]),
+        "slogdet": (lambda A: torch.linalg.slogdet(A), [rand(b, n, n, seed=1)]),
+        "slogdet_phase": (lambda A: _slogdet_phase(torch.linalg.slogdet(A)), [rand(b, n, n, seed=1)]),
+        "svd": (lambda A: _svd_gauge_free(torch.linalg.svd(A, full_matrices=False)), [rand(b, n, max(1, n - 2), seed=7)]),
+        "svd_full": (lambda A: _svd_gauge_free(torch.linalg.svd(A, full_matrices=True)),
+                     [rand(b, n, max(1, n - 2), seed=7)]),
+        "svd_wide": (lambda A: _svd_gauge_free(torch.linalg.svd(A, full_matrices=False)),
+                     [rand(b, max(1, n - 2), n, seed=7)]),
+        "svd_wide_full": (lambda A: _svd_gauge_free(torch.linalg.svd(A, full_matrices=True)),
+                          [rand(b, max(1, n - 2), n, seed=7)]),
+        "svdvals": (lambda A: torch.linalg.svdvals(A), [rand(b, n, max(1, n - 2), seed=7)]),
         "lstsq": (lambda A, B: torch.linalg.lstsq(A, B).solution, [rand(b, n, max(1, n - 2), seed=7),
                                                                    rand(b, n, 3, seed=8)]),
     }
     del k
     return out
+
+
+def _slogdet_phase(res):
+    return (res.sign * (1 + 2j)).real + res.logabsdet
+
+
+def _svd_gauge_free(res):
+    U, S, Vh = res
+    k = S.shape[-1]
+    return (U[..., :k] * S.unsqueeze(-2)) @ Vh[..., :k, :], S
 
 
 def _qr_gauge_free(qr):

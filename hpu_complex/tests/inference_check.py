@@ -32,6 +32,9 @@ def _scalar_cases(torch):
         "c64_view_as_real": lambda x: torch.view_as_real(torch.complex(x, x * 0.5) * (1 + 1j)),
         "c64_mm": lambda x: (torch.complex(x[:4, None] * x[None, :4], x[:4, None]) @
                              torch.complex(x[None, :4] + x[:4, None], x[4:8, None] * 0)).imag,
+        "c64_angle": lambda x: torch.angle(torch.complex(x, -x)),
+        "c64_im2col": lambda x: torch.ops.aten.im2col(
+            torch.complex(x, x * 0.5).reshape(1, 1, 4, 4), (2, 2), (1, 1), (1, 1), (1, 1)).abs(),
     }
 
 
