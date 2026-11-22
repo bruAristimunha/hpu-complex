@@ -46,6 +46,7 @@ C64 = torch.complex64
 FORCE_REAL_ON_CARD = False
 _CL = None  # test hook: stand-in for hpu_ops.tpc.complex_linalg on CPU tests
 CALLS = {}  # op name -> calls taken on the card (card checks read it)
+_CL = None  # test hook: stand-in for hpu_ops.tpc.complex_linalg on CPU tests
 
 
 def _count(name):
@@ -1221,6 +1222,66 @@ def lstsq(A, B, rcond=None, driver=None):
     return (X.squeeze(-1) if vector else X), residuals, rank, sv
 
 
+# ---- eig, eigvals ------------------------------------------------------------------------------------------------------
+
+
+class _Eig(torch.autograd.Function):
+    """torch's ``linalg_eig_backward`` (non-Hermitian):
+    ``gA = V^{-H} (diag(gL) + ((V^H gV - (V^H V) diag(Re(diag(V^H gV)))) / conj(E)) * (1 - I)) V^H``
+    with ``E_ij = L_j - L_i``. When ``gV`` is None (``eigvals``), skips ``E`` via ``solve_ex(V^H, gL[:, None] * V^H)``.
+    Omits the host-sync ``Im(diag(V^H gV))`` error check to stay sync-free in lazy mode.
+    """
+
+    @staticmethod
+    def forward(ctx, A, compute_v):
+        ctx.set_materialize_grads(False)
+        L_p, V_p = _complex_linalg().eig(A)
+        L, V = _as_complex(L_p), _as_complex(V_p)
+        ctx.save_for_backward(L, V)
+        if not compute_v:
+            return L, torch.empty(0, dtype=A.dtype, device=A.device)
+        return L, V
+
+    @staticmethod
+    def backward(ctx, gL, gV):
+        if gL is None and gV is None:
+            return None, None
+        L, V = ctx.saved_tensors
+        Vh = V.mH
+        if gV is None:
+            return solve_ex(Vh, gL.unsqueeze(-1) * Vh, left=True, check_errors=False)[0], None
+        VhgV = _cmatmul(Vh, gV)
+        VhV = _cmatmul(Vh, V)
+        diag_re = torch.view_as_real(VhgV.diagonal(0, -2, -1).resolve_conj())[..., 0]
+        num = VhgV - VhV * diag_re.unsqueeze(-2)
+        n = L.shape[-1]
+        eye = torch.eye(n, dtype=L.real.dtype, device=L.device)
+        E = (L.unsqueeze(-2) - L.unsqueeze(-1)).conj() + eye
+        M = (num / E) * (1.0 - eye)
+        if gL is not None:
+            M = M + torch.diag_embed(gL)
+        return solve_ex(Vh, _cmatmul(M, Vh), left=True, check_errors=False)[0], None
+
+
+def eig(A):
+    """``linalg_eig`` via ``complex_linalg.eig`` -> (eigenvalues, eigenvectors)."""
+    if torch.is_grad_enabled() and A.requires_grad:
+        return _Eig.apply(A, True)
+    L_p, V_p = _complex_linalg().eig(A)
+    return _as_complex(L_p), _as_complex(V_p)
+
+
+def eigvals(A):
+    """``linalg_eigvals`` via ``complex_linalg.eigvals`` (or ``_Eig`` when grad is needed)."""
+    if torch.is_grad_enabled() and A.requires_grad:
+        return _Eig.apply(A, False)[0]
+    cl = _complex_linalg()
+    fn = getattr(cl, "eigvals", None)
+    if fn is not None:
+        return _as_complex(fn(A))
+    return _as_complex(cl.eig(A)[0])
+
+
 # ---- registration ------------------------------------------------------------------------------------------------------
 
 
@@ -1244,16 +1305,19 @@ ROUTES = {
     "matrix_exp": ("eager", "lazy"),
     "matrix_exp_composite": ("lazy",),
     "pinv": ("eager", "lazy"),
-    "householder_product": ("eager:grad", "lazy:grad"),
-    "lstsq": ("eager:grad", "lazy:grad"),
-    "solve_triangular": ("lazy:grad",),
-    "cholesky_solve": ("eager", "lazy"),
-    "cholesky_inverse": ("eager", "lazy"),
-    "qr": (),
+    "householder_product": ("eager:grad", "lazy:grad"),  # forward alone 0.2-0.5x, with backward 2-28x
+    "lstsq": ("eager:grad", "lazy:grad"),  # forward alone 0.7-0.9x, with backward 1.6-3.2x
+    "solve_triangular": ("lazy:grad",),  # forward 0.45-0.83x eager, 0.38-0.78x lazy; forward + backward 0.88-1.01x
+    # eager, 1.05-1.32x lazy (n = 4..32)
+    "cholesky_solve": ("eager", "lazy"),  # forward 0.8-3.0x eager, 0.4-1.9x lazy; with backward 1.0-1.2x / 1.1-1.9x
+    "cholesky_inverse": ("eager", "lazy"),  # forward 0.75-3.5x / 0.8-2.5x; with backward 0.9-1.2x / 1.2-2.1x
+    "qr": (),  # Habana's real qr: eager 0.45-0.85x forward, 0.7-0.9x with backward; lazy 90 ms-4.4 s per call
     "eigvalsh": ("eager", "lazy"),
     "eigh": ("eager", "lazy"),
     "svd": ("eager", "lazy"),
     "svdvals": ("eager", "lazy"),
+    "eig": ("eager", "lazy"),
+    "eigvals": ("eager", "lazy"),
 }
 
 
@@ -1439,6 +1503,25 @@ def _takes_svdvals(A, *, driver=None):
     return _takes_svd(A, False, False, driver=driver)
 
 
+def _takes_eig(A):
+    cl = _complex_linalg()
+    if cl is None or getattr(cl, "eig", None) is None:
+        return False
+    return _complex_on_card(A) and _square(A) and 1 <= A.shape[-1] <= cl.COMPLEX_MAXN
+
+
+def _takes_eigvals(A):
+    cl = _complex_linalg()
+    if cl is None:
+        return False
+    if torch.is_grad_enabled() and A.requires_grad:
+        if getattr(cl, "eig", None) is None:
+            return False
+    elif getattr(cl, "eigvals", None) is None and getattr(cl, "eig", None) is None:
+        return False
+    return _complex_on_card(A) and _square(A) and 1 <= A.shape[-1] <= cl.COMPLEX_MAXN
+
+
 def _entries():
     return [
         (aten._linalg_solve_ex.default, "solve", _takes_solve, solve_ex),
@@ -1459,6 +1542,8 @@ def _entries():
         (aten._linalg_svd.default, "svd", _takes_svd, svd),
         (aten._linalg_svd.U, "svd", _takes_svd_out, svd_out),
         (aten.linalg_svdvals.default, "svdvals", _takes_svdvals, svdvals),
+        (aten.linalg_eig.default, "eig", _takes_eig, eig),
+        (aten.linalg_eigvals.default, "eigvals", _takes_eigvals, eigvals),
         (aten.linalg_lstsq.default, "lstsq", _takes_lstsq,
          lambda A, B, rcond=None, *, driver=None: lstsq(A, B, rcond, driver), False),
     ]
@@ -1504,4 +1589,4 @@ def uninstall():
 
 __all__ = ["install", "uninstall", "CALLS", "solve_ex", "inv_ex", "det", "slogdet", "solve_triangular",
            "cholesky_solve", "cholesky_ex", "matrix_exp", "householder_product", "cholesky_inverse", "qr",
-           "eigh", "eigvalsh", "svd", "svdvals", "hpd_slogdet", "hpd_logdet"]
+           "eigh", "eigvalsh", "svd", "svdvals", "hpd_slogdet", "hpd_logdet", "eig", "eigvals"]
