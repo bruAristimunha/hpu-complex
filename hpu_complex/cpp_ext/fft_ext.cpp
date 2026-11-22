@@ -2205,7 +2205,8 @@ at::Tensor cat_pairs(const std::vector<at::Tensor>& all, int64_t dim, const at::
                   i, " in the list.");
     }
   }
-  return complex_result(at::cat(pairs, d));
+  auto res = complex_result(at::cat(pairs, d));
+  return is_lazy_mode() ? clone_pu1(res, std::nullopt) : res;
 }
 
 // cat.out as torch: the inputs' result type must cast to out's dtype (no complex into a real out), out may not overlap

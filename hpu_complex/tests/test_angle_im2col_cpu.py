@@ -199,3 +199,24 @@ def test_im2col_col2im_invalid_inputs_preserve_torch_errors():
             torch.ops.aten.im2col(args[0].to(HPU), *args[1:])
         assert type(got.value) is type(ref.value)
         assert str(got.value).splitlines()[0] == str(ref.value).splitlines()[0]
+
+
+def test_im2col_col2im_noncontiguous_out_empty_multitrial():
+    g = torch.Generator().manual_seed(123)
+    x0 = torch.randn(2, 3, 7, 1, dtype=C64, generator=g)
+    xc = torch.cat([x0, x0], dim=1)[:, ::2, :, :]
+    xh = torch.cat([x0.to(HPU), x0.to(HPU)], dim=1)[:, ::2, :, :]
+    ref_im = torch.ops.aten.im2col(xc, (2, 1), (1, 1), (0, 0), (2, 1))
+    before = torch.ops.hpu_complex.cpu_fallback_calls()
+    for _ in range(5):
+        out = torch.empty(ref_im.shape, dtype=C64, device=HPU)
+        torch.ops.aten.im2col.out(xh, (2, 1), (1, 1), (0, 0), (2, 1), out=out)
+        torch.testing.assert_close(out.cpu(), ref_im, atol=1e-5, rtol=1e-5)
+    yc = torch.cat([ref_im, ref_im], dim=1)[:, ::2, :]
+    yh = torch.cat([ref_im.to(HPU), ref_im.to(HPU)], dim=1)[:, ::2, :]
+    ref_col = torch.ops.aten.col2im(yc, (7, 1), (2, 1), (1, 1), (0, 0), (2, 1))
+    for _ in range(5):
+        out = torch.empty(ref_col.shape, dtype=C64, device=HPU)
+        torch.ops.aten.col2im.out(yh, (7, 1), (2, 1), (1, 1), (0, 0), (2, 1), out=out)
+        torch.testing.assert_close(out.cpu(), ref_col, atol=1e-5, rtol=1e-5)
+    assert torch.ops.hpu_complex.cpu_fallback_calls() == before

@@ -112,13 +112,7 @@ def _slogdet_phase(res):
 def _svd_gauge_free(res):
     U, S, Vh = res
     k = S.shape[-1]
-    if U.shape[-1] != k:
-        er = torch.eye(U.shape[-1], k, device=S.device, dtype=S.dtype)
-        U = U @ torch.complex(er, torch.zeros_like(er))
-    if Vh.shape[-2] != k:
-        er = torch.eye(k, Vh.shape[-2], device=S.device, dtype=S.dtype)
-        Vh = torch.complex(er, torch.zeros_like(er)) @ Vh
-    return (U * S.unsqueeze(-2)) @ Vh, S
+    return (U[..., :k] * S.unsqueeze(-2)) @ Vh[..., :k, :], S
 
 
 def _qr_gauge_free(qr):

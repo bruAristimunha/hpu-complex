@@ -224,6 +224,33 @@ def main():
 
     check("svd_variants", test_svd_variants)
 
+    def test_svd_full_multistep_slice_oncard():
+        hpu_complex.set_matmul_cpu_threshold(0)
+        try:
+            errs = []
+            for b, m, n in ((4, 8, 4), (2, 8, 4), (4, 20, 16), (4, 16, 20)):
+                k = min(m, n)
+                for it in range(3):
+                    A0 = rand(b, m, n, seed=50 + m * 7 + it)
+                    Ah = A0.to(C64).to(HPU).requires_grad_()
+                    sync()
+                    U, S, Vh = torch.linalg.svd(Ah, full_matrices=True)
+                    sync()
+                    rec = (U[..., :k] * S.unsqueeze(-2)) @ Vh[..., :k, :]
+                    (rec.abs() ** 2).sum().backward()
+                    sync()
+                    errs.append(rel(to_cpu(rec), A0))
+                    Ac = A0.clone().requires_grad_()
+                    Uc, Sc, Vhc = torch.linalg.svd(Ac, full_matrices=True)
+                    rec_c = (Uc[..., :k] * Sc.unsqueeze(-2)) @ Vhc[..., :k, :]
+                    (rec_c.abs() ** 2).sum().backward()
+                    errs.append(rel(to_cpu(Ah.grad), Ac.grad))
+            return max(errs) < 1e-3, max(errs)
+        finally:
+            hpu_complex.set_matmul_cpu_threshold(1 << 22)
+
+    check("svd_full_multistep_slice_oncard", test_svd_full_multistep_slice_oncard)
+
     # 5. inference_mode across ALL card linalg ops + angle + im2col/col2im
     def test_inference_mode_all():
         prev = os.environ.get("HPU_COMPLEX_LINALG")
@@ -340,6 +367,40 @@ def main():
         return max(errs) < 1e-5, max(errs)
 
     check("g11_g16_im2col_col2im", test_g11_g16_im2col_col2im)
+
+    def test_nc_im2col_col2im_out_empty():
+        errs = []
+        g = torch.Generator().manual_seed(123)
+        x0 = torch.randn(2, 3, 7, 1, dtype=C64, generator=g)
+        xc = torch.cat([x0, x0], dim=1)[:, ::2, :, :]
+        xh = torch.cat([x0.to(HPU), x0.to(HPU)], dim=1)[:, ::2, :, :]
+        sync()
+        ref_im = torch.ops.aten.im2col(xc, (2, 1), (1, 1), (0, 0), (2, 1))
+        for _ in range(10):
+            out = torch.empty(ref_im.shape, dtype=C64, device=HPU)
+            torch.ops.aten.im2col.out(xh, (2, 1), (1, 1), (0, 0), (2, 1), out=out)
+            errs.append(rel(to_cpu(out), ref_im.to(C128)))
+        yc = torch.cat([ref_im, ref_im], dim=1)[:, ::2, :]
+        yh = torch.cat([ref_im.to(HPU), ref_im.to(HPU)], dim=1)[:, ::2, :]
+        sync()
+        ref_col = torch.ops.aten.col2im(yc, (7, 1), (2, 1), (1, 1), (0, 0), (2, 1))
+        for _ in range(10):
+            out = torch.empty(ref_col.shape, dtype=C64, device=HPU)
+            torch.ops.aten.col2im.out(yh, (7, 1), (2, 1), (1, 1), (0, 0), (2, 1), out=out)
+            errs.append(rel(to_cpu(out), ref_col.to(C128)))
+        # Non-contiguous transpose input on Tier-2 overlapping shape
+        xt0 = torch.randn(2, 3, 6, 5, dtype=C64, generator=g)
+        xt_c = xt0.transpose(-1, -2)
+        xt_h = xt0.to(HPU).transpose(-1, -2)
+        sync()
+        ref_t = torch.ops.aten.im2col(xt_c, (3, 3), (1, 1), (1, 1), (1, 1))
+        for _ in range(5):
+            out = torch.empty(ref_t.shape, dtype=C64, device=HPU)
+            torch.ops.aten.im2col.out(xt_h, (3, 3), (1, 1), (1, 1), (1, 1), out=out)
+            errs.append(rel(to_cpu(out), ref_t.to(C128)))
+        return max(errs) < 1e-4, max(errs)
+
+    check("nc_im2col_col2im_out_empty", test_nc_im2col_col2im_out_empty)
 
     # 8. Eager mode only: torch.compile(backend="hpu_backend") on new ops (steady-state step2 zero fallback)
     if not LAZY:
