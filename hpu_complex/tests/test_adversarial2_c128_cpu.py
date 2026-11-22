@@ -135,12 +135,7 @@ def _stepped(a, b):
     return a
 
 
-GAUDI_ONLY = set()  # the fake HPU backend (cpu_stub) now holds the bool/int/float32 results these needed Habana for
-BREAKS = {}  # repeat and tile (they call unfold) were breaks until unfold became a PrivateUse1 view
-
-
-@pytest.mark.parametrize("name", [pytest.param(n, marks=pytest.mark.xfail(strict=True, reason="R2b break: " + BREAKS[n]))
-                                  if n in BREAKS else n for n in OPS if n not in GAUDI_ONLY])
+@pytest.mark.parametrize("name", list(OPS))
 def test_op_matches_cpu(name):
     fn, args = OPS[name]
     try:

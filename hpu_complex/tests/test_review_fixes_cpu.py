@@ -292,7 +292,7 @@ ADD_CASES = [complex(INF, 0), complex(-INF, 2), complex(NAN, 0), complex(0, INF)
 
 
 @pytest.mark.parametrize("c", ADD_CASES)
-@pytest.mark.parametrize("alpha", [1, 2.5, -1, 1j, 2 - 1j])
+@pytest.mark.parametrize("alpha", [0, 1, 2.5, -1, 1j, 2 - 1j])
 def test_add_alpha_nan_placement_like_torch(c, alpha):
     """torch's a + alpha b, alpha b a complex product. One exception, kept for speed (README Limits): two complex
     tensors on the card with a real alpha are pair arithmetic, a + alpha b per part, as main computed them."""
@@ -306,7 +306,7 @@ def test_add_alpha_nan_placement_like_torch(c, alpha):
 
     for op, sign in ((torch.add, 1), (torch.sub, -1)):
         got = op(z.to(HPU), w.to(HPU), alpha=alpha)
-        bits_equal(got, op(z, w, alpha=alpha) if isinstance(alpha, complex) else pair_sum(z, w, alpha * sign))
+        bits_equal(got, op(z, w, alpha=alpha) if isinstance(alpha, complex) else pair_sum(z, w, float(alpha) * sign))
     bits_equal(torch.add(x.to(HPU), w.to(HPU), alpha=alpha), torch.add(x, w, alpha=alpha))
     bits_equal(torch.add(z.to(HPU), torch.tensor(c), alpha=alpha), torch.add(z, torch.tensor(c), alpha=alpha))
     if not isinstance(alpha, complex):
