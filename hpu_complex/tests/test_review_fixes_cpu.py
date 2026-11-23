@@ -43,19 +43,21 @@ def bits_equal(got, ref):
 
 
 def div_equal(got, ref):
-    """Complex division against torch's: finite parts within 2 float32 ulp (rtol 2**-23, atol 2**-148 for the
-    subnormal range, where an ulp is absolute), signed zeros exact, and a non-finite part (inf or NaN) where
-    torch has one. torch's own CPU complex division is not bitwise stable across platforms: x86 torch 2.6 gives
-    a NaN real part for x / -0j where ARM torch 2.6 gives inf, and 1-ulp differences elsewhere (CI vs local,
-    measured)."""
+    """Complex division against torch's: parts finite on both sides within 2 float32 ulp (rtol 2**-23, atol
+    2**-148 for the subnormal range, where an ulp is absolute), signed zeros exact, a non-finite part (inf or
+    NaN) where torch has one, and at the overflow edge a finite part past float32 max / 2 where torch has inf
+    (Smith scaling stays finite there; torch's x86 form overflows). torch's own CPU complex division is not
+    bitwise stable across platforms: x86 torch 2.6 gives a NaN real part for x / -0j where ARM torch 2.6 gives
+    inf, and 1-ulp differences elsewhere (CI vs local, measured)."""
     g = got.detach().cpu().resolve_conj()
     if g.is_complex():
         g, ref = torch.view_as_real(g), torch.view_as_real(ref.resolve_conj())
     assert g.dtype == ref.dtype and g.shape == ref.shape, (g.dtype, ref.dtype, g.shape, ref.shape)
-    finite = torch.isfinite(ref)
-    assert torch.equal(torch.isfinite(g), finite), (g, ref)
-    torch.testing.assert_close(g[finite], ref[finite], rtol=2 ** -23, atol=2 ** -148)
-    assert torch.equal(torch.signbit(g[finite]), torch.signbit(ref[finite])), (g, ref)
+    both_finite = torch.isfinite(g) & torch.isfinite(ref)
+    overflow = (torch.isfinite(g) & (g.abs() > 1.7e38)) | (torch.isfinite(ref) & (ref.abs() > 1.7e38))
+    assert bool((both_finite | ~torch.isfinite(g) & ~torch.isfinite(ref) | overflow).all()), (g, ref)
+    torch.testing.assert_close(g[both_finite], ref[both_finite], rtol=2 ** -23, atol=2 ** -148)
+    assert torch.equal(torch.signbit(g[both_finite]), torch.signbit(ref[both_finite])), (g, ref)
 
 
 # ---- #1 a failed set_ installs nothing -------------------------------------------------------------------
