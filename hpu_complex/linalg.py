@@ -369,8 +369,12 @@ def _det_backward(A, d, g_det):
     cofactor = (g_det * d.conj())[..., None, None] * inv_ah
     grad = torch.where(singular[..., None, None], 0.0, cofactor)
     if torch.is_grad_enabled():
-        # Double backward: the SVD formula at the singular entries (selected per entry, no host read of singular).
-        grad = torch.where(singular[..., None, None], _det_svd_backward(A, g_det), grad)
+        # Double backward at a singular matrix takes the SVD formula for the whole batch (its second derivative
+        # mixes entries); traced, select per entry instead of reading singular on the host.
+        if _tracing((d,)):
+            grad = torch.where(singular[..., None, None], _det_svd_backward(A, g_det), grad)
+        elif singular.any():
+            return _det_svd_backward(A, g_det)
     return grad
 
 
