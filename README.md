@@ -118,7 +118,7 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
   `[ar | ai] @ [[br, bi], [-bi, br]] = [cr | ci]`, conjugate operands included (they reach `mm`/`bmm`
   unresolved). Products below 2²² multiply-adds (batch·m·k·n) go to the CPU instead, one copy each way, where
   they are faster (warned once; `hpu_complex.set_matmul_cpu_threshold(0)` keeps all of them on the card). The
-  threshold comes from `tests/cmatmul_bench.py` (per-product timings), not from a model. In spd_learn's `Green`
+  threshold comes from `hpu_complex/tests/cmatmul_bench.py` (per-product timings), not from a model. In spd_learn's `Green`
   no product falls below it; a train step took 296 ms median (291-351) with the card GEMM against 411 ms
   (369-422) with every product on the CPU, 5 rotated rounds of 20 steps in one process. A second 2-round run
   measured only 1.05x and 1.21x: the step time drifts by up to 30% within a process, so read it as 1.0-1.4x.
@@ -189,9 +189,9 @@ torch.fft.rfft(v).abs().sum().backward()   # gradients work
 | real HPU tensor and a Python complex scalar (`*`, `+`, `-`, `/`, rsub, alpha, 0-d, strided; bf16/int/bool → complex64, float64 → complex128), eager and lazy (relative); in-place / `out=` into a real tensor raise as torch | ≤ 7.4e-08 |
 | complex `exp` (C99 edges: `exp(inf + 0j) = inf + 0j`), `neg`, `masked_fill_`, `cat` (real operands, conj, legacy empties), `linalg.vector_norm` (ord, dim, keepdim), with gradients, eager and lazy | ≤ 4.8e-07 |
 
-Plain float ops are unchanged. A float-only eager loop (`tests/float_tax.py`) takes 1.9–2.8 ms per iteration with or without the extension loaded (medians 2.70 and 2.58 ms over five runs each): the run-to-run spread is larger than any difference.
+Plain float ops are unchanged. A float-only eager loop (`hpu_complex/tests/float_tax.py`) takes 1.9–2.8 ms per iteration with or without the extension loaded (medians 2.70 and 2.58 ms over five runs each): the run-to-run spread is larger than any difference.
 
-The onesided `_fft_r2c` backward is one GEMM: `view_as_real(grad) @ Wᵀ`. It is registered at `AutogradHPU` and traceable under compile. Its gradients match CPU float64 to 6.1e-07, relative, for n = 8, 9, 16 and 200, all three norms, eager and compiled with static and dynamic shapes (`tests/r2c_grad_check.py`). Compiled `stft().abs()`, forward and backward, at (3000, 6000): 280 ms here, 219 ms with real-DFT matmuls inside the graph.
+The onesided `_fft_r2c` backward is one GEMM: `view_as_real(grad) @ Wᵀ`. It is registered at `AutogradHPU` and traceable under compile. Its gradients match CPU float64 to 6.1e-07, relative, for n = 8, 9, 16 and 200, all three norms, eager and compiled with static and dynamic shapes (`hpu_complex/tests/r2c_grad_check.py`). Compiled `stft().abs()`, forward and backward, at (3000, 6000) (`hpu_complex/tests/stft_bench.py`): 280 ms here, 219 ms with real-DFT matmuls inside the graph.
 
 braindecode models with `braindecode_kernels.patch_braindecode()` (v0.2.2), one card, compiled, seconds per step. The baseline computes the same spectra with real-DFT matmuls inside the graph (`--hpu-spectral`); each pair ran back to back on the same card:
 
@@ -254,7 +254,7 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
 - The dispatch mode is opt-in and scoped
   (`with hpu_complex.complex_mode():`), not global: `enable()` never
   enters it. It is only needed for the fused TPC FFT hook.
-- FFT is a dense GEMM (O(n²)), last dimension only, complex64 only.
+- FFT is a dense GEMM (O(n²)), last dimension only, complex64 on the card; complex128 on the CPU.
 - Habana misreads some non-contiguous layouts of rank 6 or more, its own
   float tensors too: `as_strided` views, and copies of results that keep
   a permuted input's strides (`(x.permute(0, 2, 1, 3, 4, 5) * 2).contiguous()`).
@@ -362,12 +362,11 @@ how other GPUs do it: [INVESTIGATION.md](INVESTIGATION.md)
 ```bash
 python -m pytest hpu_complex/tests/ -q            # CPU (the HPU tests skip without habana_frameworks;
                                                  #  the complex128 ones build the extension: need ninja)
-# The CPU suite checks the complex GEMM's formula and block layout in pure torch (test_cmatmul_formula_cpu.py),
-# and the hpu_backend pass patches on stub passes plus the rank-6 permute-block rule (test_compile_patches_cpu.py).
-# test_extension_build_cpu.py builds the C++ extension against CPU torch and checks its dispatcher registrations.
-# test_pair_kernels_formula_cpu.py mirrors the pair formulas of exp, neg, masked_fill_, cat, vector_norm and of the
-# real x complex-scalar path against torch (the scalar path bit for bit, signed zeros included).
-# test_review_fixes_cpu.py / test_review_mediums_cpu.py / test_review2_cpu.py run the C++ kernels themselves on the CPU: cpu_stub/
+# The CPU suite runs the complex GEMM on the fake backend (test_cmatmul_cpu.py), complex64 FFT/STFT
+# kernels (test_fft_cpu.py), and the hpu_backend pass patches on stub passes plus permuted rank-5..7
+# layouts on the fake backend (test_compile_patches_cpu.py). test_extension_build_cpu.py builds the
+# C++ extension against CPU torch and checks its dispatcher registrations. test_review_fixes_cpu.py /
+# test_review_mediums_cpu.py / test_review2_cpu.py run the C++ kernels themselves on the CPU: cpu_stub/
 # hpu_guard_stub.cpp is a fake HPU backend (host memory reporting the HPU device, torch's CPU kernels in place of
 # Habana's), so complex64 runs the card path (pair kernels, storages, out=, overlap, the complex-scalar interception,
 # set_, checkpoints in a fresh process) against torch. Lazy mode and Habana's numerics (its float32 GEMM, its layout

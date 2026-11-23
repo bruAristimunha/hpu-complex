@@ -1,10 +1,11 @@
 """FFT on HPU without complex dtype: real tensors in, [..., freq, 2] out.
 
 
-Why: gaudi-pytorch-bridge rejects complex64 (tensor_utils.cpp is_supported_type)
-and has no FFT kernel, so torch.fft.* crashes on HPU. This module never creates
-a complex tensor. It uses only float reshape/mul/add/matmul, which HPU already
-supports, in eager mode and inside torch.compile graphs. Differentiable.
+Why: without hpu_complex.enable(), gaudi-pytorch-bridge rejects complex64
+(tensor_utils.cpp is_supported_type) and has no FFT kernel, so torch.fft.*
+crashes on HPU. This module never creates a complex tensor. It uses only
+float reshape/mul/add/matmul, which HPU already supports, in eager mode and
+inside torch.compile graphs. Differentiable.
 
 Convention: a complex spectrum is a real tensor whose last dim is [real, imag].
 Power-of-two lengths use an O(n log n) radix-2 butterfly; other lengths use a
@@ -55,18 +56,14 @@ def _fft_pow2(re, im):
     return re, im
 
 
-def _dft_dense(re, im, inverse=False):
+def _dft_dense(re, im):
     """Dense DFT along last dim for any length, via two real matmuls."""
     n = re.shape[-1]
     k = torch.arange(n, device=re.device, dtype=re.dtype)
-    ang = (2.0 * math.pi / n) * torch.outer(k, k)
-    if not inverse:
-        ang = -ang
+    ang = -(2.0 * math.pi / n) * torch.outer(k, k)
     c, s = torch.cos(ang), torch.sin(ang)
     out_re = re @ c.T - im @ s.T
     out_im = re @ s.T + im @ c.T
-    if inverse:
-        out_re, out_im = out_re / n, out_im / n
     return out_re, out_im
 
 
@@ -115,8 +112,8 @@ def fft(spec, dim=-1):
 
 
 def magnitude(spec):
-    """|X| from a [..., 2] spectrum. The common training front end."""
-    # ponytail: 1e-12 keeps abs() grad finite at 0; exact-zero bins get ~1e-6 floor
+    """|X| from a [..., 2] spectrum. Adds 1e-12 under the sqrt: finite gradient at 0, magnitude floor ~1e-6."""
+    # Adds 1e-12 under the sqrt so abs() gradients stay finite at 0; exact-zero bins have ~1e-6 floor.
     return torch.sqrt(spec[..., 0] ** 2 + spec[..., 1] ** 2 + 1e-12)
 
 

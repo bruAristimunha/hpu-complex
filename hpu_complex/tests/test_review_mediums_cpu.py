@@ -1,6 +1,6 @@
 """The C++ kernels on the CPU stand-in (cpu_stub/hpu_guard_stub.cpp): the review's Medium and Low findings, and the
 card pair kernels (exp, neg, masked_fill_, cat, vector_norm, the real x complex-scalar path) run for real against
-torch, where test_pair_kernels_formula_cpu.py only checks Python mirrors of their formulas.
+torch.
 
 python -m pytest hpu_complex/tests/test_review_mediums_cpu.py -q
 """
@@ -12,8 +12,7 @@ import torch
 import torch.autograd.forward_ad as fwAD
 
 from hpu_complex.tests.test_complex128_cpu import HPU, extension, tagged  # noqa: F401
-from hpu_complex.tests.test_pair_kernels_formula_cpu import check_c99_cexp
-from hpu_complex.tests.test_review_fixes_cpu import bits_equal, h
+from hpu_complex.tests.test_review_fixes_cpu import bits_equal, div_equal, h
 
 C64, C128 = torch.complex64, torch.complex128
 INF, NAN = math.inf, math.nan
@@ -198,6 +197,52 @@ EDGE = torch.tensor([0j, complex(-0.0, 0.0), complex(0.0, -0.0), 1 + 2j, -3.5 + 
                      complex(0, NAN), 1e-30 + 1e30j, complex(40.0, 3.0)], dtype=C64)
 
 
+# C99 Annex G.6.3.1 cexp at its special values, (input, expected, signs specified). The table is the reference, not
+# the platform's torch.exp (torch 2.6's x86 kernel gives exp(inf + 0j) = inf + nan j, its arm64 one inf + 0j).
+# cexp(conj(z)) = conj(cexp(z)); -inf + iy gives +0 cis(y), +inf + iy (y finite, nonzero) +inf cis(y). Where C99 leaves
+# the signs unspecified (the last four infinite cases), the kernel's choice is listed and only magnitudes are checked.
+C99_CEXP = [
+    (complex(0.0, 0.0), complex(1.0, 0.0), True),
+    (complex(-0.0, 0.0), complex(1.0, 0.0), True),
+    (complex(0.0, -0.0), complex(1.0, -0.0), True),
+    (complex(-0.0, -0.0), complex(1.0, -0.0), True),
+    (complex(INF, 0.0), complex(INF, 0.0), True),
+    (complex(INF, -0.0), complex(INF, -0.0), True),
+    (complex(-INF, 0.0), complex(0.0, 0.0), True),
+    (complex(-INF, -0.0), complex(0.0, -0.0), True),
+    (complex(-INF, 1.0), complex(0.0, 0.0), True),      # +0 (cos 1 + i sin 1)
+    (complex(-INF, -2.0), complex(-0.0, -0.0), True),   # +0 (cos -2 + i sin -2): both negative
+    (complex(INF, 1.0), complex(INF, INF), True),
+    (complex(INF, 3.0), complex(-INF, INF), True),      # cos 3 < 0, sin 3 > 0
+    (complex(NAN, 0.0), complex(NAN, 0.0), True),
+    (complex(NAN, -0.0), complex(NAN, -0.0), True),
+    (complex(NAN, 1.0), complex(NAN, NAN), True),
+    (complex(1.0, INF), complex(NAN, NAN), True),
+    (complex(0.0, INF), complex(NAN, NAN), True),
+    (complex(1.0, NAN), complex(NAN, NAN), True),
+    (complex(0.0, NAN), complex(NAN, NAN), True),
+    (complex(NAN, NAN), complex(NAN, NAN), True),
+    (complex(-INF, INF), complex(0.0, 0.0), False),
+    (complex(-INF, NAN), complex(0.0, 0.0), False),
+    (complex(INF, INF), complex(INF, NAN), False),
+    (complex(INF, NAN), complex(INF, NAN), False),
+]
+
+
+def check_c99_cexp(exp):
+    """exp (complex64 tensor -> complex64 tensor) against C99_CEXP: NaN exactly where C99 has NaN, every other part
+    bit-equal (signs included) where C99 specifies the sign, equal in magnitude where it leaves the sign open."""
+    z = torch.tensor([v for v, _, _ in C99_CEXP], dtype=torch.complex64)
+    got = torch.view_as_real(exp(z)).contiguous()
+    want = torch.view_as_real(torch.tensor([w for _, w, _ in C99_CEXP], dtype=torch.complex64))
+    signed = torch.tensor([s for _, _, s in C99_CEXP])[:, None].expand_as(want)
+    nan = want.isnan()
+    assert torch.equal(got.isnan(), nan), (z, got)
+    exact = signed & ~nan
+    assert torch.equal(got[exact].view(torch.int32), want[exact].view(torch.int32)), (z, got)
+    assert torch.equal(got[~signed & ~nan].abs(), want[~signed & ~nan].abs()), (z, got)
+
+
 def test_exp_kernel_matches_torch_at_edges():
     """The special values against the C99 Annex G table (signs bit-exact where C99 fixes them), as torch's own exp is
     not the same on every platform there; finite inputs within 2 ulp of torch (e^a is computed as two halves, one
@@ -210,6 +255,13 @@ def test_exp_kernel_matches_torch_at_edges():
     zero = ref == 0
     assert torch.equal(got[zero].view(torch.int32), ref[zero].view(torch.int32)), (got, ref)
     torch.testing.assert_close(got, ref, rtol=2.5e-7, atol=0)
+
+
+@pytest.mark.parametrize("shape", [(), (2, 3, 4)])
+def test_exp_kernel_shapes_and_conj(shape):
+    z = torch.randn(shape, dtype=C64, generator=torch.Generator().manual_seed(0))
+    for inp in (z, z.conj()):
+        torch.testing.assert_close(inp.to(HPU).exp().cpu(), inp.exp(), rtol=2e-6, atol=2e-6)
 
 def test_neg_kernel_with_conjugate_views():
     z = torch.randn(3, 4, dtype=C64, generator=torch.Generator().manual_seed(1))
@@ -229,7 +281,7 @@ def test_neg_kernel_with_conjugate_views():
 
 
 @pytest.mark.parametrize("value", [0, -0.0, complex(0, -0.0), 2.5, -1j, 1 + 2j, INF, complex(NAN, 1)])
-@pytest.mark.parametrize("mask_shape", [(3, 4), (4,), (3, 1), ()])
+@pytest.mark.parametrize("mask_shape", [(3, 4), (4,), (1, 4), (3, 1), ()])
 def test_masked_fill_kernel_like_torch(value, mask_shape):
     z = torch.randn(3, 4, dtype=C64, generator=torch.Generator().manual_seed(2))
     m = torch.rand(mask_shape, generator=torch.Generator().manual_seed(3)) > 0.5
@@ -237,7 +289,7 @@ def test_masked_fill_kernel_like_torch(value, mask_shape):
     bits_equal(got, z.clone().masked_fill_(m, value))
 
 
-@pytest.mark.parametrize("dim", [0, 1, -1])
+@pytest.mark.parametrize("dim", [0, 1, -1, -2])
 def test_cat_kernel_of_complex_and_real(dim):
     a = torch.randn(2, 3, dtype=C64, generator=torch.Generator().manual_seed(4))
     b = torch.randn(2, 3, generator=torch.Generator().manual_seed(5))
@@ -249,10 +301,11 @@ def test_cat_kernel_of_complex_and_real(dim):
 @pytest.mark.parametrize("c", [2j, 1 + 2j, -0.5 - 0.25j, complex(0, -0.0), 3.0 + 0j])
 @pytest.mark.parametrize("op", ["mul", "rmul", "add", "sub", "rsub", "div"])
 def test_real_tensor_and_complex_scalar_bitwise(c, op):
-    x = torch.tensor([1.5, -2.0, 0.0, -0.0, 1e-30, 3e38])
+    x = torch.tensor([1.5, -2.0, 0.0, -0.0, 1e-40, 1e-30, 3e38, INF, -INF, NAN])
     f = {"mul": lambda t: t * c, "rmul": lambda t: c * t, "add": lambda t: t + c, "sub": lambda t: t - c,
          "rsub": lambda t: c - t, "div": lambda t: t / c}[op]
-    bits_equal(f(x.to(HPU)), f(x))  # bits_equal masks NaN payloads: division by a zero c is checked too
+    # div: torch's CPU complex division differs by platform (see div_equal); the rest stay bitwise.
+    (div_equal if op == "div" else bits_equal)(f(x.to(HPU)), f(x))
 
 
 def test_vector_norm_kernel_gradient_like_torch():

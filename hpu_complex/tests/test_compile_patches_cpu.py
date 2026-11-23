@@ -139,36 +139,77 @@ def test_patches_are_idempotent(stub_passes):
     assert (passes.is_eager_fallback_required, passes.pass_mark_placement, passes.pass_fuse_view_chains) == first
 
 
-def _permute_block(t):
-    """habana_view's rank-6+ dense path in pure torch: the dims from the largest stride to the smallest as one
-    contiguous block at t's offset, permuted back (cpp_ext/fft_ext.cpp habana_view; used by dense_copy)."""
-    order = sorted(range(t.dim()), key=lambda d: -t.stride(d))
-    block = [t.size(d) for d in order]
-    dims = [order.index(d) for d in range(t.dim())]
-    flat = t.as_strided((t.untyped_storage().nbytes() // t.element_size(),), (1,), 0)
-    return flat.narrow(0, t.storage_offset(), t.numel()).view(block).permute(dims)
+def _load_fake_hpu():
+    import importlib.util
+    import pathlib
+    import shutil
+    import warnings
+    from torch.utils.cpp_extension import load
+    from hpu_complex.extension import load_extension
+
+    if importlib.util.find_spec("habana_frameworks") is not None:
+        pytest.skip("Gaudi image: fake backend tests skip when habana_frameworks is present")
+    if shutil.which("ninja") is None:
+        pytest.skip("ninja not found: cannot build the extension")
+    stub = types.ModuleType("torch.hpu")
+    stub._lazy_init = lambda: None
+    stub.is_available = lambda: False
+    stub.is_current_stream_capturing = lambda: False
+    saved, saved_attr = sys.modules.get("torch.hpu"), getattr(torch, "hpu", None)
+    sys.modules["torch.hpu"] = stub
+    torch.hpu = stub
+    stub_cpp = pathlib.Path(__file__).parent / "cpu_stub" / "hpu_guard_stub.cpp"
+    load_extension()
+    load(name="hpu_guard_stub", sources=[str(stub_cpp)], is_python_module=False)
+    return saved, saved_attr, warnings
+
+
+@pytest.fixture
+def fake_hpu_eager():
+    saved, saved_attr, warnings = _load_fake_hpu()
+    torch.ops.hpu_complex.set_lazy_mode(False)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            yield torch.device("hpu")
+    finally:
+        torch.ops.hpu_complex.set_lazy_mode(False)
+        if saved is None:
+            sys.modules.pop("torch.hpu", None)
+        else:
+            sys.modules["torch.hpu"] = saved
+        if saved_attr is None:
+            delattr(torch, "hpu")
+        else:
+            torch.hpu = saved_attr
 
 
 @pytest.mark.parametrize("make", [
-    lambda x: x[1, 1:].permute(0, 2, 1, 3, 4, 5, 6)[..., 0] * 1,       # a permuted op result (strides kept)
-    lambda x: x[1].permute(5, 4, 3, 2, 1, 0, 6),                       # offset, dense, rank 7
-    lambda x: x[0, 1, 1].permute(4, 3, 2, 1, 0),                       # rank 5
+    lambda x: x[1].permute(5, 4, 3, 2, 1, 0, 6),                       # offset, dense, rank 7 (pair rank 8)
+    lambda x: x[0, 1, 1].permute(4, 3, 2, 1, 0),                       # offset, dense, rank 5 (pair rank 6)
+    lambda x: x[0, 0, 0].permute(4, 3, 2, 1, 0),                       # zero-offset, dense, rank 5 (pair rank 6)
 ])
-def test_permute_block_reads_dense_permuted_layouts(make):
-    x = torch.randn(2, 2, 3, 2, 2, 3, 2, 2)
-    t = make(x)
-    assert is_non_overlapping_and_dense(t) and not t.is_contiguous()
-    got = _permute_block(t)
-    assert got.stride() == t.stride()
-    assert torch.equal(got, t)
-    assert torch.equal(got.contiguous(), t.contiguous())
+def test_permuted_rank5_to_7_complex_layouts_on_fake_hpu(fake_hpu_eager, make):
+    x = torch.randn(2, 2, 3, 2, 2, 3, 2, 2, dtype=torch.complex64, generator=torch.Generator().manual_seed(0))
+    ref = make(x)
+    got = make(x.to(fake_hpu_eager))
+    assert is_non_overlapping_and_dense(ref) and got.stride() == ref.stride()
+    torch.testing.assert_close((got * 1).cpu(), ref * 1, rtol=0, atol=0)
+    torch.testing.assert_close(got.contiguous().cpu(), ref.contiguous(), rtol=0, atol=0)
+    dst = torch.empty(ref.shape, dtype=torch.complex64, device=fake_hpu_eager)
+    dst.copy_(got)
+    torch.testing.assert_close(dst.cpu(), ref.contiguous(), rtol=0, atol=0)
 
 
-def test_a_sliced_view_is_not_dense():
+def test_a_sliced_view_is_not_dense(fake_hpu_eager):
     """dense_copy keeps contiguous() for such a view (habana_view's as_strided path); only dense ones take the
     permute block."""
-    x = torch.randn(2, 2, 3, 2, 2, 3, 2, 2)
-    assert not is_non_overlapping_and_dense(x[1, 1:].permute(0, 2, 1, 3, 4, 5, 6)[..., 0])
+    x = torch.randn(2, 2, 3, 2, 2, 3, 2, 2, dtype=torch.complex64, generator=torch.Generator().manual_seed(0))
+    sliced_ref = x[1, 1:].permute(0, 2, 1, 3, 4, 5, 6)[..., 0]
+    assert not is_non_overlapping_and_dense(sliced_ref)
+    sliced_hpu = x.to(fake_hpu_eager)[1, 1:].permute(0, 2, 1, 3, 4, 5, 6)[..., 0]
+    torch.testing.assert_close((sliced_hpu * 1).cpu(), sliced_ref * 1, rtol=0, atol=0)
+    torch.testing.assert_close(sliced_hpu.contiguous().cpu(), sliced_ref.contiguous(), rtol=0, atol=0)
 
 
 def test_lazy_mode_defaults_to_lazy_without_the_bridge_query(monkeypatch):

@@ -225,7 +225,7 @@ def add_checks(check, err, grad_err, worst, sync=lambda: None):
     # ---- revision round: an independent review's cases ----------------------------------------------------------
     xe = torch.tensor([0.0, -0.0, 1.5, -2.0, inf, -inf, nan, 3e38])
     # Zero signs are not compared: Habana's own float x * 0.0 gives +0 for a negative x (torch -0), without complex.
-    # The formula's signed zeros are checked bit for bit on the CPU (test_pair_kernels_formula_cpu.py).
+    # The formula's signed zeros are checked bit for bit on the CPU (test_review_mediums_cpu.py).
     check("real x complex scalar at 0, -0, inf, nan: NaN where torch, values equal elsewhere", lambda: worst(
         *[_nan_bits_err(fn(xe.to(hpu)), fn(xe), signed_zeros=False) for fn in (
             lambda x: x * 2j, lambda x: (1 - 2j) * x, lambda x: x * (-0.0 - 0j), lambda x: x + 1j,
