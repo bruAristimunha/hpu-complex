@@ -19,6 +19,20 @@ INF, NAN = math.inf, math.nan
 # ---- G10: aten::angle, aten::angle.out, aten::eq.Scalar_out ---------------------------------------------------------
 
 
+def angle_equal(got, ref):
+    """complex64 angle against torch's: within 2 float32 ulp (rtol 2**-23; the measured difference is 1 ulp), NaN
+    and signed zeros exact. torch's own CPU angle is not bitwise stable: its x86 vector path gives
+    angle(1 + 1j) = 0x3F490FDA where its scalar path and atan2 give 0x3F490FDB (AVX512, torch 2.8 and 2.15,
+    measured)."""
+    g = got.detach().cpu()
+    if g.is_complex():
+        g, ref = torch.view_as_real(g), torch.view_as_real(ref)
+    assert g.dtype == ref.dtype and g.shape == ref.shape, (g.dtype, ref.dtype, g.shape, ref.shape)
+    torch.testing.assert_close(g, ref, rtol=2 ** -23, atol=0, equal_nan=True)
+    keep = ~ref.isnan()
+    assert torch.equal(torch.signbit(g[keep]), torch.signbit(ref[keep])), (g, ref)
+
+
 @pytest.mark.parametrize("dtype", [C64, C128])
 def test_angle_values_and_edges(dtype):
     vals = [1 + 0j, 0 + 1j, -1 + 0j, 0 - 1j, 1 + 1j, -3 - 4j, 0j, complex(-0.0, 0.0),
@@ -33,14 +47,14 @@ def test_angle_values_and_edges(dtype):
     assert not [w for w in caught if "runs on the CPU" in str(w.message)]
     ref = torch.angle(z)
     assert got.dtype == ref.dtype
-    bits_equal(got, ref)
+    (angle_equal if dtype == C64 else bits_equal)(got, ref)
 
 
 def test_angle_conj_strided_0d_empty_and_out():
     z = torch.randn(3, 5, dtype=C64, generator=torch.Generator().manual_seed(0))
     zh = z.to(HPU)
-    bits_equal(torch.angle(zh.conj().mT), torch.angle(z.conj().mT))
-    bits_equal(torch.angle(zh[1, 2]), torch.angle(z[1, 2]))
+    angle_equal(torch.angle(zh.conj().mT), torch.angle(z.conj().mT))
+    angle_equal(torch.angle(zh[1, 2]), torch.angle(z[1, 2]))
     empty = torch.empty(0, 3, dtype=C64, device=HPU)
     assert torch.angle(empty).shape == (0, 3) and torch.angle(empty).dtype == torch.float32
 
@@ -51,13 +65,13 @@ def test_angle_conj_strided_0d_empty_and_out():
             warnings.simplefilter("ignore")
             assert torch.angle(zh, out=out_h) is out_h
             torch.angle(z, out=out_c)
-        bits_equal(out_h, out_c)
+        angle_equal(out_h, out_c)
 
     # Full overlap (out=self) succeeds; partial overlap and non-castable out raise
     zc = zh.clone()
     z_ref = z.clone()
     torch.angle(zc, out=zc)
-    bits_equal(zc, torch.angle(z_ref, out=z_ref))
+    angle_equal(zc, torch.angle(z_ref, out=z_ref))
     with pytest.raises(RuntimeError, match="single memory location"):
         torch.angle(zh[1:], out=zh[:-1])
     with pytest.raises(RuntimeError, match="can't be cast"):
@@ -81,7 +95,7 @@ def test_angle_backward_zero_safe_and_inference_mode():
         before = torch.ops.hpu_complex.cpu_fallback_calls()
         got = torch.angle(zh.detach())
         assert got.is_inference() and torch.ops.hpu_complex.cpu_fallback_calls() == before
-        bits_equal(got, torch.angle(z.detach()))
+        angle_equal(got, torch.angle(z.detach()))
 
 
 @pytest.mark.parametrize("scalar", [0, 0.0, 1 + 2j, 1e40, float("inf"), float("nan")])
