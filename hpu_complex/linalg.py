@@ -362,7 +362,14 @@ def _det_backward(A, d, g_det):
     if g_det is None:
         return None
     if A.device.type != "hpu":
-        # The aten registration is global: keep torch's own semantics off the card (LU solve, no singular raise).
+        # The aten registration is global: keep torch's own semantics off the card (LU solve; at a singular
+        # matrix the SVD cofactor formula, as in _det_svd_backward, where the LU inverse is not finite).
+        if (d == 0).any():
+            U, S, Vh = torch.linalg.svd(A, full_matrices=False)
+            alpha = (torch.linalg.det(U) * torch.linalg.det(Vh)).conj()
+            before = torch.cat([torch.ones_like(S[..., :1]), S[..., :-1].cumprod(-1)], -1)
+            after = torch.cat([S[..., 1:].flip(-1).cumprod(-1).flip(-1), torch.ones_like(S[..., :1])], -1)
+            return (U * ((g_det * alpha)[..., None] * (before * after)).unsqueeze(-2)) @ Vh
         LU, piv, _info = torch.linalg.lu_factor_ex(A, check_errors=False)
         eye = torch.eye(A.shape[-1], dtype=A.dtype, device=A.device).expand_as(A)
         return g_det[..., None, None] * d.conj()[..., None, None] * torch.linalg.lu_solve(LU, piv, eye).mH
