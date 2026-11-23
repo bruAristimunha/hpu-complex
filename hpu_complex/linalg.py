@@ -363,7 +363,7 @@ def _det_backward(A, d, g_det):
         return None
     if A.device.type != "hpu":
         # The aten registration is global: keep torch's own semantics off the card (LU solve, no singular raise).
-        LU, piv = torch.linalg.lu_factor(A)
+        LU, piv, _info = torch.linalg.lu_factor_ex(A, check_errors=False)
         eye = torch.eye(A.shape[-1], dtype=A.dtype, device=A.device).expand_as(A)
         return g_det[..., None, None] * d.conj()[..., None, None] * torch.linalg.lu_solve(LU, piv, eye).mH
     singular = d.abs() == 0
@@ -383,7 +383,7 @@ def _slogdet_backward(A, sign, g_sign, g_lad):
     if g_sign is None and g_lad is None:
         return None
     if A.device.type != "hpu":
-        LU, piv = torch.linalg.lu_factor(A)
+        LU, piv, _info = torch.linalg.lu_factor_ex(A, check_errors=False)
         eye = torch.eye(A.shape[-1], dtype=A.dtype, device=A.device).expand_as(A)
         inv_ah = torch.linalg.lu_solve(LU, piv, eye).mH
         re = g_lad if g_lad is not None else torch.zeros_like(sign.real)
