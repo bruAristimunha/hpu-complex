@@ -42,6 +42,21 @@ def bits_equal(got, ref):
     assert torch.equal(gi[~nan], ri[~nan]), (g, ref)
 
 
+def div_equal(got, ref):
+    """Complex division against torch's: finite parts within 2 float32 ulp (rtol 2**-23), signed zeros exact, and
+    a non-finite part (inf or NaN) where torch has one. torch's own CPU complex division is not bitwise stable
+    across platforms: x86 torch 2.6 gives a NaN real part for x / -0j where ARM torch 2.6 gives inf, and 1-ulp
+    differences elsewhere (CI vs local, measured)."""
+    g = got.detach().cpu().resolve_conj()
+    if g.is_complex():
+        g, ref = torch.view_as_real(g), torch.view_as_real(ref.resolve_conj())
+    assert g.dtype == ref.dtype and g.shape == ref.shape, (g.dtype, ref.dtype, g.shape, ref.shape)
+    finite = torch.isfinite(ref)
+    assert torch.equal(torch.isfinite(g), finite), (g, ref)
+    torch.testing.assert_close(g[finite], ref[finite], rtol=2 ** -23, atol=0)
+    assert torch.equal(torch.signbit(g[finite]), torch.signbit(ref[finite])), (g, ref)
+
+
 # ---- #1 a failed set_ installs nothing -------------------------------------------------------------------
 
 

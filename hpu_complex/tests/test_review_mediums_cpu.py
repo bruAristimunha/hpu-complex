@@ -12,7 +12,7 @@ import torch
 import torch.autograd.forward_ad as fwAD
 
 from hpu_complex.tests.test_complex128_cpu import HPU, extension, tagged  # noqa: F401
-from hpu_complex.tests.test_review_fixes_cpu import bits_equal, h
+from hpu_complex.tests.test_review_fixes_cpu import bits_equal, div_equal, h
 
 C64, C128 = torch.complex64, torch.complex128
 INF, NAN = math.inf, math.nan
@@ -304,7 +304,8 @@ def test_real_tensor_and_complex_scalar_bitwise(c, op):
     x = torch.tensor([1.5, -2.0, 0.0, -0.0, 1e-40, 1e-30, 3e38, INF, -INF, NAN])
     f = {"mul": lambda t: t * c, "rmul": lambda t: c * t, "add": lambda t: t + c, "sub": lambda t: t - c,
          "rsub": lambda t: c - t, "div": lambda t: t / c}[op]
-    bits_equal(f(x.to(HPU)), f(x))  # bits_equal masks NaN payloads: division by a zero c is checked too
+    # div: torch's CPU complex division differs by platform (see div_equal); the rest stay bitwise.
+    (div_equal if op == "div" else bits_equal)(f(x.to(HPU)), f(x))
 
 
 def test_vector_norm_kernel_gradient_like_torch():
