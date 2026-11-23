@@ -620,19 +620,19 @@ def test_default_routes(card_linalg, monkeypatch, lazy):
     assert taken_by("slogdet", lambda: torch.linalg.slogdet(A))
     assert taken_by("cholesky", lambda: torch.linalg.cholesky(H))
     assert taken_by("matrix_exp", lambda: torch.linalg.matrix_exp(A)) == lazy  # the composite
-    assert not taken_by("householder_product", lambda: torch.linalg.householder_product(a, tau))
+    assert taken_by("householder_product", lambda: torch.linalg.householder_product(a, tau))  # forward too: no CPU route
     assert taken_by("householder_product",
                     lambda: torch.linalg.householder_product(a.requires_grad_(), tau).abs().sum().backward())
     assert taken_by("eigh", lambda: torch.linalg.eigh(H))
     assert taken_by("eigvalsh", lambda: torch.linalg.eigvalsh(H))
     assert taken_by("svd", lambda: torch.linalg.svd(A))
     assert taken_by("svdvals", lambda: torch.linalg.svdvals(A))
-    assert not taken_by("solve_triangular", lambda: torch.linalg.solve_triangular(A, B, upper=True))
+    assert taken_by("solve_triangular", lambda: torch.linalg.solve_triangular(A, B, upper=True))
     assert taken_by("solve_triangular", lambda: torch.linalg.solve_triangular(
-        A.clone().requires_grad_(), B, upper=True).abs().sum().backward()) == lazy  # lazy, with grad only
+        A.clone().requires_grad_(), B, upper=True).abs().sum().backward())
     assert taken_by("cholesky_solve", lambda: torch.cholesky_solve(B, torch.linalg.cholesky(H)))
     assert taken_by("cholesky_inverse", lambda: torch.cholesky_inverse(torch.linalg.cholesky(H)))
-    assert not taken_by("qr", lambda: torch.linalg.qr(A))
+    assert taken_by("qr", lambda: torch.linalg.qr(A))  # TPC qr at m <= 32, the real route past it
     # When complex_linalg is absent (hpu_ops missing), new complex_linalg ops decline cleanly
     monkeypatch.setattr(card_linalg, "_CL", None)
     assert not taken_by("det", lambda: torch.linalg.det(A))

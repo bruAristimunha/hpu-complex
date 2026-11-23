@@ -100,8 +100,8 @@ def _real_on_card(kind, n2, batch=1):
         return _hpu_ops_has("aten::linalg_solve_triangular") and n2 <= tpc.MAXN
     if kind == "matrix_exp":
         return _hpu_ops_has("aten::linalg_matrix_exp") and n2 <= tpc.SMALL_MAXN
-    if kind == "svd":
-        return _hpu_ops_has("aten::_linalg_svd") and n2 <= tpc.SMALL_MAXN
+    if kind == "svd":  # past SMALL_MAXN hpu-ops' Gram-free block route, any size (its _svd_takes has no cap)
+        return _hpu_ops_has("aten::_linalg_svd")
     if kind == "eigh":
         return _hpu_ops_has("aten::_linalg_eigh") and n2 <= tpc.EIGH_MAXN
     return False
@@ -1089,8 +1089,9 @@ def svdvals(A, *, driver=None):
 # ---- qr ---------------------------------------------------------------------------------------------------------------
 
 
-def _qr_forward(A, want_q):
-    """Habana's real QR of the interleaved ``E(A)`` (2m x 2n, m >= n). For ``A = Q R`` with ``diag(R) > 0``,
+def _qr_forward(A, want_q, mode="reduced"):
+    """``complex_linalg.qr`` (TPC Householder, m <= 32: rank-deficient safe, every mode) when it is there, else
+    Habana's real QR of the interleaved ``E(A)`` (2m x 2n, m >= n). For ``A = Q R`` with ``diag(R) > 0``,
     ``E(A) = E(Q) E(R)``, ``E(R)`` upper triangular with the diagonal pairs ``(r_kk, r_kk)`` and ``E(Q)`` with orthonormal
     columns; the real QR with a positive diagonal is unique (full column rank), so the real factors re-signed to a
     positive diagonal are ``E(Q)``, ``E(R)``, and column 2j holds (re, im) of column j. R has a real positive
@@ -1098,6 +1099,10 @@ def _qr_forward(A, want_q):
     decompositions (torch documents the signs as not unique), and ``Q`` differs from torch's by those column signs.
     A rank-deficient ``A`` (a zero column, dependent columns) gives NaN: Habana's qr returns NaN for it, and ``W``
     does not change the rank (torch returns a QR with a zero on R's diagonal)."""
+    cl = _complex_linalg()
+    if cl is not None and getattr(cl, "qr", None) is not None and A.shape[-2] <= cl.COMPLEX_MAXN:
+        Q_p, R_p = cl.qr(A, mode)
+        return (_as_complex(Q_p) if want_q else None), _as_complex(R_p)
     ar, ai = _pair(A)
     E = _interleaved(ar, ai)
     W = _mixing(E.shape[-2], E.device)
@@ -1151,16 +1156,17 @@ class _QR(torch.autograd.Function):
 
 
 def qr(A, mode="reduced"):
-    """``linalg.qr`` for m >= n (modes ``reduced``, ``r``, and ``complete`` when m == n)."""
+    """``linalg.qr`` for m >= n (``reduced``, ``r``, ``complete``; past the TPC kernel's m <= 32 the real route
+    takes ``complete`` only when m == n, and its backward needs the reduced factors)."""
     if mode == "r":
         if torch.is_grad_enabled() and A.requires_grad:
             raise RuntimeError("The derivative of linalg.qr depends on Q, which is not computed when mode='r'. "
                                "Please use linalg.qr(A, mode='reduced') if you are going to differentiate through "
                                "linalg.qr.")
-        return torch.empty(0, dtype=A.dtype, device=A.device), _qr_forward(A, False)[1]
+        return torch.empty(0, dtype=A.dtype, device=A.device), _qr_forward(A, False, "r")[1]
     if torch.is_grad_enabled() and A.requires_grad:
         return _QR.apply(A)
-    return _qr_forward(A, True)
+    return _qr_forward(A, True, mode)
 
 
 # ---- pinv, lstsq ------------------------------------------------------------------------------------------------------
@@ -1297,7 +1303,7 @@ def _decline(op, args, kwargs, key="AutogradPrivateUse1"):
 
 ROUTES = {
     "solve": ("eager", "lazy"),
-    "solve_left_false": ("lazy",),  # eager: forward + backward 0.79-1.0x for real block; n<=32 uses cgj_solve
+    "solve_left_false": ("eager", "lazy"),  # eager: forward + backward 0.79-1.0x for real block; n<=32 uses cgj_solve
     "inv": ("eager", "lazy"),
     "det": ("eager", "lazy"),
     "slogdet": ("eager", "lazy"),
@@ -1305,13 +1311,13 @@ ROUTES = {
     "matrix_exp": ("eager", "lazy"),
     "matrix_exp_composite": ("lazy",),
     "pinv": ("eager", "lazy"),
-    "householder_product": ("eager:grad", "lazy:grad"),  # forward alone 0.2-0.5x, with backward 2-28x
-    "lstsq": ("eager:grad", "lazy:grad"),  # forward alone 0.7-0.9x, with backward 1.6-3.2x
-    "solve_triangular": ("lazy:grad",),  # forward 0.45-0.83x eager, 0.38-0.78x lazy; forward + backward 0.88-1.01x
+    "householder_product": ("eager", "lazy"),  # forward alone 0.2-0.5x, with backward 2-28x; taken anyway: no CPU route
+    "lstsq": ("eager", "lazy"),  # forward alone 0.7-0.9x, with backward 1.6-3.2x; taken anyway: no CPU route
+    "solve_triangular": ("eager", "lazy"),  # forward 0.45-0.83x eager, 0.38-0.78x lazy; forward + backward 0.88-1.01x
     # eager, 1.05-1.32x lazy (n = 4..32)
     "cholesky_solve": ("eager", "lazy"),  # forward 0.8-3.0x eager, 0.4-1.9x lazy; with backward 1.0-1.2x / 1.1-1.9x
     "cholesky_inverse": ("eager", "lazy"),  # forward 0.75-3.5x / 0.8-2.5x; with backward 0.9-1.2x / 1.2-2.1x
-    "qr": (),  # Habana's real qr: eager 0.45-0.85x forward, 0.7-0.9x with backward; lazy 90 ms-4.4 s per call
+    "qr": ("eager", "lazy"),  # TPC Householder qr at m <= 32; past it Habana's real qr (0.45-0.85x fwd eager)
     "eigvalsh": ("eager", "lazy"),
     "eigh": ("eager", "lazy"),
     "svd": ("eager", "lazy"),
@@ -1415,8 +1421,13 @@ def _takes_cholesky_inverse(L, upper=False):
 
 
 def _takes_qr(A, mode="reduced"):
-    if not (_complex_on_card(A) and A.dim() >= 2 and A.shape[-2] >= A.shape[-1]):
+    if mode not in ("reduced", "r", "complete") or not (_complex_on_card(A) and A.dim() >= 2 and A.shape[-2] >= A.shape[-1]):
         return False
+    cl = _complex_linalg()
+    if cl is not None and getattr(cl, "qr", None) is not None and A.shape[-2] <= cl.COMPLEX_MAXN:
+        # TPC Householder QR takes every mode at m <= 32; complete with m > n has no _QR backward here.
+        return not (mode == "complete" and A.shape[-2] != A.shape[-1]
+                    and torch.is_grad_enabled() and A.requires_grad)
     if mode not in ("reduced", "r") and not (mode == "complete" and A.shape[-2] == A.shape[-1]):
         return False  # complete with m > n: the extra columns of Q need not keep the pair structure; torch's route
     return _real_on_card("qr", 2 * A.shape[-2])
@@ -1507,7 +1518,8 @@ def _takes_eig(A):
     cl = _complex_linalg()
     if cl is None or getattr(cl, "eig", None) is None:
         return False
-    return _complex_on_card(A) and _square(A) and 1 <= A.shape[-1] <= cl.COMPLEX_MAXN
+    # Past COMPLEX_MAXN ceig_big is slower than the CPU route (complex_linalg.eig): taken anyway, no CPU fallback.
+    return _complex_on_card(A) and _square(A) and 1 <= A.shape[-1] <= getattr(cl, "CEIG_MAXN", cl.COMPLEX_MAXN)
 
 
 def _takes_eigvals(A):
@@ -1519,7 +1531,7 @@ def _takes_eigvals(A):
             return False
     elif getattr(cl, "eigvals", None) is None and getattr(cl, "eig", None) is None:
         return False
-    return _complex_on_card(A) and _square(A) and 1 <= A.shape[-1] <= cl.COMPLEX_MAXN
+    return _complex_on_card(A) and _square(A) and 1 <= A.shape[-1] <= getattr(cl, "CEIG_MAXN", cl.COMPLEX_MAXN)
 
 
 def _entries():
