@@ -504,7 +504,7 @@ def main():
             "torch_compile_m2_det_slogdet",
             lambda A: torch.linalg.det(A).abs().sum() + torch.linalg.slogdet(A).logabsdet.sum(),
             (A0,),
-            check_zero_fb=False,
+            check_zero_fb=True,  # det_card/slogdet_card custom ops + registered autograd: steady state is zero
         )
 
     failed = sum(r["status"] != "ok" for r in results)

@@ -358,64 +358,113 @@ def _det_svd_backward(A, g_det):
     return _cmatmul(U * D.unsqueeze(-2), Vh)
 
 
-class _Det(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, A):
-        ctx.set_materialize_grads(False)
-        d = _as_complex(_complex_linalg().det(A))
-        ctx.save_for_backward(A, d)
-        return d
+def _det_backward(A, d, g_det):
+    if g_det is None:
+        return None
+    if A.device.type != "hpu":
+        return g_det[..., None, None] * d.conj()[..., None, None] * torch.linalg.inv(A).mH
+    singular = d.abs() == 0
+    # Call inv_ex before building (g_det * d.conj()) so TPC's lazy mark_step does not split the cofactor graph.
+    inv_ah = inv_ex(A, check_errors=False)[0].mH
+    cofactor = (g_det * d.conj())[..., None, None] * inv_ah
+    grad = torch.where(singular[..., None, None], 0.0, cofactor)
+    if torch.is_grad_enabled():
+        # Double backward: the SVD formula at the singular entries (selected per entry, no host read of singular).
+        grad = torch.where(singular[..., None, None], _det_svd_backward(A, g_det), grad)
+    return grad
 
-    @staticmethod
-    def backward(ctx, g_det):
-        if g_det is None:
-            return None
-        A, d = ctx.saved_tensors
-        singular = d.abs() == 0
-        if torch.is_grad_enabled() and singular.any():
-            return _det_svd_backward(A, g_det)
-        # Call inv_ex before building (g_det * d.conj()) so TPC's lazy mark_step does not split the cofactor graph.
-        inv_ah = inv_ex(A, check_errors=False)[0].mH
-        cofactor = (g_det * d.conj())[..., None, None] * inv_ah
-        return torch.where(singular[..., None, None], 0.0, cofactor)
+
+def _slogdet_backward(A, sign, g_sign, g_lad):
+    if g_sign is None and g_lad is None:
+        return None
+    if A.device.type != "hpu":
+        inv_ah = torch.linalg.inv(A).mH
+        re = g_lad if g_lad is not None else torch.zeros_like(sign.real)
+        im = (torch.view_as_real((sign.conj() * g_sign).resolve_conj())[..., 1]
+              if g_sign is not None else torch.zeros_like(re))
+        return torch.complex(re, im)[..., None, None] * inv_ah
+    inv_ah = inv_ex(A, check_errors=False)[0].mH
+    re = g_lad if g_lad is not None else torch.zeros(sign.shape, dtype=torch.float32, device=sign.device)
+    im = (torch.view_as_real((sign.conj() * g_sign).resolve_conj())[..., 1]
+          if g_sign is not None else torch.zeros_like(re))
+    scale = _complex(re, im)
+    return scale[..., None, None] * inv_ah
+
+
+_DET_CARD_OPS = False
+
+
+def _ensure_det_card_ops():
+    """``det``/``slogdet`` as library custom ops, so a compiled graph keeps one opaque on-card node (with this
+    module's backward) instead of declining to the boxed CPU fallback while tracing."""
+    global _DET_CARD_OPS
+    if _DET_CARD_OPS:
+        return
+    _DET_CARD_OPS = True
+
+    @torch.library.custom_op("hpu_complex::det_card", mutates_args=())
+    def det_card(A: torch.Tensor) -> torch.Tensor:
+        return _as_complex(_complex_linalg().det(A))
+
+    @det_card.register_fake
+    def _(A):
+        return A.new_empty(A.shape[:-2])
+
+    def _det_setup(ctx, inputs, output):
+        ctx.set_materialize_grads(False)
+        ctx.save_for_backward(inputs[0], output)
+
+    det_card.register_autograd(lambda ctx, g: _det_backward(*ctx.saved_tensors, g), setup_context=_det_setup)
+
+    @torch.library.custom_op("hpu_complex::slogdet_card", mutates_args=())
+    def slogdet_card(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        sign_p, lad = _complex_linalg().slogdet(A)
+        return _as_complex(sign_p), lad
+
+    @slogdet_card.register_fake
+    def _(A):
+        return A.new_empty(A.shape[:-2]), A.new_empty(A.shape[:-2], dtype=torch.float32)
+
+    def _slogdet_setup(ctx, inputs, output):
+        ctx.set_materialize_grads(False)
+        ctx.save_for_backward(inputs[0], output[0])
+
+    slogdet_card.register_autograd(
+        lambda ctx, g_sign, g_lad: _slogdet_backward(*ctx.saved_tensors, g_sign, g_lad),
+        setup_context=_slogdet_setup)
+
+    # AOT differentiates _linalg_det/_linalg_slogdet by formula (on the placeholder LU) in addition to the custom
+    # ops' own autograd: register this module's backward for the aten ops too, so a compiled graph gets exactly one.
+    def _det_setup_aten(ctx, inputs, output):
+        ctx.set_materialize_grads(False)
+        ctx.save_for_backward(inputs[0], output[0])
+
+    def _slogdet_setup_aten(ctx, inputs, output):
+        ctx.set_materialize_grads(False)
+        ctx.save_for_backward(inputs[0], output[0])
+
+    torch.library.register_autograd("aten::_linalg_det", lambda ctx, g, _glu, _gp: (_det_backward(*ctx.saved_tensors, g),),
+                                    setup_context=_det_setup_aten)
+    torch.library.register_autograd(
+        "aten::_linalg_slogdet",
+        lambda ctx, g_sign, g_lad, _glu, _gp: (_slogdet_backward(*ctx.saved_tensors, g_sign, g_lad),),
+        setup_context=_slogdet_setup_aten)
 
 
 def det(A):
-    """``_linalg_det`` via ``complex_linalg.det`` -> (result, LU, pivots)."""
-    d = _Det.apply(A) if torch.is_grad_enabled() and A.requires_grad else _as_complex(_complex_linalg().det(A))
+    """``_linalg_det`` via the ``det_card`` custom op -> (result, LU, pivots). One route in every mode: a compiled
+    forward runs with grad off, where the old gate declined (its placeholder LU would feed a traced backward);
+    the custom op's own backward never reads LU."""
+    _ensure_det_card_ops()
+    d = torch.ops.hpu_complex.det_card(A)
     LU, pivots = _placeholder_lu(A.shape, A.shape[:-2], A.shape[-1], A.device)
     return d, LU, pivots
 
 
-class _Slogdet(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, A):
-        ctx.set_materialize_grads(False)
-        sign_p, lad = _complex_linalg().slogdet(A)
-        sign = _as_complex(sign_p)
-        ctx.save_for_backward(A, sign)
-        return sign, lad
-
-    @staticmethod
-    def backward(ctx, g_sign, g_lad):
-        if g_sign is None and g_lad is None:
-            return None
-        A, sign = ctx.saved_tensors
-        inv_ah = inv_ex(A, check_errors=False)[0].mH
-        re = g_lad if g_lad is not None else torch.zeros(sign.shape, dtype=torch.float32, device=sign.device)
-        im = (torch.view_as_real((sign.conj() * g_sign).resolve_conj())[..., 1]
-              if g_sign is not None else torch.zeros_like(re))
-        scale = _complex(re, im)
-        return scale[..., None, None] * inv_ah
-
-
 def slogdet(A):
-    """``_linalg_slogdet`` via ``complex_linalg.slogdet`` -> (sign, logabsdet, LU, pivots)."""
-    if torch.is_grad_enabled() and A.requires_grad:
-        sign, lad = _Slogdet.apply(A)
-    else:
-        sign_p, lad = _complex_linalg().slogdet(A)
-        sign = _as_complex(sign_p)
+    """``_linalg_slogdet`` via the ``slogdet_card`` custom op -> (sign, logabsdet, LU, pivots)."""
+    _ensure_det_card_ops()
+    sign, lad = torch.ops.hpu_complex.slogdet_card(A)
     LU, pivots = _placeholder_lu(A.shape, A.shape[:-2], A.shape[-1], A.device)
     return sign, lad, LU, pivots
 
@@ -1396,10 +1445,13 @@ def _takes_inv(A, check_errors=False):
 
 
 def _takes_det(A):
-    if not (torch.is_grad_enabled() or torch.is_inference_mode_enabled()):
-        return False
     cl = _complex_linalg()
-    return cl is not None and _complex_on_card(A) and _square(A) and 1 <= A.shape[-1] <= cl.COMPLEX_MAXN
+    if cl is None:
+        return False
+    if _tracing((A,)):
+        return (A.dtype == C64 and A.device.type == "hpu" and not _host_backed(A) and _square(A)
+                and isinstance(A.shape[-1], int) and 1 <= A.shape[-1] <= cl.COMPLEX_MAXN)
+    return _complex_on_card(A) and _square(A) and 1 <= A.shape[-1] <= cl.COMPLEX_MAXN
 
 
 def _takes_tri(A, B, *, upper, left=True, unitriangular=False):

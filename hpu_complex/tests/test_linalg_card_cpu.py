@@ -883,3 +883,22 @@ def test_inference_mode_all_card_linalg_and_declines(card_linalg):
             assert torch.linalg.det(A33).is_inference()
             assert torch.linalg.svdvals(A33).is_inference()
             assert torch.linalg.eigvalsh(A33 + A33.mH).is_inference()
+
+
+def test_compiled_det_slogdet_on_card(card_linalg):
+    """Compiled (aot_eager stands in for hpu_backend): det/slogdet go through the det_card/slogdet_card custom ops
+    with this module's backward, not the boxed CPU fallback a traced decline used to reach."""
+    A0 = rand(2, 4, 4, seed=21).to(C64)
+    for fn, ref in [
+        (lambda a: torch.linalg.det(a).abs().sum(), None),
+        (lambda a: torch.linalg.slogdet(a).logabsdet.sum(), None),
+    ]:
+        Ac = A0.clone().requires_grad_()
+        fn(Ac).backward()
+        Ah = A0.to(HPU).detach().requires_grad_()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            torch.compile(fn, backend="aot_eager")(Ah).backward()
+        assert not [w for w in caught if "runs on the CPU" in str(w.message)]
+        assert Ah.grad is not None
+        torch.testing.assert_close(Ah.grad.cpu(), Ac.grad, rtol=1e-4, atol=1e-5)
