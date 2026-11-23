@@ -96,11 +96,11 @@ def test_lazy_inference_mode_storage_and_view_paths():
             assert all(t.is_inference() for t in (e, vc, vd, cx, vr, rl, im))
             assert all(tagged(t) for t in (e, vc, vd, cx))
             assert not any(tagged(t) for t in (vr, rl, im))
-            # Rank >= 5 permuted complex64 raises in lazy mode (even under inference_mode)
+            # Rank >= 5 permuted complex64 works in lazy mode, also under inference_mode (M6C lifted the refusal)
             perm5 = torch.empty(2, 2, 2, 2, 2, dtype=C64, device=HPU).permute(4, 3, 2, 1, 0)
-            with pytest.raises(RuntimeError, match="rank 5 or more"):
-                torch.view_as_real(perm5)
-            del e, r, vc, vd, cx, vr, rl, im, perm5
+            vr5 = torch.view_as_real(perm5)
+            assert vr5.is_inference() and vr5.shape == (2, 2, 2, 2, 2, 2)
+            del e, r, vc, vd, cx, vr, rl, im, perm5, vr5
         gc.collect()
         assert torch.ops.hpu_complex.lazy_storages_alive() == alive0
     finally:

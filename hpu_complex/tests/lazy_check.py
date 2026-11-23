@@ -10,8 +10,9 @@ Verifies:
 4. CPU complex64 ops still work while lazy mode is enabled.
 5. complex64 runs in lazy mode (lazy views of the Habana tensor behind each complex storage): factories, .to,
    view_as_complex, torch.complex, torch.fft, eigvals, products, in-place writes through .real, against the CPU.
-6. What lazy mode still refuses raises a clean RuntimeError (no process abort): permuted complex64 tensors of rank 5
-   or more. complex64 under torch.inference_mode runs (inference tensors), against the CPU.
+6. What lazy mode used to refuse now runs against the CPU: complex64 under torch.inference_mode (inference tensors)
+   and permuted complex64 tensors of rank 5 or more at storage offset 0 (rank <= 4 permute materialization,
+   copy_/fill_/zero_/sum/abs/sgn/matmul/fft/where/view_as_real/backward).
 7. green_ops_check.py in lazy mode: a real tensor times a Python complex scalar (x * 2j used to abort the process
    inside Habana), complex cat / exp / neg / masked_fill_ / linalg.vector_norm, with gradients.
 8. The Habana tensors held by lazy complex storages are released (no growth over 100 steps).
@@ -21,6 +22,7 @@ import warnings
 
 import habana_frameworks.torch.core as htcore
 import habana_frameworks.torch.hpu as hthpu
+from habana_frameworks.torch.hpu import metrics as hpu_metrics
 from habana_frameworks.torch.utils.internal import is_lazy
 import torch
 
@@ -123,31 +125,150 @@ def _no_grad(fn):
 
 
 def check_lazy_complex_guards():
-    """What lazy mode still refuses, with a clean RuntimeError (no process abort)."""
+    """Previously refused lazy-mode paths: complex64 under torch.inference_mode and rank >= 5 permuted complex64."""
     hpu = torch.device("hpu")
+    torch.manual_seed(0)
     sig = torch.randn(8, 512, device=hpu)
-    z5 = torch.randn(2, 3, 4, 5, 6, dtype=torch.complex64).to(hpu)
+    z5_cpu = torch.randn(2, 3, 4, 5, 6, dtype=torch.complex64)
+    z5 = z5_cpu.to(hpu)
     htcore.mark_step()
-    # complex64 under torch.inference_mode runs now: its tensors are inference tensors (the guard is lifted)
+
+    # 1. complex64 + rfft / stft / fft / irfft under torch.inference_mode
     got = _inference(lambda: torch.fft.rfft(sig).real.sum(-1) + (sig * 2j).imag.sum(-1))
     htcore.mark_step()
     s = sig.cpu()
     ref = torch.fft.rfft(s).real.sum(-1) + (s * 2j).imag.sum(-1)
     assert got.is_inference() and (got.cpu() - ref).abs().max() < 1e-3 * ref.abs().max(), "inference_mode"
+    win = torch.hann_window(64, device=hpu)
+    stft_h = _inference(lambda: torch.stft(sig, 64, hop_length=32, window=win, return_complex=True))
+    htcore.mark_step()
+    stft_c = torch.stft(s, 64, hop_length=32, window=win.cpu(), return_complex=True)
+    assert stft_h.is_inference() and _err(stft_h, stft_c) < 1e-3, _err(stft_h, stft_c)
+    inv_h = _inference(lambda: torch.fft.irfft(torch.fft.rfft(sig), n=512))
+    htcore.mark_step()
+    assert inv_h.is_inference() and _err(inv_h, torch.fft.irfft(torch.fft.rfft(s), n=512)) < 1e-5
     print("lazy_check complex64 under torch.inference_mode: OK")
-    cases = [
-        ("permuted 5-D complex64", lambda: z5.permute(0, 2, 1, 3, 4) * 2, "rank 5 or more"),
+
+    # 2. Permuted complex64 tensors of rank >= 5 at storage_offset == 0 (forward ops, non-coalescing perms, rank 6/7)
+    z6_cpu = torch.randn(2, 2, 3, 2, 3, 4, dtype=torch.complex64)
+    z6 = z6_cpu.to(hpu)
+    htcore.mark_step()
+    perm_cases = [
+        ("perm5 (0,2,1,3,4)*2", lambda c, d: (z5 if d == hpu else z5_cpu).permute(0, 2, 1, 3, 4) * 2, 1e-5),
+        ("perm5 (4,3,2,1,0)*2", lambda c, d: (z5 if d == hpu else z5_cpu).permute(4, 3, 2, 1, 0) * 2, 1e-5),
+        ("perm5 sliced *2", lambda c, d: (z5 if d == hpu else z5_cpu).permute(0, 2, 1, 3, 4)[:, :, :-1] * 2, 1e-5),
+        ("perm5 MetaNeuromotorHand reshape",
+         lambda c, d: (z5 if d == hpu else z5_cpu).permute(0, 4, 3, 1, 2).reshape(-1, 3, 4), 1e-5),
+        ("perm6 (0,2,1,3,5,4) sum+abs",
+         lambda c, d: (z6 if d == hpu else z6_cpu).permute(0, 2, 1, 3, 5, 4).abs().sum(dim=(1, 3)), 1e-4),
+        ("perm5 sgn", lambda c, d: (z5 if d == hpu else z5_cpu).permute(4, 3, 2, 1, 0).sgn(), 1e-5),
+        ("perm5 fft", lambda c, d: torch.fft.fft((z5 if d == hpu else z5_cpu).permute(0, 2, 1, 3, 4)), 2e-4),
+        ("perm5 where",
+         lambda c, d: torch.where(((z5 if d == hpu else z5_cpu).permute(0, 2, 1, 3, 4).real > 0),
+                                  (z5 if d == hpu else z5_cpu).permute(0, 2, 1, 3, 4), 0j), 1e-5),
+        ("perm5 infer_mode",
+         lambda c, d: _inference(lambda: (z5 if d == hpu else z5_cpu).permute(4, 3, 2, 1, 0) + 1j), 1e-5),
     ]
-    for name, fn, match in cases:
-        try:
-            fn()
-            htcore.mark_step()
-        except RuntimeError as exc:
-            msg = str(exc)
-            assert match in msg and "PT_HPU_LAZY_MODE=0" in msg, (name, msg)
-            print(f"lazy_check guard {name}: OK ({msg.splitlines()[0][:120]})")
-        else:
-            raise AssertionError(f"Expected RuntimeError for {name} in lazy mode")
+    for name, fn, tol in perm_cases:
+        got = fn(True, hpu)
+        htcore.mark_step()
+        e = _err(got, fn(False, "cpu"))
+        assert e <= tol, (name, e)
+        print(f"lazy_check {name}: OK (max|err| {e:.1e})")
+
+    # 3. Card matmul on rank-5 permuted complex64 (force on-card GEMM via threshold=0)
+    torch.ops.hpu_complex.set_matmul_cpu_threshold(0)
+    try:
+        a5_c = torch.randn(2, 2, 2, 4, 5, dtype=torch.complex64)
+        b5_c = torch.randn(2, 2, 2, 5, 3, dtype=torch.complex64)
+        mm_h = a5_c.to(hpu).permute(2, 1, 0, 3, 4) @ b5_c.to(hpu).permute(2, 1, 0, 3, 4)
+        htcore.mark_step()
+        mm_c = a5_c.permute(2, 1, 0, 3, 4) @ b5_c.permute(2, 1, 0, 3, 4)
+        assert _err(mm_h, mm_c) < 1e-4, _err(mm_h, mm_c)
+        print(f"lazy_check perm5 card matmul: OK (max|err| {_err(mm_h, mm_c):.1e})")
+    finally:
+        torch.ops.hpu_complex.set_matmul_cpu_threshold(1 << 22)
+
+    # 4. In-place writes & views on rank-5 permuted complex64 (copy_, fill_, zero_, .real, view_as_real)
+    ref_base = z5_cpu.clone()
+    hpu_base = z5_cpu.to(hpu)
+    htcore.mark_step()
+    p_ref = ref_base.permute(4, 3, 2, 1, 0)
+    p_hpu = hpu_base.permute(4, 3, 2, 1, 0)
+    p_ref.fill_(1.5 - 2.5j)
+    p_hpu.fill_(1.5 - 2.5j)
+    htcore.mark_step()
+    assert _err(hpu_base, ref_base) == 0, _err(hpu_base, ref_base)
+    p_ref.zero_()
+    p_hpu.zero_()
+    htcore.mark_step()
+    assert _err(hpu_base, ref_base) == 0, _err(hpu_base, ref_base)
+    src_c = torch.randn(6, 5, 4, 3, 2, dtype=torch.complex64)
+    p_ref.copy_(src_c.conj())
+    p_hpu.copy_(src_c.to(hpu).conj())
+    htcore.mark_step()
+    assert _err(hpu_base, ref_base) == 0, _err(hpu_base, ref_base)
+    p_ref.real.mul_(2.0)
+    p_hpu.real.mul_(2.0)
+    htcore.mark_step()
+    assert _err(hpu_base, ref_base) == 0, _err(hpu_base, ref_base)
+    assert _err(torch.view_as_real(p_hpu), torch.view_as_real(p_ref)) == 0
+    print("lazy_check perm5 inplace (fill_, zero_, copy_, .real.mul_, view_as_real): OK")
+
+    # 5. Backward through MetaNeuromotorHand-style permute + reshape
+    xc = z5_cpu.clone().requires_grad_()
+    xh = z5_cpu.to(hpu).detach().requires_grad_()
+    yc = xc.permute(0, 4, 3, 1, 2).reshape(-1, 3, 4).abs().sum()
+    yh = xh.permute(0, 4, 3, 1, 2).reshape(-1, 3, 4).abs().sum()
+    yc.backward()
+    yh.backward()
+    htcore.mark_step()
+    assert _err(xh.grad, xc.grad) < 1e-5, _err(xh.grad, xc.grad)
+    print(f"lazy_check perm5 MetaNeuromotorHand backward: OK (max|err| {_err(xh.grad, xc.grad):.1e})")
+
+    # 6. Zero bridge FallbackOps on rank-6 rfft, rank-5 abs/sgn/where/vector_norm, and rank-6 exp
+    def _fb_stats():
+        return dict(dict(hpu_metrics.metric_global("cpu_fallback").stats()).get("FallbackOps", {}) or {})
+
+    def _check_no_fb(name, fn, tol):
+        htcore.mark_step()
+        f0 = _fb_stats()
+        c0 = torch.ops.hpu_complex.cpu_fallback_calls()
+        got, ref = fn()
+        htcore.mark_step()
+        f1 = _fb_stats()
+        c1 = torch.ops.hpu_complex.cpu_fallback_calls()
+        delta = {k: f1[k] - f0.get(k, 0) for k in f1 if f1[k] - f0.get(k, 0) > 0}
+        assert delta == {} and c1 == c0, (name, delta, c1 - c0)
+        e = _err(got, ref)
+        assert e <= tol, (name, e)
+        print(f"lazy_check no-fallback {name}: OK (max|err| {e:.1e}, FallbackOps={{}})")
+
+    x6_cpu = torch.randn(2, 2, 2, 2, 2, 8)
+    x6_h = x6_cpu.to(hpu).requires_grad_()
+    x6_c = x6_cpu.clone().requires_grad_()
+    p5_h = z5.permute(4, 3, 2, 1, 0)
+    p5_c = z5_cpu.permute(4, 3, 2, 1, 0)
+    w5_h = (z5 + 0.5).permute(4, 3, 2, 1, 0)
+    w5_c = (z5_cpu + 0.5).permute(4, 3, 2, 1, 0)
+    c5_c = p5_c.real > 0
+    c5_h = c5_c.to(hpu)
+    p6_h = z6.permute(5, 4, 3, 2, 1, 0)
+    p6_c = z6_cpu.permute(5, 4, 3, 2, 1, 0)
+
+    def _rfft6_fwdbwd():
+        yh = torch.fft.rfft(x6_h)
+        (yh.abs() ** 2).sum().backward()
+        yc = torch.fft.rfft(x6_c)
+        (yc.abs() ** 2).sum().backward()
+        return x6_h.grad, x6_c.grad
+
+    _check_no_fb("rank-6 rfft fwd+bwd", _rfft6_fwdbwd, 1e-4)
+    _check_no_fb("rank-5 abs", lambda: (p5_h.abs(), p5_c.abs()), 1e-5)
+    _check_no_fb("rank-5 sgn", lambda: (torch.sgn(p5_h), torch.sgn(p5_c)), 1e-5)
+    _check_no_fb("rank-5 where", lambda: (torch.where(c5_h, p5_h, w5_h), torch.where(c5_c, p5_c, w5_c)), 1e-5)
+    _check_no_fb("rank-5 vector_norm", lambda: (torch.linalg.vector_norm(p5_h), torch.linalg.vector_norm(p5_c)), 1e-4)
+    _check_no_fb("rank-6 exp", lambda: (torch.exp(p6_h), torch.exp(p6_c)), 1e-4)
 
 
 def _inference(fn):
