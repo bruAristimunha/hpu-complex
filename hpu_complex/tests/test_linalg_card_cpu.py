@@ -19,14 +19,124 @@ from hpu_complex.tests.test_complex128_cpu import HPU, extension, tagged  # noqa
 C64, C128 = torch.complex64, torch.complex128
 
 
+class _ComplexLinalgReplica:
+    """CPU replica of ``hpu_ops.tpc.complex_linalg`` for unit-testing ``hpu_complex.linalg`` wiring and autograd."""
+
+    COMPLEX_MAXN = 32
+
+    @staticmethod
+    def _to_c64(A, layout="pairs"):
+        if A.is_complex():
+            if A.dtype != C64:
+                raise ValueError(f"complex64 only, got {A.dtype}")
+            return A.resolve_conj().resolve_neg()
+        if layout == "pairs":
+            return torch.view_as_complex(A.contiguous())
+        if layout == "interleaved":
+            return torch.view_as_complex(A.reshape(*A.shape[:-1], A.shape[-1] // 2, 2).contiguous())
+        raise ValueError(layout)
+
+    @staticmethod
+    def _out_pairs(Z, device, layout="pairs"):
+        P = torch.view_as_real(Z.to(C64)).contiguous().to(device)
+        return P if layout == "pairs" else P.reshape(*P.shape[:-2], P.shape[-2] * 2)
+
+    def cgj_solve(self, A, B, layout="pairs"):
+        dev = A.device
+        za, zb = self._to_c64(A, layout).cpu(), self._to_c64(B, layout).cpu()
+        n, m = za.shape[-1], zb.shape[-1]
+        if za.shape[-2] != n or not (1 <= n <= self.COMPLEX_MAXN):
+            raise ValueError(f"bad shape {za.shape}")
+        batch = torch.broadcast_shapes(za.shape[:-2], zb.shape[:-2])
+        za_b = za.expand(*batch, n, n)
+        zb_b = zb.expand(*batch, n, m)
+        nonfinite = ((~torch.isfinite(za_b.real) | ~torch.isfinite(za_b.imag)).any(-1).any(-1)
+                     | (~torch.isfinite(zb_b.real) | ~torch.isfinite(zb_b.imag)).any(-1).any(-1))
+        X, info = torch.linalg.solve_ex(za_b, zb_b)
+        bad = nonfinite | (info > 0)
+        X = torch.where(bad[..., None, None], 0.0, X)
+        X = torch.where(nonfinite[..., None, None], float("nan"), X)
+        D = torch.zeros(*batch, 3, n, dtype=torch.float32, device=dev)
+        S = torch.zeros(*batch, 4, dtype=torch.float32, device=dev)
+        S[..., 2] = info.to(torch.float32).to(dev)
+        if nonfinite.any():
+            D[nonfinite.to(dev)] = float("nan")
+            S[nonfinite.to(dev)] = float("nan")
+        return self._out_pairs(X, dev, layout), D, S
+
+    def cgj_inv(self, A, layout="pairs"):
+        za = self._to_c64(A, layout)
+        n = za.shape[-1]
+        eye = torch.eye(n, dtype=C64).expand(*za.shape[:-2], n, n)
+        return self.cgj_solve(A, eye, layout=layout)
+
+    def solve(self, A, B, layout="pairs"):
+        return self.cgj_solve(A, B, layout=layout)[0]
+
+    def inv(self, A, layout="pairs"):
+        return self.cgj_inv(A, layout=layout)[0]
+
+    def det(self, A, layout="pairs"):
+        dev = A.device
+        za = self._to_c64(A, layout).cpu()
+        d = torch.linalg.det(za)
+        nonfinite = (~torch.isfinite(za.real) | ~torch.isfinite(za.imag)).any(-1).any(-1)
+        d = torch.where(nonfinite, complex(float("nan"), float("nan")), d)
+        return self._out_pairs(d, dev, "pairs")
+
+    def slogdet(self, A, layout="pairs"):
+        dev = A.device
+        za = self._to_c64(A, layout).cpu()
+        s, lad = torch.linalg.slogdet(za)
+        nonfinite = (~torch.isfinite(za.real) | ~torch.isfinite(za.imag)).any(-1).any(-1)
+        s = torch.where(nonfinite, complex(float("nan"), float("nan")), s)
+        lad = torch.where(nonfinite, float("nan"), lad)
+        return self._out_pairs(s, dev, "pairs"), lad.to(torch.float32).to(dev)
+
+    def eigh(self, A, UPLO="L", layout="pairs"):
+        if not isinstance(UPLO, str) or UPLO.upper() not in ("L", "U"):
+            raise RuntimeError(f"Expected UPLO argument to be 'L' or 'U', but got {UPLO}")
+        dev = A.device
+        za = self._to_c64(A, layout).cpu()
+        n = za.shape[-1]
+        if not (1 <= n <= self.COMPLEX_MAXN):
+            raise ValueError(f"bad n {n}")
+        w, V = torch.linalg.eigh(za, UPLO=UPLO.upper())
+        return w.to(torch.float32).to(dev), self._out_pairs(V, dev, layout)
+
+    def eigvalsh(self, A, UPLO="L", layout="pairs"):
+        return self.eigh(A, UPLO=UPLO, layout=layout)[0]
+
+    def svd(self, A, full_matrices=False, layout="pairs"):
+        dev = A.device
+        za = self._to_c64(A, layout).cpu()
+        m, n = za.shape[-2], za.shape[-1]
+        if max(m, n) > self.COMPLEX_MAXN or min(m, n) < 1:
+            raise ValueError(f"bad shape {za.shape}")
+        if full_matrices and m != n:
+            raise NotImplementedError("complex_linalg.svd: full_matrices=True for non-square A")
+        U, S, Vh = torch.linalg.svd(za, full_matrices=False)
+        return self._out_pairs(U, dev, layout), S.to(torch.float32).to(dev), self._out_pairs(Vh, dev, layout)
+
+    def svdvals(self, A, layout="pairs"):
+        dev = A.device
+        za = self._to_c64(A, layout).cpu()
+        m, n = za.shape[-2], za.shape[-1]
+        if max(m, n) > self.COMPLEX_MAXN or min(m, n) < 1:
+            raise ValueError(f"bad shape {za.shape}")
+        return torch.linalg.svdvals(za).to(torch.float32).to(dev)
+
+
 @pytest.fixture(scope="module", autouse=True)
 def card_linalg(extension):  # noqa: F811
     import hpu_complex.linalg as L
 
     L.FORCE_REAL_ON_CARD = True
+    L._CL = _ComplexLinalgReplica()
     L.install()
     yield L
     L.uninstall()
+    L._CL = None
     L.FORCE_REAL_ON_CARD = False
 
 
@@ -468,9 +578,12 @@ def test_inference_mode_and_no_grad(card_linalg):
         calls = taken(card_linalg, "inv")
         torch.linalg.inv(A.to(HPU))
         assert taken(card_linalg, "inv") > calls
-    with torch.inference_mode(), warnings.catch_warnings():  # below autograd: torch's route (the CPU fallback)
-        warnings.simplefilter("ignore")
+    with torch.inference_mode():  # inference_mode runs on-card with 0 CPU fallbacks!
+        before = torch.ops.hpu_complex.cpu_fallback_calls()
+        calls = taken(card_linalg, "solve")
         Y = torch.linalg.solve(A.to(HPU), B.to(HPU))
+        assert Y.is_inference() and taken(card_linalg, "solve") > calls
+        assert torch.ops.hpu_complex.cpu_fallback_calls() == before
     for got in (X, Y):
         assert (got.cpu().to(C128) - ref).abs().max() < 1e-5
 
@@ -501,24 +614,34 @@ def test_default_routes(card_linalg, monkeypatch, lazy):
         return taken(card_linalg, name) > before
 
     assert taken_by("solve", lambda: torch.linalg.solve(A, B))
-    assert taken_by("solve", lambda: torch.linalg.solve(A, B, left=False)) == lazy
+    assert taken_by("solve", lambda: torch.linalg.solve(A, B, left=False))
     assert taken_by("inv", lambda: torch.linalg.inv(A))
+    assert taken_by("det", lambda: torch.linalg.det(A))
+    assert taken_by("slogdet", lambda: torch.linalg.slogdet(A))
     assert taken_by("cholesky", lambda: torch.linalg.cholesky(H))
     assert taken_by("matrix_exp", lambda: torch.linalg.matrix_exp(A)) == lazy  # the composite
     assert not taken_by("householder_product", lambda: torch.linalg.householder_product(a, tau))
     assert taken_by("householder_product",
                     lambda: torch.linalg.householder_product(a.requires_grad_(), tau).abs().sum().backward())
-    assert not taken_by("eigh", lambda: torch.linalg.eigh(H))
+    assert taken_by("eigh", lambda: torch.linalg.eigh(H))
+    assert taken_by("eigvalsh", lambda: torch.linalg.eigvalsh(H))
+    assert taken_by("svd", lambda: torch.linalg.svd(A))
+    assert taken_by("svdvals", lambda: torch.linalg.svdvals(A))
     assert not taken_by("solve_triangular", lambda: torch.linalg.solve_triangular(A, B, upper=True))
     assert taken_by("solve_triangular", lambda: torch.linalg.solve_triangular(
         A.clone().requires_grad_(), B, upper=True).abs().sum().backward()) == lazy  # lazy, with grad only
     assert taken_by("cholesky_solve", lambda: torch.cholesky_solve(B, torch.linalg.cholesky(H)))
     assert taken_by("cholesky_inverse", lambda: torch.cholesky_inverse(torch.linalg.cholesky(H)))
     assert not taken_by("qr", lambda: torch.linalg.qr(A))
-    assert not taken_by("eigvalsh", lambda: torch.linalg.eigvalsh(H))
-    assert taken_by("eigvalsh", lambda: torch.linalg.eigvalsh(H.clone().requires_grad_()).sum().backward()) == lazy
+    # When complex_linalg is absent (hpu_ops missing), new complex_linalg ops decline cleanly
+    monkeypatch.setattr(card_linalg, "_CL", None)
+    assert not taken_by("det", lambda: torch.linalg.det(A))
+    assert not taken_by("slogdet", lambda: torch.linalg.slogdet(A))
+    assert not taken_by("svd", lambda: torch.linalg.svd(A))
+    assert not taken_by("svdvals", lambda: torch.linalg.svdvals(A))
+    assert not taken_by("eigh", lambda: torch.linalg.eigh(H))
     monkeypatch.setenv("HPU_COMPLEX_LINALG", "all")
-    assert taken_by("eigh", lambda: torch.linalg.eigh(H))
+    assert not taken_by("eigh", lambda: torch.linalg.eigh(H))
 
 
 # ---- review round (PR #16): the exact inputs that failed --------------------------------------------------------
@@ -595,3 +718,168 @@ def test_lstsq_rank_counts_a_pair_once(card_linalg):
     for driver in ("gelsd", "gelss", "gelsy"):
         got = torch.linalg.lstsq(A.to(HPU), torch.ones(2, 1, dtype=C64, device=HPU), driver=driver).rank.cpu()
         assert got.item() == torch.linalg.lstsq(A, torch.ones(2, 1, dtype=C64), driver=driver).rank.item()
+
+
+# ---- M2 complex_linalg wiring: det, slogdet, svd, svdvals, eigh, inference_mode, n>32 --------------------------------
+
+
+@pytest.mark.parametrize("shape", [(1, 1), (4, 4), (3, 5, 5)])
+def test_det_and_slogdet(card_linalg, shape):
+    A = rand(*shape, seed=11)
+    check(torch.linalg.det, [A], "det", card_linalg)
+    check(torch.det, [A], "det", card_linalg)
+    # slogdet: test gradients wrt sign alone, logabsdet alone, and both combined (catches +1j vs -1j sign error!)
+    check(lambda a: torch.linalg.slogdet(a), [A], "slogdet", card_linalg)
+    check(lambda a: (torch.linalg.slogdet(a).sign * (1 + 2j)).real.sum(), [A], "slogdet", card_linalg)
+    check(lambda a: torch.linalg.slogdet(a).logabsdet.sum(), [A], "slogdet", card_linalg)
+    check(lambda a: (torch.linalg.slogdet(a).sign * (2 - 1j)).imag.sum() + torch.linalg.slogdet(a).logabsdet.sum(),
+          [A], "slogdet", card_linalg)
+
+
+def test_det_singular_first_and_double_backward(card_linalg):
+    # Non-singular double backward matches complex128
+    B = rand(3, 3, seed=18).to(C64)
+    bh, br = B.to(HPU).requires_grad_(), B.to(C128).requires_grad_()
+    (gbh,) = torch.autograd.grad((torch.linalg.det(bh) * (1 - 1j)).real.sum(), bh, create_graph=True)
+    (gbr,) = torch.autograd.grad((torch.linalg.det(br) * (1 - 1j)).real.sum(), br, create_graph=True)
+    (ggbh,) = torch.autograd.grad(gbh.abs().pow(2).sum(), bh)
+    (ggbr,) = torch.autograd.grad(gbr.abs().pow(2).sum(), br)
+    torch.testing.assert_close(ggbh.cpu().to(C128), ggbr, atol=1e-4, rtol=1e-4)
+
+    # Singular rank n - 1: 1st grad with create_graph=True matches complex128; 2nd grad matches exact finite diff
+    A = rand(3, 3, seed=17).to(C64)
+    A[2] = 0
+    ah = A.to(HPU).requires_grad_()
+    ar = A.to(C128).requires_grad_()
+    (gh,) = torch.autograd.grad((torch.linalg.det(ah) * (1 - 1j)).real.sum(), ah, create_graph=True)
+    (gr,) = torch.autograd.grad((torch.linalg.det(ar) * (1 - 1j)).real.sum(), ar, create_graph=True)
+    torch.testing.assert_close(gh.detach().cpu().to(C128), gr.detach(), atol=1e-5, rtol=1e-5)
+    (ggh,) = torch.autograd.grad(gh.abs().pow(2).sum(), ah)
+    eps = 1e-6
+
+    def grad1_norm2(X):
+        X = X.detach().requires_grad_()
+        g1 = torch.autograd.grad((torch.linalg.det(X) * (1 - 1j)).real.sum(), X, create_graph=True)[0].detach()
+        return g1.abs().pow(2).sum()
+
+    A128 = A.to(C128)
+    fd = torch.zeros_like(A128)
+    for i in range(3):
+        for j in range(3):
+            dr = torch.zeros_like(A128); dr[i, j] = eps
+            di = torch.zeros_like(A128); di[i, j] = 1j * eps
+            fd[i, j] = ((grad1_norm2(A128 + dr) - grad1_norm2(A128 - dr)) / (2 * eps)
+                        + 1j * (grad1_norm2(A128 + di) - grad1_norm2(A128 - di)) / (2 * eps))
+    torch.testing.assert_close(ggh.cpu().to(C128), fd, atol=1e-4, rtol=1e-4)
+
+    # First-order singular det backward with create_graph=False returns 0 without 0*inf
+    ah1 = A.to(HPU).requires_grad_()
+    (torch.linalg.det(ah1) * (1 - 1j)).real.sum().backward()
+    assert torch.equal(ah1.grad.cpu(), torch.zeros_like(A))
+
+
+@pytest.mark.parametrize("shape", [(4, 4), (5, 3), (3, 5), (2, 6, 4), (1, 1), (3, 1)])
+@pytest.mark.parametrize("full_matrices", [False, True])
+def test_svd_and_svdvals(card_linalg, shape, full_matrices):
+    A = rand(*shape, seed=19)
+    k = min(shape[-2], shape[-1])
+    check(torch.linalg.svdvals, [A], "svdvals", card_linalg)
+
+    def svd_reconstruct(a):
+        U, S, Vh = torch.linalg.svd(a, full_matrices=full_matrices)
+        # Reconstruct A via thin slices (exercises diag_term in complex _Svd.backward!) + check full orthonormality
+        Uk, Vhk = U[..., :k], Vh[..., :k, :]
+        return (Uk * S.unsqueeze(-2)) @ Vhk, U @ U.mH, Vh @ Vh.mH
+
+    check(svd_reconstruct, [A], "svd", card_linalg, tol=5e-5, gtol=2e-4)
+    # Also test svdvals gradient and out= variants
+    check(lambda a: (torch.linalg.svdvals(a) ** 2).sum(), [A], "svdvals", card_linalg)
+
+    ac = A.to(C64)
+    ah = ac.to(HPU)
+    U_out = torch.empty(0, dtype=C64, device=HPU)
+    S_out = torch.empty(0, dtype=torch.float32, device=HPU)
+    Vh_out = torch.empty(0, dtype=C64, device=HPU)
+    calls = taken(card_linalg, "svd")
+    torch.linalg.svd(ah, full_matrices=full_matrices, out=(U_out, S_out, Vh_out))
+    assert taken(card_linalg, "svd") > calls
+    torch.testing.assert_close(S_out.cpu(), torch.linalg.svdvals(ac), atol=1e-5, rtol=1e-5)
+    S_only = torch.empty(0, dtype=torch.float32, device=HPU)
+    torch.linalg.svdvals(ah, out=S_only)
+    torch.testing.assert_close(S_only.cpu(), torch.linalg.svdvals(ac), atol=1e-5, rtol=1e-5)
+
+
+def test_eigh_invalid_uplo_and_partial_grads(card_linalg):
+    H = hermitian("random", 2, 4, seed=5).to(C64).to(HPU)
+    with pytest.raises(RuntimeError, match="UPLO"):
+        torch.linalg.eigh(H, UPLO="X")
+    with pytest.raises(RuntimeError, match="UPLO"):
+        torch.linalg.eigvalsh(H, UPLO="Z")
+    # Partial grads: gV only and gL only
+    hr = H.detach().cpu().to(C128).requires_grad_()
+    hh = H.detach().requires_grad_()
+    w_r, V_r = torch.linalg.eigh(hr)
+    w_h, V_h = torch.linalg.eigh(hh)
+    (V_r @ V_r.mH).abs().sum().backward()
+    (V_h @ V_h.mH).abs().sum().backward()
+    torch.testing.assert_close(hh.grad.cpu().to(C128), hr.grad, atol=1e-5, rtol=1e-4)
+    hr2, hh2 = H.detach().cpu().to(C128).requires_grad_(), H.detach().requires_grad_()
+    torch.linalg.eigh(hr2)[0].pow(2).sum().backward()
+    torch.linalg.eigh(hh2)[0].pow(2).sum().backward()
+    torch.testing.assert_close(hh2.grad.cpu().to(C128), hr2.grad, atol=1e-5, rtol=1e-4)
+
+
+def test_inference_mode_all_card_linalg_and_declines(card_linalg):
+    A = rand(2, 4, 4, seed=1).to(C64)
+    B = rand(2, 4, 2, seed=2).to(C64)
+    H = hpd(2, 4, 4, seed=3).to(C64)
+    L = torch.linalg.cholesky(H)
+    a, tau = torch.geqrf(rand(2, 5, 4, seed=4).to(C64))
+    ah, bh, hh, lh, a_h, tau_h = [t.to(HPU) for t in (A, B, H, L, a, tau)]
+    ops = [
+        ("solve", lambda: torch.linalg.solve(ah, bh)),
+        ("inv", lambda: torch.linalg.inv(ah)),
+        ("det", lambda: torch.linalg.det(ah)),
+        ("slogdet", lambda: torch.linalg.slogdet(ah)),
+        ("eigh", lambda: torch.linalg.eigh(hh)),
+        ("eigvalsh", lambda: torch.linalg.eigvalsh(hh)),
+        ("svd", lambda: torch.linalg.svd(ah)),
+        ("svdvals", lambda: torch.linalg.svdvals(ah)),
+        ("cholesky", lambda: torch.linalg.cholesky(hh)),
+        ("cholesky_solve", lambda: torch.cholesky_solve(bh, lh)),
+        ("cholesky_inverse", lambda: torch.cholesky_inverse(lh)),
+        ("solve_triangular", lambda: torch.linalg.solve_triangular(lh, bh, upper=False)),
+        ("qr", lambda: torch.linalg.qr(ah)),
+        ("matrix_exp", lambda: torch.linalg.matrix_exp(ah)),
+        ("householder_product", lambda: torch.linalg.householder_product(a_h, tau_h)),
+        ("pinv", lambda: torch.linalg.pinv(ah)),
+        ("lstsq", lambda: torch.linalg.lstsq(ah, bh).solution),
+    ]
+    with torch.inference_mode():
+        before_fb = torch.ops.hpu_complex.cpu_fallback_calls()
+        for name, fn in ops:
+            c0 = taken(card_linalg, name)
+            out = fn()
+            outs = out if isinstance(out, tuple) else (out,)
+            assert all(t.is_inference() for t in outs if isinstance(t, torch.Tensor)), name
+            assert taken(card_linalg, name) > c0, name
+        assert torch.ops.hpu_complex.cpu_fallback_calls() == before_fb
+
+        # complex128 (host_backed) declines cleanly to host_fallback under inference_mode (float64 kept in host memory!)
+        import hpu_complex
+
+        A128 = rand(2, 4, 4, seed=5).to(HPU)
+        B128 = rand(2, 4, 2, seed=6).to(HPU)
+        for fn in (lambda: torch.linalg.solve(A128, B128), lambda: torch.linalg.det(A128),
+                   lambda: torch.linalg.slogdet(A128)[1], lambda: torch.linalg.svdvals(A128),
+                   lambda: torch.linalg.eigvalsh(A128 + A128.mH)):
+            r128 = fn()
+            assert r128.is_inference() and hpu_complex._host_backed(r128)
+
+        # n > 32 declines cleanly under inference_mode
+        A33 = rand(33, 33, seed=7).to(C64).to(HPU)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            assert torch.linalg.det(A33).is_inference()
+            assert torch.linalg.svdvals(A33).is_inference()
+            assert torch.linalg.eigvalsh(A33 + A33.mH).is_inference()

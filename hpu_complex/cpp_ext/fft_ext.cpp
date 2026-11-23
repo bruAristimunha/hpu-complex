@@ -126,13 +126,17 @@ bool is_lazy_mode() {
 // through it), and it releases the Habana tensor when the last complex tensor over it goes.
 struct LazyOwner {
   at::Tensor tensor;
+  const c10::StorageImpl* key;  // the Habana StorageImpl it was registered under in lazy_storages()
 };
 
 std::atomic<int64_t> lazy_owners_alive{0};
 
 // One lazy storage per Habana storage: complex tensors made separately over the same Habana storage (two
 // view_as_complex of one r) share it, as torch's views share a StorageImpl, so a growth through one of them is seen by
-// all (each kept its own capacity before) and torch's overlap checks see one storage.
+// all (each kept its own capacity before) and torch's overlap checks see one storage. An entry is keyed by the
+// StorageImpl its owner lived in when it was made, and Habana moves a lazy tensor (and its detached aliases) to a new
+// StorageImpl when some graphs run (measured at a mark_step and at a host read, Gaudi2, bridge 1.21.4) and frees the
+// old one, whose address a later tensor then gets: so an entry is used only while its owner still lives there.
 struct LazyStorages {
   std::mutex mutex;
   std::map<const c10::StorageImpl*, std::pair<const LazyOwner*, c10::weak_intrusive_ptr<c10::StorageImpl>>> of;
@@ -148,7 +152,7 @@ void lazy_owner_free(void* ctx) {
   {
     auto& storages = lazy_storages();
     std::lock_guard<std::mutex> lock(storages.mutex);
-    auto it = storages.of.find(owner->tensor.storage().unsafeGetStorageImpl());
+    auto it = storages.of.find(owner->key);
     if (it != storages.of.end() && it->second.first == owner) {
       storages.of.erase(it);
     }
@@ -161,7 +165,7 @@ void lazy_owner_free(void* ctx) {
 // or r.resize_() on the caller's tensor cannot retarget the complex tensor, and r's autograd graph is not kept alive.
 LazyOwner* lazy_owner(const at::Tensor& owner) {
   lazy_owners_alive.fetch_add(1);
-  return new LazyOwner{owner.detach()};
+  return new LazyOwner{owner.detach(), owner.storage().unsafeGetStorageImpl()};
 }
 
 c10::Storage lazy_storage(const at::Tensor& owner) {
@@ -170,7 +174,11 @@ c10::Storage lazy_storage(const at::Tensor& owner) {
   std::lock_guard<std::mutex> lock(storages.mutex);
   auto it = storages.of.find(key);
   if (it != storages.of.end()) {
-    if (auto alive = it->second.second.lock()) {
+    // An owner that has moved away leaves a stale address: taking its entry made a new complex tensor a view of an
+    // older one, which reads the older values or fails in Habana (strided_view or strided_insert synStatus 1,
+    // "tensor_data is empty").
+    auto alive = it->second.second.lock();
+    if (alive && it->second.first->tensor.storage().unsafeGetStorageImpl() == key) {
       // The Habana storage may have grown since (r.resize_() on the real tensor): the lazy storage reports its size.
       if (alive->nbytes() < owner.storage().nbytes()) {
         alive->set_nbytes(owner.storage().nbytes());
@@ -1203,7 +1211,19 @@ at::Tensor matmul_pu1(const at::Tensor& a, const at::Tensor& b) {
     TORCH_WARN_ONCE("hpu_complex: complex mm/bmm below the CPU threshold (default 2^22 multiply-adds; first one: ",
                     macs, ") runs on the CPU, where it is faster than the card's GEMM "
                     "(hpu_complex.set_matmul_cpu_threshold(0) keeps every product on the card)");
-    return at::matmul(a.to(at::kCPU), b.to(at::kCPU)).to(device);
+    // Copy through raw_pair (not a.to(kCPU) directly on a Conjugate view): in Habana lazy mode, copying a transposed
+    // conjugate view via PrivateUse1 copy_ while another lazy result is live corrupts or triggers strided_insert.
+    auto to_cpu_resolved = [](const at::Tensor& t) {
+      auto c = at::view_as_complex(dense_copy(raw_pair(t)).to(at::kCPU));
+      if (t.is_conj()) {
+        c = c.conj().resolve_conj();
+      }
+      if (t.is_neg()) {
+        c = c.neg();
+      }
+      return c;
+    };
+    return at::matmul(to_cpu_resolved(a), to_cpu_resolved(b)).to(device);
   }
   // (..., r, c) complex -> (..., r, 2c) float = [re | im] per row. mm/bmm fall through the Conjugate key (BLAS folds
   // the conjugation in), so a conjugate view arrives unresolved: raw_pair gives its stored values, and the
@@ -1421,6 +1441,66 @@ at::ScalarType promoted_type(const at::Tensor& self, const c10::IValue& other) {
 std::optional<at::Tensor> real_times_complex_scalar_1d(bool mul, bool sub, c10::ArrayRef<c10::IValue> args,
                                                        c10::complex<float> c, const at::Tensor& x);
 
+// Lightweight autograd::Function for `real * w` (0-d complex CPU scalar tensor w, real.requires_grad(),
+// !w.requires_grad(), !w._fw_grad(0).defined()): runs real_times_complex_scalar_1d under
+// AutoDispatchBelowADInplaceOrView and saves w via save_for_backward({w}) so PyTorch checks w's version counter
+// on backward without paying the ~90-op promoted path.
+class MulWith0dComplexScalar : public torch::autograd::Function<MulWith0dComplexScalar> {
+ public:
+  static at::Tensor forward(torch::autograd::AutogradContext* ctx, const at::Tensor& real, const at::Tensor& w) {
+    ctx->save_for_backward({w});
+    ctx->saved_data["real_dtype"] = static_cast<int64_t>(real.scalar_type());
+    const auto c64 = w.item().toComplexDouble();
+    const c10::complex<float> c(static_cast<float>(c64.real()), static_cast<float>(c64.imag()));
+    ctx->saved_data["cr"] = static_cast<double>(c.real());
+    ctx->saved_data["ci"] = static_cast<double>(c.imag());
+    at::AutoDispatchBelowADInplaceOrView guard;
+    HPU_COMPLEX_NO_AUTOCAST;
+    auto x = real.scalar_type() == at::kFloat ? real : real.to(at::kFloat);
+    if (x.dim() == 0) {
+      x = x.unsqueeze(0);
+      auto value = real_times_complex_scalar_1d(true, false, {}, c, x);
+      return value->squeeze(0);
+    }
+    return *real_times_complex_scalar_1d(true, false, {}, c, x);
+  }
+
+  static torch::autograd::variable_list backward(torch::autograd::AutogradContext* ctx,
+                                                 torch::autograd::variable_list grads) {
+    const auto saved = ctx->get_saved_variables();  // enforces version-counter check on w
+    (void)saved;
+    const auto& grad = grads[0];
+    if (!grad.defined()) {
+      return {at::Tensor(), at::Tensor()};
+    }
+    HPU_COMPLEX_NO_AUTOCAST;
+    const double cr = ctx->saved_data["cr"].toDouble();
+    const double ci = ctx->saved_data["ci"].toDouble();
+    const auto real_dtype = static_cast<at::ScalarType>(ctx->saved_data["real_dtype"].toInt());
+    // Mirror forward's 0-d -> 1-d workaround: Habana's lazy compiler mis-shapes 0-d view arithmetic in unbind/stack backward.
+    const bool scalar = grad.dim() == 0;
+    auto g = scalar ? grad.unsqueeze(0) : grad;
+    auto pair = at::view_as_real(g.resolve_conj());
+    auto g_real = pair.select(-1, 0) * cr + pair.select(-1, 1) * ci;
+    if (g_real.scalar_type() != real_dtype) {
+      g_real = g_real.to(real_dtype);
+    }
+    return {scalar ? g_real.squeeze(0) : g_real, at::Tensor()};
+  }
+};
+
+bool in_functorch(const at::Tensor& t) {
+  const auto functorch_keys = DispatchKeySet({
+      DispatchKey::FuncTorchDynamicLayerFrontMode,
+      DispatchKey::FuncTorchDynamicLayerBackMode,
+      DispatchKey::FuncTorchBatched,
+      DispatchKey::FuncTorchGradWrapper,
+      DispatchKey::FuncTorchVmapMode,
+  });
+  return t.key_set().has_any(functorch_keys) ||
+         c10::impl::tls_local_dispatch_key_set().included_.has_any(functorch_keys);
+}
+
 std::optional<at::Tensor> real_times_complex_scalar(const std::string& name, c10::ArrayRef<c10::IValue> args,
                                                     int64_t real_at, const at::Tensor& real) {
   const bool mul = name == "aten::mul";
@@ -1430,17 +1510,28 @@ std::optional<at::Tensor> real_times_complex_scalar(const std::string& name, c10
     return std::nullopt;
   }
   const auto& other = args[1 - real_at];
-  // A 0-d complex tensor is read with .item() only when its autograd is not needed: not when it requires grad or has
-  // a forward-AD tangent (those keep the promoted op, whose autograd has both). Not covered: a w modified in place
-  // between x * w and the backward is not detected (README Limits); Green makes 10 such calls a step, and the
-  // promoted op cost them ~90 dispatched ops (measured with torch.profiler).
   if (other.isTensor()) {
     const auto& w = other.toTensor();
     if (w.requires_grad() || w._fw_grad(/*level=*/0).defined()) {
       return std::nullopt;
     }
+    const auto c64 = w.item().toComplexDouble();
+    const c10::complex<float> c(static_cast<float>(c64.real()), static_cast<float>(c64.imag()));
+    if (!std::isfinite(c.real()) || !std::isfinite(c.imag())) {
+      return std::nullopt;
+    }
+    if (mul && torch::autograd::GradMode::is_enabled() && real.requires_grad() && !in_functorch(real)) {
+      return MulWith0dComplexScalar::apply(real, w);
+    }
+    auto x = real.scalar_type() == at::kFloat ? real : real.to(at::kFloat);
+    if (x.dim() == 0) {
+      x = x.unsqueeze(0);
+      auto value = real_times_complex_scalar_1d(mul, sub, args, c, x);
+      return value ? std::optional<at::Tensor>(value->squeeze(0)) : std::nullopt;
+    }
+    return real_times_complex_scalar_1d(mul, sub, args, c, x);
   }
-  const auto c64 = other.isTensor() ? other.toTensor().item().toComplexDouble() : other.toScalar().toComplexDouble();
+  const auto c64 = other.toScalar().toComplexDouble();
   const c10::complex<float> c(static_cast<float>(c64.real()), static_cast<float>(c64.imag()));
   if (!std::isfinite(c.real()) || !std::isfinite(c.imag())) {
     return std::nullopt;
@@ -1580,7 +1671,7 @@ void complex_scalar_backend_select(const c10::OperatorHandle& op, DispatchKeySet
 template <class T>
 bool on_hpu(const T& v) {
   if constexpr (std::is_same_v<std::decay_t<T>, at::Tensor>) {
-    return v.defined() && v.is_hpu();
+    return v.defined() && v.is_hpu() && !v.is_complex() && !tagged(v);
   } else {
     return false;
   }
@@ -2122,7 +2213,8 @@ at::Tensor cat_pairs(const std::vector<at::Tensor>& all, int64_t dim, const at::
                   i, " in the list.");
     }
   }
-  return complex_result(at::cat(pairs, d));
+  auto res = complex_result(at::cat(pairs, d));
+  return is_lazy_mode() ? clone_pu1(res, std::nullopt) : res;
 }
 
 // cat.out as torch: the inputs' result type must cast to out's dtype (no complex into a real out), out may not overlap
@@ -2515,11 +2607,12 @@ bool allocates_like(const c10::OperatorName& name) {
   return name.overload_name.empty() && ops.count(name.name) > 0;
 }
 
-// Registers structured_pu1 for every aten op whose PrivateUse1 slot holds the NonFunctional composite kernel, and
-// for the composite ops above.
+// Registers structured_pu1 for every aten op whose PrivateUse1/PrivateUse2 slot holds the NonFunctional composite
+// kernel, and for the composite ops above.
 struct RegisterStructured {
   RegisterStructured() {
     static auto* lib = new torch::Library(torch::Library::IMPL, "aten", DispatchKey::PrivateUse1, __FILE__, __LINE__);
+    static auto* lib2 = new torch::Library(torch::Library::IMPL, "aten", DispatchKey::PrivateUse2, __FILE__, __LINE__);
     auto& dispatcher = c10::Dispatcher::singleton();
     for (const auto& name : dispatcher.getAllOpNames()) {
       if (name.name.rfind("aten::", 0) != 0) {
@@ -2528,15 +2621,256 @@ struct RegisterStructured {
       auto op = dispatcher.findOp(name);
       if (!op || !(op->hasKernelForDispatchKey(DispatchKey::CompositeExplicitAutogradNonFunctional) ||
                    (op->hasKernelForDispatchKey(DispatchKey::CompositeExplicitAutograd) && allocates_like(name))) ||
-          op->hasKernelForDispatchKey(DispatchKey::PrivateUse1) ||
           op->hasKernelForDispatchKey(DispatchKey::PrivateUse3)) {
         continue;
       }
       auto unqualified = name.name.substr(6) + (name.overload_name.empty() ? "" : "." + name.overload_name);
-      lib->impl(unqualified.c_str(), torch::CppFunction::makeFromBoxedFunction<&structured_pu1>());
+      if (!op->hasKernelForDispatchKey(DispatchKey::PrivateUse1)) {
+        lib->impl(unqualified.c_str(), torch::CppFunction::makeFromBoxedFunction<&structured_pu1>());
+      }
+      if (!op->hasKernelForDispatchKey(DispatchKey::PrivateUse2)) {
+        lib2->impl(unqualified.c_str(), torch::CppFunction::makeFromBoxedFunction<&structured_pu1>());
+      }
     }
   }
 };
+
+// ---- angle, eq.Scalar_out, im2col, col2im (PrivateUse1) ---------------------------------------------------
+
+at::Tensor angle_pu1(const at::Tensor& self) {
+  if (host_backed(self)) {
+    return from_cpu(at::angle(host_cpu(self)), self.device());
+  }
+  HPU_COMPLEX_NO_AUTOCAST;
+  if (!self.is_complex()) {
+    return at::angle(self);
+  }
+  auto pair = values_pair(self);
+  return at::atan2(pair.select(-1, 1), pair.select(-1, 0));
+}
+
+at::Tensor& angle_out_pu1(const at::Tensor& self, at::Tensor& out) {
+  return write_out(out, angle_pu1(self), {&self});
+}
+
+at::Tensor& eq_scalar_out_pu1(const at::Tensor& self, const at::Scalar& other, at::Tensor& out) {
+  if (host_backed(self)) {
+    return write_out(out, from_cpu(at::eq(host_cpu(self), other), self.device()), {&self});
+  }
+  HPU_COMPLEX_NO_AUTOCAST;
+  if (!self.is_complex()) {
+    if (other.isComplex()) {
+      const auto c = other.toComplexDouble();
+      auto eq_real = self == static_cast<float>(c.real());
+      auto eq_val = static_cast<float>(c.imag()) == 0.0f ? eq_real : at::zeros_like(eq_real);
+      return write_out(out, eq_val, {&self});
+    }
+    return write_out(out, at::eq(self, other), {&self});
+  }
+  auto pair = values_pair(self);
+  const auto c = other.toComplexDouble();
+  auto eq_val = (pair.select(-1, 0) == static_cast<float>(c.real()))
+                    .logical_and(pair.select(-1, 1) == static_cast<float>(c.imag()));
+  return write_out(out, eq_val, {&self});
+}
+
+constexpr int64_t kMaxIm2colIndex = int64_t{1} << 24;
+
+bool valid_im2col_params(c10::IntArrayRef kernel_size, c10::IntArrayRef dilation, c10::IntArrayRef padding,
+                         c10::IntArrayRef stride) {
+  return kernel_size.size() == 2 && dilation.size() == 2 && padding.size() == 2 && stride.size() == 2 &&
+         kernel_size[0] > 0 && kernel_size[1] > 0 && dilation[0] > 0 && dilation[1] > 0 && padding[0] >= 0 &&
+         padding[1] >= 0 && stride[0] > 0 && stride[1] > 0;
+}
+
+std::pair<int64_t, int64_t> im2col_out_size(int64_t h, int64_t w, int64_t kh, int64_t kw, int64_t dh, int64_t dw,
+                                            int64_t ph, int64_t pw, int64_t sh, int64_t sw) {
+  const int64_t h_num = h + 2 * ph - dh * (kh - 1) - 1;
+  const int64_t w_num = w + 2 * pw - dw * (kw - 1) - 1;
+  const int64_t oh = h_num >= 0 ? (h_num / sh + 1) : 0;
+  const int64_t ow = w_num >= 0 ? (w_num / sw + 1) : 0;
+  return {oh, ow};
+}
+
+bool is_4d_non_overlap(int64_t h, int64_t w, int64_t kh, int64_t kw, int64_t dh, int64_t dw, int64_t ph, int64_t pw,
+                       int64_t sh, int64_t sw) {
+  return dh == 1 && dw == 1 && ph == 0 && pw == 0 && sh == kh && sw == kw &&
+         ((w == 1 && kw == 1) || (h == 1 && kh == 1));
+}
+
+at::Tensor im2col_pu1(const at::Tensor& self, c10::IntArrayRef kernel_size, c10::IntArrayRef dilation,
+                      c10::IntArrayRef padding, c10::IntArrayRef stride) {
+  if (host_backed(self)) {
+    return from_cpu(at::im2col(host_cpu(self), kernel_size, dilation, padding, stride), self.device());
+  }
+  if (!self.is_complex()) {
+    return at::im2col(self, kernel_size, dilation, padding, stride);
+  }
+  const int64_t ndim = self.dim();
+  if ((ndim != 3 && ndim != 4) || !valid_im2col_params(kernel_size, dilation, padding, stride)) {
+    return at::im2col(cpu_operand(self), kernel_size, dilation, padding, stride).to(self.device());
+  }
+  const int64_t n = ndim == 4 ? self.size(0) : 1;
+  const int64_t c = ndim == 4 ? self.size(1) : self.size(0);
+  const int64_t h = ndim == 4 ? self.size(2) : self.size(1);
+  const int64_t w = ndim == 4 ? self.size(3) : self.size(2);
+  if (c <= 0 || h <= 0 || w <= 0) {
+    return at::im2col(cpu_operand(self), kernel_size, dilation, padding, stride).to(self.device());
+  }
+  const int64_t kh = kernel_size[0], kw = kernel_size[1];
+  const int64_t dh = dilation[0], dw = dilation[1];
+  const int64_t ph = padding[0], pw = padding[1];
+  const int64_t sh = stride[0], sw = stride[1];
+  const auto [oh, ow] = im2col_out_size(h, w, kh, kw, dh, dw, ph, pw, sh, sw);
+  if (oh <= 0 || ow <= 0) {
+    return at::im2col(cpu_operand(self), kernel_size, dilation, padding, stride).to(self.device());
+  }
+  if (kh * kw * oh * ow > kMaxIm2colIndex) {
+    cpu_fallback_calls.fetch_add(1);
+    TORCH_WARN_ONCE("hpu_complex: aten::im2col on a complex HPU tensor runs on the CPU");
+    return at::im2col(cpu_operand(self), kernel_size, dilation, padding, stride).to(self.device());
+  }
+  if (n == 0) {
+    const std::vector<int64_t> empty_sizes{0, c * kh * kw, oh * ow};
+    return make_complex_empty(empty_sizes, c10::contiguous_strides(empty_sizes), self.device());
+  }
+  HPU_COMPLEX_NO_AUTOCAST;
+  auto pair = values_pair(self);
+  if (ndim == 3) {
+    pair = pair.unsqueeze(0);
+  }
+  at::Tensor res_pair;
+  if (is_4d_non_overlap(h, w, kh, kw, dh, dw, ph, pw, sh, sw)) {
+    if (w == 1 && kw == 1) {
+      auto t = pair.reshape({n * c, h, 2});
+      if (h > oh * kh) {
+        t = t.narrow(1, 0, oh * kh);
+      }
+      res_pair = t.reshape({n * c, oh, kh, 2}).transpose(1, 2).contiguous();
+    } else {
+      auto t = pair.reshape({n * c, w, 2});
+      if (w > ow * kw) {
+        t = t.narrow(1, 0, ow * kw);
+      }
+      res_pair = t.reshape({n * c, ow, kw, 2}).transpose(1, 2).contiguous();
+    }
+  } else {
+    const int64_t hp = h + 2 * ph;
+    const int64_t wp = w + 2 * pw;
+    auto iopts = at::TensorOptions().dtype(at::kLong).device(self.device());
+    auto ky = at::arange(kh, iopts) * dh;
+    auto kx = at::arange(kw, iopts) * dw;
+    auto oy = at::arange(oh, iopts) * sh;
+    auto ox = at::arange(ow, iopts) * sw;
+    auto rows = ky.view({kh, 1, 1, 1}) + oy.view({1, 1, oh, 1});
+    auto cols = kx.view({1, kw, 1, 1}) + ox.view({1, 1, 1, ow});
+    auto idx = (rows * wp + cols).reshape({-1});
+    auto xp = pair.reshape({n * c, h, w, 2}).permute({0, 3, 1, 2}).contiguous();
+    if (ph > 0 || pw > 0) {
+      xp = at::constant_pad_nd(xp, {pw, pw, ph, ph});
+    }
+    auto gathered = xp.reshape({n * c * 2, hp * wp}).index_select(1, idx);
+    res_pair = gathered.reshape({n * c, 2, kh * kw * oh * ow}).transpose(1, 2).contiguous();
+  }
+  if (ndim == 3) {
+    return complex_result(res_pair.reshape({c * kh * kw, oh * ow, 2}));
+  }
+  return complex_result(res_pair.reshape({n, c * kh * kw, oh * ow, 2}));
+}
+
+at::Tensor& im2col_out_pu1(const at::Tensor& self, c10::IntArrayRef kernel_size, c10::IntArrayRef dilation,
+                           c10::IntArrayRef padding, c10::IntArrayRef stride, at::Tensor& out) {
+  return write_out(out, im2col_pu1(self, kernel_size, dilation, padding, stride), {&self}, /*matrix_mm=*/true);
+}
+
+at::Tensor col2im_pu1(const at::Tensor& self, c10::IntArrayRef output_size, c10::IntArrayRef kernel_size,
+                      c10::IntArrayRef dilation, c10::IntArrayRef padding, c10::IntArrayRef stride) {
+  if (host_backed(self)) {
+    return from_cpu(at::col2im(host_cpu(self), output_size, kernel_size, dilation, padding, stride), self.device());
+  }
+  if (!self.is_complex()) {
+    return at::col2im(self, output_size, kernel_size, dilation, padding, stride);
+  }
+  const int64_t ndim = self.dim();
+  if ((ndim != 2 && ndim != 3) || output_size.size() != 2 ||
+      !valid_im2col_params(kernel_size, dilation, padding, stride)) {
+    return at::col2im(cpu_operand(self), output_size, kernel_size, dilation, padding, stride).to(self.device());
+  }
+  const int64_t h = output_size[0], w = output_size[1];
+  const int64_t kh = kernel_size[0], kw = kernel_size[1];
+  const int64_t dh = dilation[0], dw = dilation[1];
+  const int64_t ph = padding[0], pw = padding[1];
+  const int64_t sh = stride[0], sw = stride[1];
+  const int64_t n = ndim == 3 ? self.size(0) : 1;
+  const int64_t c_kw = self.size(-2);
+  const int64_t length = self.size(-1);
+  if (h <= 0 || w <= 0 || c_kw <= 0 || c_kw % (kh * kw) != 0) {
+    return at::col2im(cpu_operand(self), output_size, kernel_size, dilation, padding, stride).to(self.device());
+  }
+  const auto [oh, ow] = im2col_out_size(h, w, kh, kw, dh, dw, ph, pw, sh, sw);
+  if (oh <= 0 || ow <= 0 || length != oh * ow) {
+    return at::col2im(cpu_operand(self), output_size, kernel_size, dilation, padding, stride).to(self.device());
+  }
+  const int64_t c = c_kw / (kh * kw);
+  if (kh * kw * length > kMaxIm2colIndex) {
+    cpu_fallback_calls.fetch_add(1);
+    TORCH_WARN_ONCE("hpu_complex: aten::col2im on a complex HPU tensor runs on the CPU");
+    return at::col2im(cpu_operand(self), output_size, kernel_size, dilation, padding, stride).to(self.device());
+  }
+  if (n == 0) {
+    const std::vector<int64_t> empty_sizes{0, c, h, w};
+    return make_complex_empty(empty_sizes, c10::contiguous_strides(empty_sizes), self.device());
+  }
+  HPU_COMPLEX_NO_AUTOCAST;
+  auto pair = values_pair(self);
+  if (ndim == 2) {
+    pair = pair.unsqueeze(0);
+  }
+  at::Tensor res_pair;
+  if (is_4d_non_overlap(h, w, kh, kw, dh, dw, ph, pw, sh, sw)) {
+    if (w == 1 && kw == 1) {
+      auto t = pair.reshape({n * c, kh, oh, 2}).transpose(1, 2).contiguous().reshape({n * c, oh * kh, 1, 2});
+      if (h > oh * kh) {
+        t = at::cat({t, at::zeros({n * c, h - oh * kh, 1, 2}, t.options())}, 1);
+      }
+      res_pair = t;
+    } else {
+      auto t = pair.reshape({n * c, kw, ow, 2}).transpose(1, 2).contiguous().reshape({n * c, 1, ow * kw, 2});
+      if (w > ow * kw) {
+        t = at::cat({t, at::zeros({n * c, 1, w - ow * kw, 2}, t.options())}, 2);
+      }
+      res_pair = t;
+    }
+  } else {
+    const int64_t hp = h + 2 * ph;
+    const int64_t wp = w + 2 * pw;
+    auto iopts = at::TensorOptions().dtype(at::kLong).device(self.device());
+    auto ky = at::arange(kh, iopts) * dh;
+    auto kx = at::arange(kw, iopts) * dw;
+    auto oy = at::arange(oh, iopts) * sh;
+    auto ox = at::arange(ow, iopts) * sw;
+    auto rows = ky.view({kh, 1, 1, 1}) + oy.view({1, 1, oh, 1});
+    auto cols = kx.view({1, kw, 1, 1}) + ox.view({1, 1, 1, ow});
+    auto idx = (rows * wp + cols).reshape({-1});
+    auto src = pair.reshape({n * c, kh * kw * length, 2}).transpose(1, 2).contiguous().reshape({n * c * 2, kh * kw * length});
+    auto acc = at::zeros({n * c * 2, hp * wp}, src.options()).index_add(1, idx, src).reshape({n * c, 2, hp, wp});
+    if (ph > 0 || pw > 0) {
+      acc = acc.narrow(2, ph, h).narrow(3, pw, w);
+    }
+    res_pair = acc.permute({0, 2, 3, 1}).contiguous();
+  }
+  if (ndim == 2) {
+    return complex_result(res_pair.reshape({c, h, w, 2}));
+  }
+  return complex_result(res_pair.reshape({n, c, h, w, 2}));
+}
+
+at::Tensor& col2im_out_pu1(const at::Tensor& self, c10::IntArrayRef output_size, c10::IntArrayRef kernel_size,
+                           c10::IntArrayRef dilation, c10::IntArrayRef padding, c10::IntArrayRef stride,
+                           at::Tensor& out) {
+  return write_out(out, col2im_pu1(self, output_size, kernel_size, dilation, padding, stride), {&self},
+                   /*matrix_mm=*/true);
+}
 
 }  // namespace
 
@@ -2548,6 +2882,10 @@ TORCH_LIBRARY(hpu_complex, m) {
 }
 
 TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
+  m.fallback(torch::CppFunction::makeFromBoxedFunction<&cpu_fallback>());
+}
+
+TORCH_LIBRARY_IMPL(_, PrivateUse2, m) {
   m.fallback(torch::CppFunction::makeFromBoxedFunction<&cpu_fallback>());
 }
 
@@ -2680,6 +3018,13 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("set_.source_Storage_storage_offset", &set_storage_pu1);
   m.impl("set_.source_Storage", &set_source_storage_pu1);
   m.impl("set_", &set_empty_pu1);
+  m.impl("angle", &angle_pu1);
+  m.impl("angle.out", &angle_out_pu1);
+  m.impl("eq.Scalar_out", &eq_scalar_out_pu1);
+  m.impl("im2col", &im2col_pu1);
+  m.impl("im2col.out", &im2col_out_pu1);
+  m.impl("col2im", &col2im_pu1);
+  m.impl("col2im.out", &col2im_out_pu1);
 }
 
 TORCH_LIBRARY_FRAGMENT(hpu_complex, m) {  // a fragment: Team C's branch may define the namespace too

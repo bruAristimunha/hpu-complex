@@ -11,6 +11,7 @@ enable() is safe to call anywhere: without a Gaudi it does nothing.
 hpu_complex.rfft/irfft/fft/stft (the _core module) are a separate,
 device-agnostic float API on [..., 2] pairs.
 """
+import contextlib
 import importlib.util
 import math
 import os
@@ -118,6 +119,7 @@ def _complex128_graphs_run_eagerly():
 
     @functools.wraps(original)
     def hpu_backend(gm, example_inputs, **kwargs):
+        _patch_hpu_ops_im2col()
         if _holds_host_values(gm, example_inputs):
             return gm.forward
         return _eager_for_host_inputs(gm, original(gm, example_inputs, **kwargs))
@@ -165,6 +167,134 @@ def _fold_conj_of_python_scalars(gm):
     return True
 
 
+_PARTITIONER_LOCK = threading.Lock()
+_PARTITIONER_DEPTH = 0
+_PARTITIONER_SAVED = None
+
+
+@contextlib.contextmanager
+def _python_partitioner(hpu_config):
+    """Hold ``hpu_config.use_cpp_partitioner = False`` across concurrent AOT graph compilations."""
+    global _PARTITIONER_DEPTH, _PARTITIONER_SAVED
+    with _PARTITIONER_LOCK:
+        if _PARTITIONER_DEPTH == 0 and hasattr(hpu_config, "use_cpp_partitioner"):
+            _PARTITIONER_SAVED = hpu_config.use_cpp_partitioner
+            if _PARTITIONER_SAVED:
+                hpu_config.use_cpp_partitioner = False
+        _PARTITIONER_DEPTH += 1
+    try:
+        yield
+    finally:
+        with _PARTITIONER_LOCK:
+            _PARTITIONER_DEPTH -= 1
+            if _PARTITIONER_DEPTH == 0 and _PARTITIONER_SAVED is not None:
+                hpu_config.use_cpp_partitioner = _PARTITIONER_SAVED
+                _PARTITIONER_SAVED = None
+
+
+def _wrap_im2col_decomps(decomps):
+    """Skip AOT decomposition of aten.im2col / aten.col2im on complex tensors so pass_mark_placement keeps them
+    eager on im2col_pu1 / col2im_pu1 instead of lowering into unsupported complex index / index_put ops."""
+    import functools
+
+    import torch
+
+    if not isinstance(decomps, dict):
+        return decomps
+    aten = torch.ops.aten
+    targets = (aten.im2col.default, aten.im2col.out, aten.col2im.default, aten.col2im.out)
+    wrapped = None
+    for op in targets:
+        orig = decomps.get(op)
+        if orig is None or getattr(orig, "_hpu_complex_wrapped", False):
+            continue
+        if wrapped is None:
+            wrapped = dict(decomps)
+
+        def make_wrapper(orig_fn):
+            @functools.wraps(orig_fn)
+            def wrapper(*args, **kwargs):
+                first = args[0] if args else kwargs.get("input")
+                if isinstance(first, torch.Tensor) and first.is_complex():
+                    return NotImplemented
+                return orig_fn(*args, **kwargs)
+
+            wrapper._hpu_complex_wrapped = True
+            return wrapper
+
+        wrapped[op] = make_wrapper(orig)
+    return decomps if wrapped is None else wrapped
+
+
+def _patch_hpu_ops_im2col():
+    """When hpu_ops is loaded alongside hpu_complex, decline complex tensors in hpu_ops.im2col so FakeTensor
+    tracing under torch.compile preserves aten.im2col / aten.col2im for im2col_pu1 / col2im_pu1 instead of lowering
+    complex tensors into index_select / index_add."""
+    import sys
+
+    mod = sys.modules.get("hpu_ops.im2col")
+    if mod is None or getattr(mod, "_hpu_complex_patched", False):
+        return
+    for fn_name in ("_valid_im2col", "_valid_col2im"):
+        orig = getattr(mod, fn_name, None)
+        if callable(orig):
+            def make_valid(orig_fn=orig):
+                def valid(self, *args, **kwargs):
+                    if self.is_complex():
+                        return False
+                    return orig_fn(self, *args, **kwargs)
+
+                return valid
+
+            setattr(mod, fn_name, make_valid())
+    mod._hpu_complex_patched = True
+
+
+def _preserve_complex_im2col_decomps():
+    _patch_hpu_ops_im2col()
+    try:
+        from habana_frameworks.torch.dynamo.compile_backend import backends
+    except ImportError:
+        return
+    try:
+        from habana_frameworks.torch.dynamo.compile_backend import decomposition
+    except ImportError:
+        decomposition = None
+
+    if decomposition is not None:
+        common = getattr(decomposition, "hpu_backend_decompositions_common", None)
+        if isinstance(common, dict):
+            common.update(_wrap_im2col_decomps(common))
+        orig_get = getattr(decomposition, "get_hpu_decompositions", None)
+        if callable(orig_get) and not getattr(orig_get, "_hpu_complex_wrapped", False):
+            def get_hpu_decompositions():
+                return _wrap_im2col_decomps(orig_get())
+
+            get_hpu_decompositions._hpu_complex_wrapped = True
+            decomposition.get_hpu_decompositions = get_hpu_decompositions
+
+    orig_backends_get = getattr(backends, "get_hpu_decompositions", None)
+    if callable(orig_backends_get) and not getattr(orig_backends_get, "_hpu_complex_wrapped", False):
+        def backends_get_hpu_decompositions():
+            return _wrap_im2col_decomps(orig_backends_get())
+
+        backends_get_hpu_decompositions._hpu_complex_wrapped = True
+        backends.get_hpu_decompositions = backends_get_hpu_decompositions
+
+    try:
+        from habana_frameworks.torch.dynamo.compile_backend._passes import fuse_attention
+    except ImportError:
+        fuse_attention = None
+    if fuse_attention is not None:
+        orig_fa_get = getattr(fuse_attention, "get_hpu_decompositions", None)
+        if callable(orig_fa_get) and not getattr(orig_fa_get, "_hpu_complex_wrapped", False):
+            def fa_get_hpu_decompositions():
+                return _wrap_im2col_decomps(orig_fa_get())
+
+            fa_get_hpu_decompositions._hpu_complex_wrapped = True
+            fuse_attention.get_hpu_decompositions = fa_get_hpu_decompositions
+
+
 def _aot_graphs_keep_complex64_scalars():
     """hpu_backend's forward, backward and inference graphs (after AOT autograd).
 
@@ -189,23 +319,48 @@ def _aot_graphs_keep_complex64_scalars():
         backends.import_compilers()
 
     def wrap(compiler):
+        if getattr(compiler, "_hpu_complex_wrapped", False):
+            return compiler
+
         def compile_graph(gm, example_inputs, *args, **kwargs):
             _fold_conj_of_python_scalars(gm)
             if _holds_host_values(gm, example_inputs):
                 from functorch.compile import make_boxed_func
 
                 return make_boxed_func(gm.forward)  # AOT calls its compiled graphs with a boxed list
-            if getattr(hpu_config, "use_cpp_partitioner", False) and any(
-                    n.op == "call_function" and _runs_eagerly(n) for n in gm.graph.nodes):
-                with hpu_config.patch(use_cpp_partitioner=False):
+            if any(n.op == "call_function" and _runs_eagerly(n) for n in gm.graph.nodes):
+                with _python_partitioner(hpu_config):
                     return compiler(gm, example_inputs, *args, **kwargs)
             return compiler(gm, example_inputs, *args, **kwargs)
 
+        compile_graph._hpu_complex_wrapped = True
         return compile_graph
 
-    for name in ("hpu_training_compiler_fw", "hpu_training_compiler_bw", "hpu_inference_compiler"):
-        if callable(getattr(backends, name, None)):
-            setattr(backends, name, wrap(getattr(backends, name)))
+    names = ("hpu_training_compiler_fw", "hpu_training_compiler_bw", "hpu_inference_compiler")
+
+    def wrap_targets():
+        for name in names:
+            if callable(getattr(backends, name, None)):
+                setattr(backends, name, wrap(getattr(backends, name)))
+        try:
+            from habana_frameworks.torch.dynamo.compile_backend import compilers as hpu_compilers
+        except ImportError:
+            hpu_compilers = None
+        if hpu_compilers is not None:
+            for name in names:
+                if callable(getattr(hpu_compilers, name, None)):
+                    setattr(hpu_compilers, name, wrap(getattr(hpu_compilers, name)))
+
+    wrap_targets()
+    orig_import = getattr(backends, "import_compilers", None)
+    if callable(orig_import) and not getattr(orig_import, "_hpu_complex_wrapped", False):
+        def import_compilers():
+            orig_import()
+            wrap_targets()
+
+        import_compilers._hpu_complex_wrapped = True
+        backends.import_compilers = import_compilers
+    _preserve_complex_im2col_decomps()
     backends._hpu_complex_aot = True
 
 

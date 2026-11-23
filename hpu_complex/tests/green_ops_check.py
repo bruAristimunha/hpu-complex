@@ -499,3 +499,45 @@ def add_checks(check, err, grad_err, worst, sync=lambda: None):
 
     check("review2 B15: the CPU-computation and inf-sign detectors catch the review's mutations",
           detectors_catch_mutations, 0)
+
+    # ---- M2 G10 (angle + eq.Scalar_out) & G11 (im2col + col2im) ------------------------------------------------
+    z_ang = torch.tensor([0j, -0.0 + 0j, 1 + 2j, -3 + 0.5j, 0 - 1j, complex(inf, 1)], dtype=torch.complex64)
+    z_ang_nan = torch.tensor([complex(nan, 0), complex(0, nan), 1 - 2j], dtype=torch.complex64)
+    check("M2 G10: complex angle values, conj, strided, out=", _no_cpu_fallback(lambda: worst(
+        cmp(torch.angle, z_ang),
+        float(not torch.equal(torch.angle(z_ang_nan.to(hpu)).cpu().isnan(), torch.angle(z_ang_nan).isnan())),
+        cmp(lambda t: torch.angle(t.conj()), z),
+        cmp(lambda t: torch.angle(t.mT), z),
+        cmp(lambda t: torch.angle(t, out=torch.empty(t.shape, dtype=torch.float32, device=t.device)), z))), 1e-6)
+    check("M2 G10: complex angle fwd+grad (0j-safe, eq.Scalar_out on card)", _no_cpu_fallback(
+        lambda: grad_err(lambda t: torch.angle(torch.complex(t, t.flip(-1) * 0.5))
+                         + torch.angle(torch.complex(torch.zeros_like(t), torch.zeros_like(t))),
+                         xr[..., :4].contiguous())), 1e-5)
+
+    x_t1 = torch.complex(torch.randn(2, 3, 7, 1), torch.randn(2, 3, 7, 1))
+    x_t1_w = torch.complex(torch.randn(2, 3, 1, 7), torch.randn(2, 3, 1, 7))
+    x_t2 = torch.complex(torch.randn(2, 3, 5, 6), torch.randn(2, 3, 5, 6))
+    c_t1_h = torch.complex(torch.randn(2, 6, 3), torch.randn(2, 6, 3))
+    c_t1_w = torch.complex(torch.randn(2, 6, 3), torch.randn(2, 6, 3))
+    c_t2 = torch.complex(torch.randn(2, 12, 9), torch.randn(2, 12, 9))
+    check("M2 G11: complex im2col / col2im Tier-1 & Tier-2 values", _no_cpu_fallback(lambda: worst(
+        cmp(lambda t: torch.ops.aten.im2col(t, (3, 1), (1, 1), (0, 0), (3, 1)), x_t1),
+        cmp(lambda t: torch.ops.aten.im2col(t, (1, 2), (1, 1), (0, 0), (1, 2)), x_t1_w),
+        cmp(lambda t: torch.ops.aten.im2col(t, (2, 3), (1, 1), (1, 1), (1, 2)), x_t2),
+        cmp(lambda t: torch.ops.aten.col2im(t, (7, 1), (2, 1), (1, 1), (0, 0), (2, 1)), c_t1_h),
+        cmp(lambda t: torch.ops.aten.col2im(t, (1, 7), (1, 2), (1, 1), (0, 0), (1, 2)), c_t1_w),
+        cmp(lambda t: torch.ops.aten.col2im(t, (5, 5), (2, 2), (2, 2), (0, 0), (1, 1)), c_t2))), 1e-5)
+    check("M2 G11: complex im2col / col2im fwd+grad", _no_cpu_fallback(lambda: worst(
+        grad_err(lambda t: torch.view_as_real(torch.ops.aten.im2col(
+            torch.complex(t, 1 - t).reshape(2, 1, 6, 2), (2, 2), (1, 1), (1, 0), (1, 1))), xr),
+        grad_err(lambda t: torch.view_as_real(torch.ops.aten.im2col(
+            torch.complex(t.reshape(-1)[:21], 1 - t.reshape(-1)[:21]).reshape(1, 3, 7, 1),
+            (2, 1), (1, 1), (0, 0), (2, 1))), xr),
+        grad_err(lambda t: torch.view_as_real(torch.ops.aten.col2im(
+            torch.complex(t, t * 0.5).reshape(2, 4, 3), (4, 2), (2, 2), (1, 1), (0, 0), (1, 1))), xr),
+        grad_err(lambda t: torch.view_as_real(torch.ops.aten.col2im(
+            torch.complex(t.reshape(-1)[:18], t.reshape(-1)[:18] * 0.5).reshape(1, 6, 3),
+            (7, 1), (2, 1), (1, 1), (0, 0), (2, 1))), xr),
+        grad_err(lambda t: torch.view_as_real(torch.ops.aten.col2im(
+            torch.complex(t.reshape(-1)[:18], t.reshape(-1)[:18] * 0.5).reshape(1, 6, 3),
+            (1, 7), (1, 2), (1, 1), (0, 0), (1, 2))), xr))), 1e-5)

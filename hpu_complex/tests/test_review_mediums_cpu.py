@@ -52,8 +52,6 @@ def test_forward_ad_tangent_of_a_0d_complex_tensor():
     assert got is not None and torch.equal(got.cpu(), ref)  # main dropped it: 6 + 8j in torch
 
 
-@pytest.mark.xfail(strict=True, reason="kept fast path: a 0-d tensor read with .item() has no version to check "
-                   "(README Limits); the promoted op cost Green 90 dispatched ops a step")
 def test_modified_0d_scalar_is_detected_before_backward():
     x = torch.tensor([2.0], requires_grad=True)
     w = torch.tensor(1 + 1j)
@@ -61,6 +59,53 @@ def test_modified_0d_scalar_is_detected_before_backward():
     w.add_(1)
     with pytest.raises(RuntimeError, match="modified by an inplace operation"):
         y.backward()
+
+
+def test_0d_scalar_mul_supports_double_backward_and_functorch():
+    x = torch.tensor([2.0, -3.0], requires_grad=True)
+    w = torch.tensor(1 + 2j)
+    xh = x.detach().to(HPU).requires_grad_()
+    (g_ref,) = torch.autograd.grad((x * w).abs().pow(2).sum(), x, create_graph=True)
+    (gg_ref,) = torch.autograd.grad(g_ref.sum(), x)
+    (g_got,) = torch.autograd.grad((xh * w).abs().pow(2).sum(), xh, create_graph=True)
+    (gg_got,) = torch.autograd.grad(g_got.sum(), xh)
+    torch.testing.assert_close(g_got.cpu(), g_ref)
+    torch.testing.assert_close(gg_got.cpu(), gg_ref)
+    # functorch grad skips MulWith0dComplexScalar cleanly
+    fg_got = torch.func.grad(lambda t: (t * w).abs().sum())(xh.detach())
+    fg_ref = torch.func.grad(lambda t: (t * w).abs().sum())(x.detach())
+    torch.testing.assert_close(fg_got.cpu(), fg_ref)
+
+
+def test_lazy_inference_mode_storage_and_view_paths():
+    """#13 Finding 5: exercise lazy C++ storage/view paths under inference_mode via set_lazy_mode(True)."""
+    import gc
+
+    torch.ops.hpu_complex.set_lazy_mode(True)
+    try:
+        gc.collect()
+        alive0 = torch.ops.hpu_complex.lazy_storages_alive()
+        with torch.inference_mode():
+            e = torch.empty(3, 4, dtype=C64, device=HPU)
+            r = torch.randn(3, 4, 2, device=HPU)
+            vc = torch.view_as_complex(r)
+            vd = r.reshape(3, 8).view(C64)
+            cx = torch.complex(r[..., 0], r[..., 1])
+            vr = torch.view_as_real(cx)
+            rl = cx.real
+            im = cx.imag
+            assert all(t.is_inference() for t in (e, vc, vd, cx, vr, rl, im))
+            assert all(tagged(t) for t in (e, vc, vd, cx))
+            assert not any(tagged(t) for t in (vr, rl, im))
+            # Rank >= 5 permuted complex64 raises in lazy mode (even under inference_mode)
+            perm5 = torch.empty(2, 2, 2, 2, 2, dtype=C64, device=HPU).permute(4, 3, 2, 1, 0)
+            with pytest.raises(RuntimeError, match="rank 5 or more"):
+                torch.view_as_real(perm5)
+            del e, r, vc, vd, cx, vr, rl, im, perm5
+        gc.collect()
+        assert torch.ops.hpu_complex.lazy_storages_alive() == alive0
+    finally:
+        torch.ops.hpu_complex.set_lazy_mode(False)
 
 
 # ---- inference mode: views of inference tensors are inference tensors ----------------------------------

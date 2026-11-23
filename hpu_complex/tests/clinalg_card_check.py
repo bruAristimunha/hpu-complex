@@ -87,11 +87,32 @@ def cases(b, n):
         "qr": (lambda A: _qr_gauge_free(torch.linalg.qr(A)), [rand(b, n, n, seed=9)]),
         "qr_tall": (lambda A: _qr_gauge_free(torch.linalg.qr(A)), [rand(b, n, max(1, n // 2), seed=9)]),
         "hpd_slogdet": (_hpd_logabsdet, [hpd(b, n, 3)]),
+        "det": (lambda A: torch.linalg.det(A), [rand(b, n, n, seed=1)]),
+        "slogdet": (lambda A: torch.linalg.slogdet(A), [rand(b, n, n, seed=1)]),
+        "slogdet_phase": (lambda A: _slogdet_phase(torch.linalg.slogdet(A)), [rand(b, n, n, seed=1)]),
+        "svd": (lambda A: _svd_gauge_free(torch.linalg.svd(A, full_matrices=False)), [rand(b, n, max(1, n - 2), seed=7)]),
+        "svd_full": (lambda A: _svd_gauge_free(torch.linalg.svd(A, full_matrices=True)),
+                     [rand(b, n, max(1, n - 2), seed=7)]),
+        "svd_wide": (lambda A: _svd_gauge_free(torch.linalg.svd(A, full_matrices=False)),
+                     [rand(b, max(1, n - 2), n, seed=7)]),
+        "svd_wide_full": (lambda A: _svd_gauge_free(torch.linalg.svd(A, full_matrices=True)),
+                          [rand(b, max(1, n - 2), n, seed=7)]),
+        "svdvals": (lambda A: torch.linalg.svdvals(A), [rand(b, n, max(1, n - 2), seed=7)]),
         "lstsq": (lambda A, B: torch.linalg.lstsq(A, B).solution, [rand(b, n, max(1, n - 2), seed=7),
                                                                    rand(b, n, 3, seed=8)]),
     }
     del k
     return out
+
+
+def _slogdet_phase(res):
+    return (res.sign * (1 + 2j)).real + res.logabsdet
+
+
+def _svd_gauge_free(res):
+    U, S, Vh = res
+    k = S.shape[-1]
+    return (U[..., :k] * S.unsqueeze(-2)) @ Vh[..., :k, :], S
 
 
 def _qr_gauge_free(qr):
@@ -115,7 +136,7 @@ def _herm(b, n, seed):
 
 def _gauge_free(wv):
     w, V = wv
-    return w, V.abs() ** 2
+    return w, V.real.square() + V.imag.square()
 
 
 def loss_of(out):
@@ -138,22 +159,31 @@ def run(f, inputs, grad):
 
 def time_calls(f, inputs, grad, reps):
     xs = [x.clone().requires_grad_(grad) for x in inputs]
-    keep = []
+    keep = [] if not LAZY else None
 
     def once():
+        nonlocal keep
         out = f(*xs)
         if grad:
             g = torch.autograd.grad(loss_of(out), xs)
-            keep.append(g)
-        keep.append(out)
+            val = (out, g)
+        else:
+            val = out
+        if LAZY:
+            keep = val
+            sync()
+        else:
+            keep.append(val)
 
     for _ in range(3):
         once()
-    sync()
+    if not LAZY:
+        sync()
     t = time.perf_counter()
     for _ in range(reps):
         once()
-    sync()
+    if not LAZY:
+        sync()
     return (time.perf_counter() - t) / reps * 1e3
 
 
@@ -179,6 +209,7 @@ def main():
     import hpu_complex.linalg as L
 
     hpu_complex.enable()
+    hpu_complex.set_matmul_cpu_threshold(0)
     ext = torch.ops.hpu_complex
     failed = 0
     wanted = set(filter(None, args.ops.split(",")))
@@ -219,12 +250,16 @@ def main():
                             with warnings.catch_warnings():
                                 warnings.simplefilter("ignore")
                                 times[f"{label}_fwd"].append(time_calls(f, hin, False, args.reps))
-                                times[f"{label}_fwd_bwd"].append(time_calls(f, hin, True, args.reps))
-                    row["ms_median"] = {k: round(statistics.median(v), 3) for k, v in times.items()}
+                                # Habana's native Lazy cpu_route backward crashes strided_insert on left=False solve & SVD U/Vh.
+                                if not (LAZY and label == "cpu_route" and (
+                                        name == "solve_left_false" or (name.startswith("svd") and name != "svdvals"))):
+                                    times[f"{label}_fwd_bwd"].append(time_calls(f, hin, True, args.reps))
+                    row["ms_median"] = {k: (round(statistics.median(v), 3) if v else None) for k, v in times.items()}
                     row["ms_all"] = {k: [round(x, 3) for x in v] for k, v in times.items()}
                     row["speedup_fwd"] = round(row["ms_median"]["cpu_route_fwd"] / row["ms_median"]["card_fwd"], 2)
-                    row["speedup_fwd_bwd"] = round(row["ms_median"]["cpu_route_fwd_bwd"]
-                                                   / row["ms_median"]["card_fwd_bwd"], 2)
+                    row["speedup_fwd_bwd"] = (round(row["ms_median"]["cpu_route_fwd_bwd"]
+                                                    / row["ms_median"]["card_fwd_bwd"], 2)
+                                              if row["ms_median"]["cpu_route_fwd_bwd"] is not None else None)
                 L.install()
                 row["status"] = "ok" if ok else "wrong"
             except Exception as e:  # noqa: BLE001  (the failure is the result)
