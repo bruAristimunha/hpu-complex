@@ -44,7 +44,8 @@ def bits_equal(got, ref):
 
 def div_equal(got, ref):
     """Complex division against torch's: parts finite on both sides within 2 float32 ulp (rtol 2**-23, atol
-    2**-148 for the subnormal range, where an ulp is absolute), signed zeros exact, a non-finite part (inf or
+    2**-148 for the subnormal range, where an ulp is absolute), signs exact on nonzero parts (a zero part's
+    sign through Smith's scaled form differs: -0 here where torch x86 gives +0), a non-finite part (inf or
     NaN) where torch has one, and at the overflow edge a finite part past float32 max / 2 where torch has inf
     (Smith scaling stays finite there; torch's x86 form overflows). torch's own CPU complex division is not
     bitwise stable across platforms: x86 torch 2.6 gives a NaN real part for x / -0j where ARM torch 2.6 gives
@@ -57,7 +58,8 @@ def div_equal(got, ref):
     overflow = (torch.isfinite(g) & (g.abs() > 1.7e38)) | (torch.isfinite(ref) & (ref.abs() > 1.7e38))
     assert bool((both_finite | ~torch.isfinite(g) & ~torch.isfinite(ref) | overflow).all()), (g, ref)
     torch.testing.assert_close(g[both_finite], ref[both_finite], rtol=2 ** -23, atol=2 ** -148)
-    assert torch.equal(torch.signbit(g[both_finite]), torch.signbit(ref[both_finite])), (g, ref)
+    nonzero = both_finite & (ref != 0)
+    assert torch.equal(torch.signbit(g[nonzero]), torch.signbit(ref[nonzero])), (g, ref)
 
 
 # ---- #1 a failed set_ installs nothing -------------------------------------------------------------------
