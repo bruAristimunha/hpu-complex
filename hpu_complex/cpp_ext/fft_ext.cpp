@@ -126,13 +126,17 @@ bool is_lazy_mode() {
 // through it), and it releases the Habana tensor when the last complex tensor over it goes.
 struct LazyOwner {
   at::Tensor tensor;
+  const c10::StorageImpl* key;  // the Habana StorageImpl it was registered under in lazy_storages()
 };
 
 std::atomic<int64_t> lazy_owners_alive{0};
 
 // One lazy storage per Habana storage: complex tensors made separately over the same Habana storage (two
 // view_as_complex of one r) share it, as torch's views share a StorageImpl, so a growth through one of them is seen by
-// all (each kept its own capacity before) and torch's overlap checks see one storage.
+// all (each kept its own capacity before) and torch's overlap checks see one storage. An entry is keyed by the
+// StorageImpl its owner lived in when it was made, and Habana moves a lazy tensor (and its detached aliases) to a new
+// StorageImpl when some graphs run (measured at a mark_step and at a host read, Gaudi2, bridge 1.21.4) and frees the
+// old one, whose address a later tensor then gets: so an entry is used only while its owner still lives there.
 struct LazyStorages {
   std::mutex mutex;
   std::map<const c10::StorageImpl*, std::pair<const LazyOwner*, c10::weak_intrusive_ptr<c10::StorageImpl>>> of;
@@ -148,7 +152,7 @@ void lazy_owner_free(void* ctx) {
   {
     auto& storages = lazy_storages();
     std::lock_guard<std::mutex> lock(storages.mutex);
-    auto it = storages.of.find(owner->tensor.storage().unsafeGetStorageImpl());
+    auto it = storages.of.find(owner->key);
     if (it != storages.of.end() && it->second.first == owner) {
       storages.of.erase(it);
     }
@@ -161,7 +165,7 @@ void lazy_owner_free(void* ctx) {
 // or r.resize_() on the caller's tensor cannot retarget the complex tensor, and r's autograd graph is not kept alive.
 LazyOwner* lazy_owner(const at::Tensor& owner) {
   lazy_owners_alive.fetch_add(1);
-  return new LazyOwner{owner.detach()};
+  return new LazyOwner{owner.detach(), owner.storage().unsafeGetStorageImpl()};
 }
 
 c10::Storage lazy_storage(const at::Tensor& owner) {
@@ -170,7 +174,11 @@ c10::Storage lazy_storage(const at::Tensor& owner) {
   std::lock_guard<std::mutex> lock(storages.mutex);
   auto it = storages.of.find(key);
   if (it != storages.of.end()) {
-    if (auto alive = it->second.second.lock()) {
+    // An owner that has moved away leaves a stale address: taking its entry made a new complex tensor a view of an
+    // older one, which reads the older values or fails in Habana (strided_view or strided_insert synStatus 1,
+    // "tensor_data is empty").
+    auto alive = it->second.second.lock();
+    if (alive && it->second.first->tensor.storage().unsafeGetStorageImpl() == key) {
       // The Habana storage may have grown since (r.resize_() on the real tensor): the lazy storage reports its size.
       if (alive->nbytes() < owner.storage().nbytes()) {
         alive->set_nbytes(owner.storage().nbytes());

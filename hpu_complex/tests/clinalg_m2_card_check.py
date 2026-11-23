@@ -5,7 +5,8 @@ Checks:
   double-backward (create_graph=True) against finite-difference complex128 reference.
 - slogdet partial gradients (sign only, logabsdet only, combined).
 - eigh / eigvalsh: UPLO='L' and 'U' with junk in unread triangle, clustered eigenvalues, gV=None gradient.
-- svd / svdvals: full_matrices=True tall/wide orthogonality, compute_uv=False with grad, svd(..., out=...).
+- svd / svdvals: full_matrices=True tall/wide orthogonality, compute_uv=False with grad, svd(..., out=...), and many
+  svd + backward steps in a row with host reads and no device synchronize (lazy complex storages, task-96).
 - torch.inference_mode(): all card linalg ops + angle + im2col/col2im (inference tensors, 0 CPU fallbacks).
 - G10 (angle, angle.out, eq.Scalar_out): 0j forward + backward (zero CPU fallbacks), signed zeros, complex out=.
 - G11/G16 (im2col/unfold, col2im/fold): Tier-1 (non-overlapping) & Tier-2 (overlapping dilated/strided) fwd + bwd.
@@ -225,26 +226,63 @@ def main():
     check("svd_variants", test_svd_variants)
 
     def test_svd_full_multistep_slice_oncard():
+        # The M2 challenger's loop (task-96): thin products of full SVD factors with their gradients, step after
+        # step, each read back to the host while the previous step's complex tensors are alive — the first sweep
+        # with a mark_step and a device synchronize per step (both can move a lazy tensor), the second also
+        # without them. In lazy mode Habana gives a tensor a new StorageImpl when some graphs run and reuses the
+        # old address: a complex storage found by that address made a new complex tensor a view of an earlier one
+        # (strided_view or strided_insert synStatus 1, or "tensor_data is empty", in 16 of 16 processes before the
+        # fix, none after; Gaudi2, bridge 1.21.4).
+        import habana_frameworks.torch.hpu as hthpu
+
+        def rel_c(a, b):
+            a, b = a.detach().cpu().to(C128), b.detach().cpu().to(C128)
+            return (a - b).abs().max().item() / max(b.abs().max().item(), 1e-30)
+
+        def cpu_grad(A0, k):
+            Ac = A0.clone().requires_grad_(True)
+            Uc, Sc, Vhc = torch.linalg.svd(Ac, full_matrices=True)
+            ((Uc[..., :k] * Sc.unsqueeze(-2)) @ Vhc[..., :k, :]).abs().pow(2).sum().backward()
+            return Ac.grad
+
         hpu_complex.set_matmul_cpu_threshold(0)
         try:
+            g = torch.Generator().manual_seed(123)
             errs = []
-            for b, m, n in ((4, 8, 4), (2, 8, 4), (4, 20, 16), (4, 16, 20)):
-                k = min(m, n)
-                for it in range(3):
-                    A0 = rand(b, m, n, seed=50 + m * 7 + it)
-                    Ah = A0.to(C64).to(HPU).requires_grad_()
-                    sync()
-                    U, S, Vh = torch.linalg.svd(Ah, full_matrices=True)
-                    sync()
-                    rec = (U[..., :k] * S.unsqueeze(-2)) @ Vh[..., :k, :]
-                    (rec.abs() ** 2).sum().backward()
-                    sync()
-                    errs.append(rel(to_cpu(rec), A0))
-                    Ac = A0.clone().requires_grad_()
-                    Uc, Sc, Vhc = torch.linalg.svd(Ac, full_matrices=True)
-                    rec_c = (Uc[..., :k] * Sc.unsqueeze(-2)) @ Vhc[..., :k, :]
-                    (rec_c.abs() ** 2).sum().backward()
-                    errs.append(rel(to_cpu(Ah.grad), Ac.grad))
+            for _ in range(2):
+                for n in range(4, 33, 2):
+                    for mm, nn in ((n, max(2, n - 2)), (max(2, n - 2), n)):
+                        k = min(mm, nn)
+                        A0 = torch.randn(2, mm, nn, dtype=C64, generator=g)
+                        Ah = A0.to(HPU).requires_grad_(True)
+                        htcore.mark_step()
+                        U, S, Vh = torch.linalg.svd(Ah, full_matrices=True)
+                        htcore.mark_step()
+                        rec = (U[..., :k] * S.unsqueeze(-2)) @ Vh[..., :k, :]
+                        (rec.abs() ** 2).sum().backward()
+                        htcore.mark_step()
+                        hthpu.synchronize()
+                        errs += [rel_c(rec, A0), rel_c(Ah.grad, cpu_grad(A0, k))]
+                for shp in ((2, 8, 4), (4, 8, 4), (2, 20, 16)):
+                    k = min(shp[-2], shp[-1])
+                    for rg in (False, True):
+                        for do_sync in (True, False):
+                            for _ in range(6):
+                                A0 = torch.randn(*shp, dtype=C64, generator=g)
+                                Ah = A0.to(HPU)
+                                Ah = Ah.requires_grad_(True) if rg else Ah
+                                if do_sync:
+                                    htcore.mark_step()
+                                U, S, Vh = torch.linalg.svd(Ah, full_matrices=True)
+                                if do_sync:
+                                    htcore.mark_step()
+                                rec = (U[..., :k] * S.unsqueeze(-2)) @ Vh[..., :k, :]
+                                if rg:
+                                    (rec.abs() ** 2).sum().backward()
+                                htcore.mark_step()
+                                errs.append(rel_c(rec, A0))
+                                if rg:
+                                    errs.append(rel_c(Ah.grad, cpu_grad(A0, k)))
             return max(errs) < 1e-3, max(errs)
         finally:
             hpu_complex.set_matmul_cpu_threshold(1 << 22)
