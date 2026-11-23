@@ -27,6 +27,20 @@ class _EigReplica:
         L = torch.linalg.eigvals(A.detach().cpu())
         return self._pairs(L, A.device)
 
+    def _d_s(self, A, batch):
+        # (D, S) of cgj_*: D is discarded by every caller, S[..., 2] == 0 reads as info 0 (regular).
+        n = A.shape[-1]
+        return (A.new_zeros((*batch, 3, n), dtype=torch.float32),
+                A.new_zeros((*batch, 4), dtype=torch.float32))
+
+    def cgj_solve(self, A, B, layout="pairs"):
+        X = torch.linalg.solve(A.detach().cpu(), B.detach().cpu())
+        return self._pairs(X, A.device), *self._d_s(A, X.shape[:-2])
+
+    def cgj_inv(self, A, layout="pairs"):
+        X = torch.linalg.inv(A.detach().cpu())
+        return self._pairs(X, A.device), *self._d_s(A, X.shape[:-2])
+
 
 @pytest.fixture
 def eig_linalg(extension, monkeypatch):  # noqa: F811
