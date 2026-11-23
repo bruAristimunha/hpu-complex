@@ -364,17 +364,15 @@ def _det_backward(A, d, g_det):
     if A.device.type != "hpu":
         return g_det[..., None, None] * d.conj()[..., None, None] * torch.linalg.inv(A).mH
     singular = d.abs() == 0
+    if torch.is_grad_enabled() and not _tracing((d,)) and singular.any():
+        return _det_svd_backward(A, g_det)
     # Call inv_ex before building (g_det * d.conj()) so TPC's lazy mark_step does not split the cofactor graph.
     inv_ah = inv_ex(A, check_errors=False)[0].mH
     cofactor = (g_det * d.conj())[..., None, None] * inv_ah
     grad = torch.where(singular[..., None, None], 0.0, cofactor)
-    if torch.is_grad_enabled():
-        # Double backward at a singular matrix takes the SVD formula for the whole batch (its second derivative
-        # mixes entries); traced, select per entry instead of reading singular on the host.
-        if _tracing((d,)):
-            grad = torch.where(singular[..., None, None], _det_svd_backward(A, g_det), grad)
-        elif singular.any():
-            return _det_svd_backward(A, g_det)
+    if torch.is_grad_enabled() and _tracing((d,)):
+        # Traced double backward: the SVD formula at the singular entries (per entry, no host read of singular).
+        grad = torch.where(singular[..., None, None], _det_svd_backward(A, g_det), grad)
     return grad
 
 
