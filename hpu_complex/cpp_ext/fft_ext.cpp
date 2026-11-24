@@ -1187,6 +1187,161 @@ bool both_real(const std::optional<at::Tensor>& pa, const std::optional<at::Tens
   return true;
 }
 
+// ---- double-single (DS) complex128 on the card, opt-in HPU_COMPLEX_DS=1 --------------------------
+// A host complex128 value split as (hi, lo) tagged complex64 card tensors (hi + lo to ~48 bits;
+// the split itself measures 1.7e-15). Elementwise ops compute in DS on the card and join back to
+// the host complex128 tensor, so results stay float64-exact at DS precision instead of computed
+// on the CPU. Off by default: the host path is bit-exact float64, DS is ~48-bit.
+
+bool ds_enabled() {
+  const char* v = std::getenv("HPU_COMPLEX_DS");  // per call: tests toggle it per process
+  return v != nullptr && v[0] == '1';
+}
+
+std::pair<at::Tensor, at::Tensor> ds_split(const at::Tensor& t) {
+  auto cpu = cpu_operand(t).contiguous();
+  if (cpu.scalar_type() == at::kDouble) {  // a real float64 operand: imaginary part zero
+    auto hi_f = cpu.to(at::kFloat);
+    auto lo_f = (cpu - hi_f.to(at::kDouble)).to(at::kFloat);
+    auto to_card = [&](const at::Tensor& re, const at::Tensor& im) {
+      auto pair = at::stack({re, im}, -1).to(t.device());
+      return complex_view(pair.contiguous());
+    };
+    auto zero = at::zeros_like(hi_f);
+    return {to_card(hi_f, zero), to_card(lo_f, zero)};
+  }
+  auto hi_c = cpu.to(at::kComplexFloat);
+  auto lo_c = (cpu - hi_c.to(at::kComplexDouble)).to(at::kComplexFloat);
+  auto to_card = [&](const at::Tensor& c) {
+    auto pair = at::view_as_real(c).to(t.device());
+    return complex_view(pair.contiguous());
+  };
+  return {to_card(hi_c), to_card(lo_c)};
+}
+
+at::Tensor ds_join(const at::Tensor& hi, const at::Tensor& lo, const at::Device& device) {
+  auto as_cpu = [](const at::Tensor& c) {
+    auto pair = contiguous_pair_view(c).cpu();
+    return at::view_as_complex(pair.contiguous());
+  };
+  return from_cpu(as_cpu(hi).to(at::kComplexDouble) + as_cpu(lo).to(at::kComplexDouble), device);
+}
+
+// DS float add/product on float tensors (whole pair views or single components alike).
+std::pair<at::Tensor, at::Tensor> ds_fadd(const at::Tensor& ah, const at::Tensor& al,
+                                          const at::Tensor& bh, const at::Tensor& bl) {
+  auto s = ah + bh;
+  auto bb = s - ah;
+  auto e = (ah - (s - bb)) + (bh - bb) + (al + bl);
+  auto hi = s + e;
+  return {hi, e - (hi - s)};
+}
+
+std::pair<at::Tensor, at::Tensor> ds_fmul(const at::Tensor& ah, const at::Tensor& al,
+                                          const at::Tensor& bh, const at::Tensor& bl) {
+  auto p = ah * bh;
+  auto split = [](const at::Tensor& v) {
+    auto t = v * 4097.0f;
+    auto h = t - (t - v);
+    return std::pair<at::Tensor, at::Tensor>{h, v - h};
+  };
+  auto [ahh, ahl] = split(ah);
+  auto [bhh, bhl] = split(bh);
+  auto e = ((ahh * bhh - p) + ahh * bhl + ahl * bhh) + ahl * bhl + (ah * bl + al * bh);
+  auto hi = p + e;
+  return {hi, e - (hi - p)};
+}
+
+std::pair<at::Tensor, at::Tensor> ds_fdiv(const at::Tensor& ah, const at::Tensor& al,
+                                          const at::Tensor& bh, const at::Tensor& bl) {
+  auto q1 = ah / bh;
+  auto zero = at::zeros_like(q1);
+  auto [nh, nl] = ds_fmul(q1, zero, bh, bl);
+  auto [rh, rl] = ds_fadd(ah, al, -nh, -nl);
+  auto q2 = rh / bh;
+  auto hi = q1 + q2;
+  return {hi, q2 - (hi - q1)};
+}
+
+using DsPair = std::pair<at::Tensor, at::Tensor>;
+
+DsPair ds_cadd(const DsPair& A, const DsPair& B) {
+  auto [h, l] = ds_fadd(contiguous_pair_view(A.first), contiguous_pair_view(A.second),
+                        contiguous_pair_view(B.first), contiguous_pair_view(B.second));
+  return {complex_view(h.contiguous()), complex_view(l.contiguous())};
+}
+
+DsPair ds_cmul(const DsPair& A, const DsPair& B) {
+  auto ap = contiguous_pair_view(A.first), aq = contiguous_pair_view(A.second);
+  auto bp = contiguous_pair_view(B.first), bq = contiguous_pair_view(B.second);
+  auto ar = ap.select(-1, 0), ai = ap.select(-1, 1), arl = aq.select(-1, 0), ail = aq.select(-1, 1);
+  auto br = bp.select(-1, 0), bi = bp.select(-1, 1), brl = bq.select(-1, 0), bil = bq.select(-1, 1);
+  auto [prh, prl] = ds_fmul(ar, arl, br, brl);
+  auto [pih, pil] = ds_fmul(ai, ail, bi, bil);
+  auto [rrh, rrl] = ds_fadd(prh, prl, -pih, -pil);
+  auto [qrh, qrl] = ds_fmul(ar, arl, bi, bil);
+  auto [qih, qil] = ds_fmul(ai, ail, br, brl);
+  auto [rih, ril] = ds_fadd(qrh, qrl, qih, qil);
+  auto hi = complex_view(at::stack({rrh, rih}, -1).contiguous());
+  auto lo = complex_view(at::stack({rrl, ril}, -1).contiguous());
+  return {hi, lo};
+}
+
+DsPair ds_cdiv(const DsPair& A, const DsPair& B) {
+  auto bp = contiguous_pair_view(B.first), bq = contiguous_pair_view(B.second);
+  auto br = bp.select(-1, 0), bi = bp.select(-1, 1), brl = bq.select(-1, 0), bil = bq.select(-1, 1);
+  auto sq_r = ds_fmul(br, brl, br, brl);
+  auto sq_i = ds_fmul(bi, bil, bi, bil);
+  auto [dh, dl] = ds_fadd(sq_r.first, sq_r.second, sq_i.first, sq_i.second);
+  auto conj_b = DsPair{complex_view(at::stack({br, -bi}, -1).contiguous()),
+                       complex_view(at::stack({brl, -bil}, -1).contiguous())};
+  auto num = ds_cmul(A, conj_b);
+  auto np = contiguous_pair_view(num.first), nq = contiguous_pair_view(num.second);
+  auto [rh, rl] = ds_fdiv(np.select(-1, 0), nq.select(-1, 0), dh, dl);
+  auto [ih, il] = ds_fdiv(np.select(-1, 1), nq.select(-1, 1), dh, dl);
+  return {complex_view(at::stack({rh, ih}, -1).contiguous()),
+          complex_view(at::stack({rl, il}, -1).contiguous())};
+}
+
+// |z| as a DS float pair (shaped like the input, not a pair view).
+std::pair<at::Tensor, at::Tensor> ds_cabs(const DsPair& A) {
+  auto ap = contiguous_pair_view(A.first), aq = contiguous_pair_view(A.second);
+  auto sq_r = ds_fmul(ap.select(-1, 0), aq.select(-1, 0), ap.select(-1, 0), aq.select(-1, 0));
+  auto sq_i = ds_fmul(ap.select(-1, 1), aq.select(-1, 1), ap.select(-1, 1), aq.select(-1, 1));
+  auto s = ds_fadd(sq_r.first, sq_r.second, sq_i.first, sq_i.second);
+  auto y = at::sqrt(s.first);
+  auto yy = ds_fmul(y, at::zeros_like(y), y, at::zeros_like(y));
+  auto corr = ds_fadd(s.first, s.second, -yy.first, -yy.second);
+  auto lo = (corr.first + corr.second) / (2.0f * y);
+  auto hi = y + lo;
+  return {hi, lo - (hi - y)};
+}
+
+// kind: 0 add, 1 sub, 2 mul, 3 div. Operands host complex128 or float64 tensors (CPU scalars
+// keep the host path).
+std::optional<at::Tensor> ds_binary(const at::Tensor& a, const at::Tensor& b, int kind) {
+  auto host_num = [](const at::Tensor& t) {
+    return (host_backed(t) || t.is_hpu()) &&
+           (t.scalar_type() == at::kComplexDouble || t.scalar_type() == at::kDouble);
+  };
+  if (!ds_enabled() || !host_num(a) || !host_num(b) ||
+      (a.scalar_type() != at::kComplexDouble && b.scalar_type() != at::kComplexDouble)) {
+    return std::nullopt;
+  }
+  auto A = ds_split(a), B = ds_split(b);
+  DsPair out;
+  if (kind == 0) {
+    out = ds_cadd(A, B);
+  } else if (kind == 1) {
+    out = ds_cadd(A, DsPair{at::neg(B.first), at::neg(B.second)});
+  } else if (kind == 2) {
+    out = ds_cmul(A, B);
+  } else {
+    out = ds_cdiv(A, B);
+  }
+  return ds_join(out.first, out.second, device_of(a, b));
+}
+
 template <class CpuOp>
 std::optional<at::Tensor> host_binary(const at::Tensor& a, const at::Tensor& b, CpuOp cpu_op) {
   check_host_devices({&a, &b});
@@ -1208,6 +1363,9 @@ BinaryPairs pairs_of(const at::Tensor& a, const at::Tensor& b) {
 }
 
 at::Tensor mul_pu1(const at::Tensor& a, const at::Tensor& b) {
+  if (auto ds = ds_binary(a, b, 2)) {
+    return *ds;
+  }
   if (auto host = host_binary(a, b, [](const auto& ca, const auto& cb) { return at::mul(ca, cb); })) {
     return *host;
   }
@@ -1283,6 +1441,9 @@ at::Tensor real_div(const at::Tensor& pair, const at::Tensor& c) {
 }
 
 at::Tensor div_pu1(const at::Tensor& a, const at::Tensor& b) {
+  if (auto ds = ds_binary(a, b, 3)) {
+    return *ds;
+  }
   if (auto host = host_binary(a, b, [](const auto& ca, const auto& cb) { return at::div(ca, cb); })) {
     return *host;
   }
@@ -1323,6 +1484,11 @@ c10::complex<float> complex_alpha(const at::Scalar& alpha) {
 at::Tensor add_pairs(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha);
 
 at::Tensor add_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha) {
+  if (alpha.toComplexDouble() == c10::complex<double>(1, 0)) {
+    if (auto ds = ds_binary(a, b, 0)) {
+      return *ds;
+    }
+  }
   if (auto host = host_binary(a, b, [&](const auto& ca, const auto& cb) { return at::add(ca, cb, alpha); })) {
     return *host;
   }
@@ -1374,6 +1540,11 @@ at::Tensor add_pairs(const at::Tensor& a, const at::Tensor& b, const at::Scalar&
 }
 
 at::Tensor sub_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha) {
+  if (alpha.toComplexDouble() == c10::complex<double>(1, 0)) {
+    if (auto ds = ds_binary(a, b, 1)) {
+      return *ds;
+    }
+  }
   if (auto host = host_binary(a, b, [&](const auto& ca, const auto& cb) { return at::sub(ca, cb, alpha); })) {
     return *host;
   }
@@ -1411,6 +1582,10 @@ at::Tensor modulus(const at::Tensor& pair, bool keepdim) {
 
 at::Tensor abs_pu1(const at::Tensor& self) {
   if (host_backed(self)) {
+    if (ds_enabled() && self.scalar_type() == at::kComplexDouble) {
+      auto [h, l] = ds_cabs(ds_split(self));
+      return from_cpu(h.cpu().to(at::kDouble) + l.cpu().to(at::kDouble), self.device());
+    }
     return from_cpu(at::abs(host_cpu(self)), self.device());
   }
   HPU_COMPLEX_NO_AUTOCAST;
@@ -2955,7 +3130,48 @@ void cpu_fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
 // (float64 on the HPU: Habana storage at float32 precision) and calls the out= op. For host-backed arguments this
 // kernel computes on the CPU instead (host_fallback, float64 kept in host memory); for any other tagged tensor it
 // runs that composite kernel, read from PrivateUse3's slot, where nothing else is registered.
+// pow.Tensor_Scalar with a non-negative integer exponent on a host complex128 tensor, in DS
+// (SensingDynamics' unit_delay**delay). True when the stack now holds the DS result.
+bool ds_pow(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
+  if (!ds_enabled()) {
+    return false;
+  }
+  const auto& name = op.schema().operator_name();
+  if (name.name != "aten::pow" || name.overload_name != "Tensor_Scalar" || stack->size() != 2) {
+    return false;
+  }
+  const auto& self = (*stack)[0].toTensor();
+  const auto& exp_s = (*stack)[1].toScalar();
+  const auto exp_t = exp_s.type();
+  const bool integral = exp_t == c10::ScalarType::Long || exp_t == c10::ScalarType::Int ||
+                        exp_t == c10::ScalarType::Short || exp_t == c10::ScalarType::Byte ||
+                        exp_t == c10::ScalarType::Char;
+  if (!host_backed(self) || self.scalar_type() != at::kComplexDouble || !integral ||
+      exp_s.toLong() < 0) {
+    return false;
+  }
+  auto ones = from_cpu(at::ones(self.sizes(), at::TensorOptions().dtype(at::kComplexDouble)),
+                       self.device());
+  auto out = ds_split(ones);
+  auto base = ds_split(self);
+  for (int64_t n = exp_s.toLong(); n > 0; n >>= 1) {
+    if (n & 1) {
+      out = ds_cmul(out, base);
+    }
+    if (n > 1) {
+      base = ds_cmul(base, base);
+    }
+  }
+  auto result = ds_join(out.first, out.second, self.device());
+  torch::jit::drop(*stack, 2);
+  stack->push_back(std::move(result));
+  return true;
+}
+
 void structured_pu1(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
+  if (ds_pow(op, stack)) {
+    return;
+  }
   if (has_host_arg(op, stack)) {
     host_fallback(op, stack);
     return;
