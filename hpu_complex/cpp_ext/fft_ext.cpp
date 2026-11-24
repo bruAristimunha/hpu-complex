@@ -3142,7 +3142,11 @@ bool ds_pow(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
   }
   const auto& self = (*stack)[0].toTensor();
   const auto& exp_s = (*stack)[1].toScalar();
-  if (!host_backed(self) || self.scalar_type() != at::kComplexDouble || !exp_s.isIntegral() ||
+  const auto exp_t = exp_s.type();
+  const bool integral = exp_t == c10::ScalarType::Long || exp_t == c10::ScalarType::Int ||
+                        exp_t == c10::ScalarType::Short || exp_t == c10::ScalarType::Byte ||
+                        exp_t == c10::ScalarType::Char;
+  if (!host_backed(self) || self.scalar_type() != at::kComplexDouble || !integral ||
       exp_s.toLong() < 0) {
     return false;
   }
