@@ -1194,11 +1194,8 @@ bool both_real(const std::optional<at::Tensor>& pa, const std::optional<at::Tens
 // on the CPU. Off by default: the host path is bit-exact float64, DS is ~48-bit.
 
 bool ds_enabled() {
-  static const bool on = [] {
-    const char* v = std::getenv("HPU_COMPLEX_DS");
-    return v != nullptr && v[0] == '1';
-  }();
-  return on;
+  const char* v = std::getenv("HPU_COMPLEX_DS");  // per call: tests toggle it per process
+  return v != nullptr && v[0] == '1';
 }
 
 std::pair<at::Tensor, at::Tensor> ds_split(const at::Tensor& t) {

@@ -2,7 +2,6 @@
 abs of host complex128 tensors compute from (hi, lo) complex64 pairs at ~48-bit precision
 instead of the host float64 path. Opt-in: without the env the host path stays bit-exact."""
 import importlib.util
-import os
 import pathlib
 import shutil
 import sys
@@ -12,7 +11,6 @@ import warnings
 import pytest
 import torch
 
-os.environ["HPU_COMPLEX_DS"] = "1"
 HERE = pathlib.Path(__file__).parent
 
 if importlib.util.find_spec("habana_frameworks") is not None:
@@ -70,14 +68,16 @@ def _check(fn, tol=1e-12):
     assert rel < tol, rel
 
 
-def test_ds_arithmetic():
+def test_ds_arithmetic(monkeypatch):
+    monkeypatch.setenv("HPU_COMPLEX_DS", "1")
     _check(lambda a, b: a * b)
     _check(lambda a, b: a / b)
     _check(lambda a, b: a + b)
     _check(lambda a, b: a - b)
 
 
-def test_ds_pow_and_abs():
+def test_ds_pow_and_abs(monkeypatch):
+    monkeypatch.setenv("HPU_COMPLEX_DS", "1")
     z, _ = _pair()
     got = (z.to(HPU) ** 3).cpu()
     rel = ((got - z**3).abs() / (z**3).abs().clamp_min(1e-300)).max().item()
