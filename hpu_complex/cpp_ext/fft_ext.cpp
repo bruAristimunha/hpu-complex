@@ -1328,12 +1328,30 @@ std::optional<at::Tensor> ds_binary(const at::Tensor& a, const at::Tensor& b, in
       (a.scalar_type() != at::kComplexDouble && b.scalar_type() != at::kComplexDouble)) {
     return std::nullopt;
   }
+  double amax = 0, bmax = 0, bmin = 0;
   for (const auto* t : {&a, &b}) {  // DS keeps the float32 exponent range: out-of-range stays exact on the host
     auto cpu = cpu_operand(*t);
-    if (cpu.numel() && (!at::isfinite(cpu).all().item<bool>() ||
-                        (cpu.abs() > 1e30).any().item<bool>())) {
+    if (!cpu.numel()) {
+      continue;
+    }
+    if (!at::isfinite(cpu).all().item<bool>()) {
       return std::nullopt;
     }
+    auto mag = cpu.abs();
+    double hi = mag.max().item<double>();
+    if (hi > 1e30) {
+      return std::nullopt;
+    }
+    if (t == &a) {
+      amax = hi;
+    } else {
+      bmax = hi;
+      bmin = bmax == 0 ? 0 : at::where(mag > 0, mag, at::full_like(mag, 1e300)).min().item<double>();
+    }
+  }
+  if ((kind == 2 && amax > 0 && bmax > 1e30 / amax) ||
+      (kind == 3 && (bmax > 1e15 || bmin == 0 || (bmin > 0 && amax / bmin > 1e30)))) {
+    return std::nullopt;  // the product/quotient (or its squared denominator) would overflow float32
   }
   auto A = ds_split(a), B = ds_split(b);
   DsPair out;
@@ -1593,9 +1611,15 @@ at::Tensor modulus(const at::Tensor& pair, bool keepdim) {
   return pair.dim() >= 6 ? r.view(out_sizes) : (keepdim ? r : r.squeeze(-1));
 }
 
+bool ds_magnitude_ok(const at::Tensor& t, double max_abs) {
+  auto cpu = cpu_operand(t);
+  return !cpu.numel() || (at::isfinite(cpu).all().item<bool>() &&
+                          (cpu.abs() <= max_abs).all().item<bool>());
+}
+
 at::Tensor abs_pu1(const at::Tensor& self) {
   if (host_backed(self)) {
-    if (ds_enabled() && self.scalar_type() == at::kComplexDouble) {
+    if (ds_enabled() && self.scalar_type() == at::kComplexDouble && ds_magnitude_ok(self, 1e18)) {
       auto [h, l] = ds_cabs(ds_split(self));
       return from_cpu(h.cpu().to(at::kDouble) + l.cpu().to(at::kDouble), self.device());
     }
@@ -3160,8 +3184,14 @@ bool ds_pow(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
                         exp_t == c10::ScalarType::Short || exp_t == c10::ScalarType::Byte ||
                         exp_t == c10::ScalarType::Char;
   if (!host_backed(self) || self.scalar_type() != at::kComplexDouble || !integral ||
-      exp_s.toLong() < 0) {
+      exp_s.toLong() < 0 || !ds_magnitude_ok(self, 1e30)) {
     return false;
+  }
+  if (exp_s.toLong() > 0 && self.numel()) {
+    double top = cpu_operand(self).abs().max().item<double>();
+    if (top > 1 && exp_s.toLong() * std::log10(top) > 30) {
+      return false;  // the power would overflow the float32 DS range; the host stays exact
+    }
   }
   auto ones = from_cpu(at::ones(self.sizes(), at::TensorOptions().dtype(at::kComplexDouble)),
                        self.device());
