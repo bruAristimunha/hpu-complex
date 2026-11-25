@@ -76,6 +76,23 @@ def test_ds_arithmetic(monkeypatch):
     _check(lambda a, b: a - b)
 
 
+def test_ds_abs_zero_and_range_decline(monkeypatch):
+    monkeypatch.setenv("HPU_COMPLEX_DS", "1")
+    z = torch.tensor([0.0 + 0j, 3.0 + 4.0j], dtype=torch.complex128)
+    mag = z.to(HPU).abs().cpu()
+    assert mag.tolist() == [0.0, 5.0]
+    big = torch.tensor([1e100 + 0j], dtype=torch.complex128)
+    got = (big.to(HPU) * big.to(HPU)).cpu()
+    assert abs(got.item() / 1e200 - 1) < 1e-15  # out of DS range: exact host path
+
+
+def test_ds_bool_alpha_raises(monkeypatch):
+    monkeypatch.setenv("HPU_COMPLEX_DS", "1")
+    z, w = _pair()
+    with pytest.raises(RuntimeError, match="Boolean alpha"):
+        torch.add(z.to(HPU), w.to(HPU), alpha=True)
+
+
 def test_ds_pow_and_abs(monkeypatch):
     monkeypatch.setenv("HPU_COMPLEX_DS", "1")
     z, _ = _pair()

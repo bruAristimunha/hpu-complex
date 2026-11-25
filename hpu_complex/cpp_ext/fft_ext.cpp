@@ -1312,7 +1312,7 @@ std::pair<at::Tensor, at::Tensor> ds_cabs(const DsPair& A) {
   auto y = at::sqrt(s.first);
   auto yy = ds_fmul(y, at::zeros_like(y), y, at::zeros_like(y));
   auto corr = ds_fadd(s.first, s.second, -yy.first, -yy.second);
-  auto lo = (corr.first + corr.second) / (2.0f * y);
+  auto lo = at::where(y == 0, at::zeros_like(y), (corr.first + corr.second) / (2.0f * y));
   auto hi = y + lo;
   return {hi, lo - (hi - y)};
 }
@@ -1324,9 +1324,16 @@ std::optional<at::Tensor> ds_binary(const at::Tensor& a, const at::Tensor& b, in
     return (host_backed(t) || t.is_hpu()) &&
            (t.scalar_type() == at::kComplexDouble || t.scalar_type() == at::kDouble);
   };
-  if (!ds_enabled() || !host_num(a) || !host_num(b) ||
+  if (!ds_enabled() || !host_num(a) || !host_num(b) || a.device() != b.device() ||
       (a.scalar_type() != at::kComplexDouble && b.scalar_type() != at::kComplexDouble)) {
     return std::nullopt;
+  }
+  for (const auto* t : {&a, &b}) {  // DS keeps the float32 exponent range: out-of-range stays exact on the host
+    auto cpu = cpu_operand(*t);
+    if (cpu.numel() && (!at::isfinite(cpu).all().item<bool>() ||
+                        (cpu.abs() > 1e30).any().item<bool>())) {
+      return std::nullopt;
+    }
   }
   auto A = ds_split(a), B = ds_split(b);
   DsPair out;
@@ -1484,6 +1491,9 @@ c10::complex<float> complex_alpha(const at::Scalar& alpha) {
 at::Tensor add_pairs(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha);
 
 at::Tensor add_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha) {
+  if (a.is_complex() || b.is_complex()) {
+    complex_alpha(alpha);  // torch's checks first (a bool alpha must raise, DS gate included)
+  }
   if (alpha.toComplexDouble() == c10::complex<double>(1, 0)) {
     if (auto ds = ds_binary(a, b, 0)) {
       return *ds;
@@ -1540,6 +1550,9 @@ at::Tensor add_pairs(const at::Tensor& a, const at::Tensor& b, const at::Scalar&
 }
 
 at::Tensor sub_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha) {
+  if (a.is_complex() || b.is_complex()) {
+    complex_alpha(alpha);  // torch's checks first (a bool alpha must raise, DS gate included)
+  }
   if (alpha.toComplexDouble() == c10::complex<double>(1, 0)) {
     if (auto ds = ds_binary(a, b, 1)) {
       return *ds;
