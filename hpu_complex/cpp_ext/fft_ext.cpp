@@ -1587,6 +1587,22 @@ at::Tensor sub_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& a
   return add_pairs(a, b, alpha.isComplex() ? at::Scalar(-alpha.toComplexDouble()) : at::Scalar(-alpha.toDouble()));
 }
 
+at::Tensor rsub_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha) {
+  return sub_pu1(b, a, alpha);
+}
+
+at::Tensor rsub_scalar_pu1(const at::Tensor& a, const at::Scalar& other, const at::Scalar& alpha) {
+  if (a.is_complex() || other.isComplex() || alpha.isComplex()) {
+    complex_alpha(alpha);
+  }
+  const auto scalar_dtype = other.isComplex()
+      ? at::kComplexDouble
+      : (other.isFloatingPoint() ? at::kDouble : (other.isIntegral(false) ? at::kLong : at::kBool));
+  auto b = at::scalar_tensor(other, at::TensorOptions().dtype(scalar_dtype));
+  b.unsafeGetTensorImpl()->set_wrapped_number(true);
+  return sub_pu1(b, a, alpha);
+}
+
 // |z| = hypot(re, im), scaled by m = max(|re|, |im|) as C's hypot: Habana's own vector_norm and hypot square in float
 // (|3e19 + 3e19j| = inf, |1e-30| = 0 on Gaudi2, bridge 1.21.4, where torch gives 4.2e19 and 1e-30). m = 0 gives 0;
 // an infinite part gives inf even next to a NaN (hypot(inf, nan) = inf, as torch's abs).
@@ -1853,6 +1869,13 @@ at::Tensor& add_out_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scal
 }
 at::Tensor& sub_out_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha, at::Tensor& out) {
   return write_out(out, sub_pu1(a, b, alpha), {&a, &b});
+}
+at::Tensor& rsub_out_pu1(const at::Tensor& a, const at::Tensor& b, const at::Scalar& alpha, at::Tensor& out) {
+  return write_out(out, rsub_pu1(a, b, alpha), {&a, &b});
+}
+at::Tensor& rsub_scalar_out_pu1(const at::Tensor& a, const at::Scalar& other, const at::Scalar& alpha,
+                                at::Tensor& out) {
+  return write_out(out, rsub_scalar_pu1(a, other, alpha), {&a});
 }
 // abs/sgn/vector_norm of a complex tensor: torch's out dtype is the value's (a float out for abs, exactly).
 at::Tensor& abs_out_pu1(const at::Tensor& self, at::Tensor& out) {
@@ -3634,6 +3657,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("add_.Tensor", &add__pu1);
   m.impl("sub.Tensor", &sub_pu1);
   m.impl("sub.out", &sub_out_pu1);
+  m.impl("rsub.Tensor", &rsub_pu1);
+  m.impl("rsub.Scalar", &rsub_scalar_pu1);
+  m.impl("rsub.Tensor_out", &rsub_out_pu1);
+  m.impl("rsub.Scalar_out", &rsub_scalar_out_pu1);
   m.impl("where.self", &where_pu1);
   m.impl("neg", &neg_pu1);
   m.impl("neg.out", &neg_out_pu1);

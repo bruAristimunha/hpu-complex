@@ -383,3 +383,23 @@ def test_lazy_mode_guard_and_real_safety():
         htcore.mark_step()
     assert spec.is_inference() and (spec.cpu() - torch.fft.rfft(real_sig.cpu())).abs().max() < 1e-3
     print("lazy mode complex64 (inference_mode too) + real safety: OK")
+
+
+def test_rsub_complex_on_hpu():
+    if _skip_if_lazy("test_rsub_complex_on_hpu"):
+        return
+    H.enable()
+    hpu = torch.device("hpu")
+    z = torch.complex(torch.randn(2, 4, device=hpu), torch.randn(2, 4, device=hpu))
+    r = torch.randn(2, 4, device=hpu)
+    zc, rc = z.cpu(), r.cpu()
+    before = int(torch.ops.hpu_complex.cpu_fallback_calls())
+    s_got = torch.rsub(z, 1.0)
+    t_got = torch.rsub(z, r)
+    c_got = 1.0 - z
+    torch.hpu.synchronize()
+    after = int(torch.ops.hpu_complex.cpu_fallback_calls())
+    assert after == before
+    assert _max_err(s_got, torch.rsub(zc, 1.0)) < 1e-5
+    assert _max_err(t_got, torch.rsub(zc, rc)) < 1e-5
+    assert _max_err(c_got, 1.0 - zc) < 1e-5

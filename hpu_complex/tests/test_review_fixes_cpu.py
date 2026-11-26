@@ -417,3 +417,18 @@ def test_complex128_set_onto_complex64_card_storage_copies_bytes():
     t = torch.empty(0, dtype=C128, device=HPU)
     t.set_(z.untyped_storage(), 0, (1,), (1,))
     assert torch.equal(t.cpu(), torch.tensor([1 + 2j, 3 + 4j]).view(C128))
+
+
+def test_complex_rsub_tensor_scalar_and_out():
+    z = h([1 + 2j, -3 + 4j])
+    r = torch.tensor([5.0, -2.0], dtype=torch.float32).to(HPU)
+    zc, rc = z.cpu(), r.cpu()
+    bits_equal(torch.rsub(z, 1.0), torch.rsub(zc, 1.0))
+    bits_equal(torch.rsub(z, 2.0 - 1.0j, alpha=0.5), torch.rsub(zc, 2.0 - 1.0j, alpha=0.5))
+    bits_equal(torch.rsub(z, r), torch.rsub(zc, rc))
+    bits_equal(torch.rsub(z, h([4 - 1j, 0 + 2j]), alpha=2.0), torch.rsub(zc, torch.tensor([4 - 1j, 0 + 2j]), alpha=2.0))
+    out = torch.empty(2, dtype=C64, device=HPU)
+    torch.ops.aten.rsub.Scalar_out(z, 1.0, out=out)
+    bits_equal(out, torch.rsub(zc, 1.0))
+    torch.ops.aten.rsub.Tensor_out(z, r, out=out)
+    bits_equal(out, torch.rsub(zc, rc))
